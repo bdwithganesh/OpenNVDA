@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleDevelopmentRegion</key><string>English</string>
+<key>CFBundleExecutable</key><string>NVAccelerator</string>
+<key>CFBundleIdentifier</key><string>org.local.macosdevicelab.NVAccelerator</string>
+<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+<key>CFBundleName</key><string>NVAccelerator</string>
+<key>CFBundlePackageType</key><string>KEXT</string>
+<key>CFBundleShortVersionString</key><string>0.5.2</string>
+<key>CFBundleVersion</key><string>0.5.2</string>
+<key>OSBundleRequired</key><string>Root</string>
+<key>IOKitPersonalities</key><dict><key>RTX 4080 IOAccelerator launcher</key><dict>
+<key>CFBundleIdentifier</key><string>org.local.macosdevicelab.NVAccelerator</string>
+<key>IOClass</key><string>NVAccelLauncher</string>
+<key>IOProviderClass</key><string>IOResources</string>
+<key>IOResourceMatch</key><string>IOKit</string>
+<key>IOMatchCategory</key><string>NVAccelLauncher</string>
+<key>NVAcceleratorPCIID</key><integer>654577886</integer>
+<key>NVAcceleratorProperties</key><dict>
+<key>IOClass</key><string>NVAccelerator</string>
+<key>IOMatchCategory</key><string>IOAccelerator</string>
+<key>MetalPluginName</key><string>NVMTLDriver</string>
+<key>MetalPluginClassName</key><string>NVMTLDevice</string>
+<key>MetalStatisticsName</key><string>NVMTLDriver</string>
+<key>IOAccelDisplayPipeCapabilities</key><dict><key>DisplayPipeSupported</key><false/></dict>
+</dict>
+</dict></dict>
+<key>OSBundleLibraries</key><dict>
+<key>com.apple.kpi.bsd</key><string>8.0.0</string>
+<key>com.apple.kpi.iokit</key><string>16.7</string>
+<key>com.apple.kpi.libkern</key><string>16.7</string>
+<key>com.apple.kpi.mach</key><string>9.0.0b1</string>
+<key>com.apple.kpi.unsupported</key><string>8.0.0</string>
+<key>com.apple.iokit.IOPCIFamily</key><string>2.9</string>
+<key>com.apple.iokit.IOGraphicsFamily</key><string>515.3</string>
+<key>com.apple.iokit.IOSurface</key><string>87.0</string>
+<key>com.apple.iokit.IOAcceleratorFamily2</key><string>2.0.0</string>
+<key>com.apple.AppleGraphicsDeviceControl</key><string>1.0.0</string>
+</dict>
+</dict></plist>
