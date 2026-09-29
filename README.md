@@ -2,6 +2,8 @@
 
 **An RTX 4080 running natively on macOS. Not a framebuffer hack: the GPU's own firmware booted from a macOS kext, a real display driver, compute, video decode, Vulkan, and Metal slowly coming up on top.**
 
+[![Buy me a coffee](https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=&slug=bdwithganesh&button_colour=FFDD00&font_colour=000000&font_family=Cookie&outline_colour=000000&coffee_colour=ffffff)](https://www.buymeacoffee.com/bdwithganesh)
+
 > Made for fun, on one PC, by one person with a lot of reboots. It is not a product and it is not ready for your daily machine. If you want it to become a real driver, see [Funding](#want-this-to-become-a-real-driver) below.
 
 Apple never shipped a driver for any NVIDIA card newer than Kepler. From Mojave onwards there is nothing at all. On a modern Hackintosh an RTX card is dead weight, or at best a dumb framebuffer on the firmware's GOP screen.
@@ -106,7 +108,7 @@ Right now it is a hobby. Nights and weekends on one PC. To turn it into somethin
 
 If you want an RTX card working on macOS for real, you can help fund it:
 
-☕ **Buy me a coffee:** _link coming soon_
+<a href="https://www.buymeacoffee.com/bdwithganesh"><img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=&slug=bdwithganesh&button_colour=FFDD00&font_colour=000000&font_family=Cookie&outline_colour=000000&coffee_colour=ffffff" alt="Buy me a coffee" height="45"></a>
 
 Sponsors and backers get their name here. If a company or a group wants to fund proper work (more cards, Tahoe support, a stable release), open an issue titled **"Funding"** and we'll talk.
 
