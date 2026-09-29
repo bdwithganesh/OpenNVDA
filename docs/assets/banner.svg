@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b0f0a"/>
+      <stop offset="1" stop-color="#16210f"/>
+    </linearGradient>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#76b900"/>
+      <stop offset="1" stop-color="#b6f03c"/>
+    </linearGradient>
+    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M24 0H0V24" fill="none" stroke="#76b900" stroke-opacity="0.07" stroke-width="1"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="300" rx="18" fill="url(#bg)"/>
+  <rect width="1200" height="300" rx="18" fill="url(#grid)"/>
+  <!-- chip -->
+  <g transform="translate(900,60)" fill="none" stroke="url(#g)" stroke-width="3">
+    <rect x="30" y="30" width="120" height="120" rx="12"/>
+    <rect x="58" y="58" width="64" height="64" rx="6" fill="#76b900" fill-opacity="0.15"/>
+    <g stroke-linecap="round">
+      <path d="M50 30V8M75 30V8M100 30V8M125 30V8M50 150V172M75 150V172M100 150V172M125 150V172"/>
+      <path d="M30 50H8M30 75H8M30 100H8M30 125H8M150 50H172M150 75H172M150 100H172M150 125H172"/>
+    </g>
+  </g>
+  <text x="70" y="140" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="84" font-weight="800" fill="#ffffff">Open<tspan fill="url(#g)">NVDA</tspan></text>
+  <text x="74" y="190" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="28" fill="#c9d4c0">An RTX 4080 running natively on macOS</text>
+  <text x="74" y="236" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="18" fill="#76b900">GSP-RM boot · 4K display · compute · Vulkan · NVDEC · Metal</text>
+</svg>

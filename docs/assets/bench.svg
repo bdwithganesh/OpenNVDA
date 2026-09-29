@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="420" viewBox="0 0 1000 420" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="1000" height="420" rx="14" fill="#0d1117"/>
+<text x="30" y="40" font-size="20" font-weight="700" fill="#e6edf3">Same PC, same RTX 4080, three operating systems</text>
+<text x="970" y="40" font-size="13" fill="#8b949e" text-anchor="end">raw compute, warmed up · higher is better</text>
+<line x1="190.0" y1="62" x2="190.0" y2="360" stroke="#30363d" stroke-dasharray="3 4"/>
+<text x="190.0" y="378" font-size="12" fill="#8b949e" text-anchor="middle">80% of Linux</text>
+<line x1="420.0" y1="62" x2="420.0" y2="360" stroke="#30363d" stroke-dasharray="3 4"/>
+<text x="420.0" y="378" font-size="12" fill="#8b949e" text-anchor="middle">90% of Linux</text>
+<line x1="650.0" y1="62" x2="650.0" y2="360" stroke="#30363d" stroke-dasharray="0"/>
+<text x="650.0" y="378" font-size="12" fill="#8b949e" text-anchor="middle">100% of Linux</text>
+<line x1="880.0" y1="62" x2="880.0" y2="360" stroke="#30363d" stroke-dasharray="3 4"/>
+<text x="880.0" y="378" font-size="12" fill="#8b949e" text-anchor="middle">110% of Linux</text>
+<text x="30" y="110" font-size="16" font-weight="600" fill="#e6edf3">Memory fill</text>
+<text x="30" y="130" font-size="12" fill="#8b949e">GB/s</text>
+<rect x="190" y="70" width="460.0" height="22" rx="4" fill="#8b949e"/>
+<text x="658.0" y="86" font-size="13" fill="#c9d1d9" font-weight="400">663</text>
+<rect x="190" y="96" width="411.4" height="22" rx="4" fill="#3b82f6"/>
+<text x="609.4" y="112" font-size="13" fill="#c9d1d9" font-weight="400">649</text>
+<rect x="190" y="122" width="479.1" height="22" rx="4" fill="#76b900"/>
+<text x="677.1" y="138" font-size="13" fill="#b6f03c" font-weight="700">668.5</text>
+<text x="30" y="210" font-size="16" font-weight="600" fill="#e6edf3">Copy kernel</text>
+<text x="30" y="230" font-size="12" fill="#8b949e">GB/s</text>
+<rect x="190" y="170" width="460.0" height="22" rx="4" fill="#8b949e"/>
+<text x="658.0" y="186" font-size="13" fill="#c9d1d9" font-weight="400">293</text>
+<rect x="190" y="196" width="436.5" height="22" rx="4" fill="#3b82f6"/>
+<text x="634.5" y="212" font-size="13" fill="#c9d1d9" font-weight="400">290</text>
+<rect x="190" y="222" width="585.6" height="22" rx="4" fill="#76b900"/>
+<text x="783.6" y="238" font-size="13" fill="#b6f03c" font-weight="700">309</text>
+<text x="30" y="310" font-size="16" font-weight="600" fill="#e6edf3">FP32</text>
+<text x="30" y="330" font-size="12" fill="#8b949e">TFLOPS</text>
+<rect x="190" y="270" width="460.0" height="22" rx="4" fill="#8b949e"/>
+<text x="658.0" y="286" font-size="13" fill="#c9d1d9" font-weight="400">47.27</text>
+<rect x="190" y="296" width="465.4" height="22" rx="4" fill="#3b82f6"/>
+<text x="663.4" y="312" font-size="13" fill="#c9d1d9" font-weight="400">47.38</text>
+<rect x="190" y="322" width="481.9" height="22" rx="4" fill="#76b900"/>
+<text x="679.9" y="338" font-size="13" fill="#b6f03c" font-weight="700">47.72</text>
+<rect x="30" y="388" width="14" height="14" rx="3" fill="#8b949e"/><text x="50" y="400" font-size="13" fill="#c9d1d9">Linux</text>
+<rect x="200" y="388" width="14" height="14" rx="3" fill="#3b82f6"/><text x="220" y="400" font-size="13" fill="#c9d1d9">Windows</text>
+<rect x="370" y="388" width="14" height="14" rx="3" fill="#76b900"/><text x="390" y="400" font-size="13" fill="#c9d1d9">macOS + OpenNVDA</text>
+</svg>
