@@ -383,7 +383,7 @@
     },
     {
       "path": "tests/nvgsp_arena_map_check.cpp",
-      "sha256": "d1c3abce0780ef26ded9d8f9d4eaf88219ee5eaa6df958ddd0147b81bc6cde54"
+      "sha256": "0961b554e18da109a83e2d510354a86f6eb0449647b4c06da82d60c339b519cf"
     },
     {
       "path": "tests/nvgsp_arena_pages_check.cpp",

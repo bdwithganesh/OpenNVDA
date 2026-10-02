@@ -177,7 +177,6 @@ static void runCore() {
     {   // small pages: scattered 4 KiB host pages, owner unbind, no mixing
         FakeVram v2;
         std::unique_ptr<Map> m2(new Map());
-        std::memset(m2.get(), 0, sizeof(Map));
         m2->sparse = gSparse;
         assert(m2->init(v2, 0x200000000ULL));
         const uint64_t base = nvgsp::kArenaBase + 0x40000000ULL + 0x1f0000;  // crosses a 2 MiB region
