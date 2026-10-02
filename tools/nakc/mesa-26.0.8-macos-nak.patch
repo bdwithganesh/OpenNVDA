@@ -1,0 +1,118 @@
+--- a/meson.build	2026-05-27 22:32:08
++++ b/meson.build	2026-09-26 02:43:50
+@@ -884,9 +884,9 @@
+   with_gallium_iris, with_gallium_crocus, with_intel_vk, with_intel_hasvk,
+   with_gallium_asahi, with_asahi_vk, with_tools.contains('asahi'),
+   with_gallium_panfrost, with_panfrost_vk,
+-  with_nouveau_vk, with_imagination_vk,
++  with_imagination_vk,
+   with_kosmickrisp_vk,
+-].contains(true)
++].contains(true)  # macOS NAK-only build: nouveau_vk CL shaders skipped
+ 
+ if get_option('mesa-clc') == 'system'
+   prog_mesa_clc = find_program('mesa_clc', native : true)
+@@ -1768,7 +1768,7 @@
+ allow_fallback_for_libdrm = get_option('allow-fallback-for').contains('libdrm')
+ 
+ with_gallium_drisw_kms = false
+-if system_has_kms_drm
++if system_has_kms_drm or host_machine.system() == 'darwin'  # macOS NAK-only build: headers for nak_bindings
+   dep_libdrm = dependency(
+     'libdrm', version : '>=' + _drm_ver,
+     required : with_dri2 or with_dri or with_gbm,
+--- a/src/nouveau/meson.build	2026-05-27 22:32:08
++++ b/src/nouveau/meson.build	2026-09-26 02:38:14
+@@ -13,7 +13,7 @@
+   subdir('drm-shim')
+ endif
+ 
+-if with_nouveau_vk
++if with_nouveau_vk and host_machine.system() != 'darwin'
+   subdir('mme')
+   subdir('vulkan')
+ endif
+diff --git a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
+index bddca60..98d3de2 100644
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -34,6 +34,8 @@ nak_nir_load_sysval(nir_builder *b, enum nak_sv idx,
+    case NAK_SV_PRIM_TYPE:
+    case NAK_SV_CLOCK_LO:
+    case NAK_SV_CLOCK_HI:
++   case NAK_SV_GLOBALTIMER_LO:
++   case NAK_SV_GLOBALTIMER_HI:
+    case NAK_SV_VARIABLE_RATE:
+       divergent = false;
+       break;
+@@ -631,7 +633,14 @@ nak_nir_lower_system_value_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
+       nir_variable *clock =
+          nir_local_variable_create(b->impl, glsl_uvec2_type(), NULL);
+ 
+-      nir_def *clock_hi = nak_nir_load_sysval(b, NAK_SV_CLOCK_HI, 0);
++      /* Device scope (clockRealtimeEXT / OpReadClockKHR Device) is the
++       * nanosecond %globaltimer, not the SM cycle counter; same hi/lo/hi
++       * read loop. */
++      const bool realtime = nir_intrinsic_memory_scope(intrin) == SCOPE_DEVICE;
++      const enum nak_sv sv_lo = realtime ? NAK_SV_GLOBALTIMER_LO : NAK_SV_CLOCK_LO;
++      const enum nak_sv sv_hi = realtime ? NAK_SV_GLOBALTIMER_HI : NAK_SV_CLOCK_HI;
++
++      nir_def *clock_hi = nak_nir_load_sysval(b, sv_hi, 0);
+       nir_ssa_bar_nv(b, clock_hi);
+ 
+       nir_store_var(b, clock, nir_vec2(b, nir_imm_int(b, 0), clock_hi), 0x3);
+@@ -640,10 +649,10 @@ nak_nir_lower_system_value_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
+       {
+          nir_def *last_clock = nir_load_var(b, clock);
+ 
+-         nir_def *clock_lo = nak_nir_load_sysval(b, NAK_SV_CLOCK_LO, 0);
++         nir_def *clock_lo = nak_nir_load_sysval(b, sv_lo, 0);
+          nir_ssa_bar_nv(b, clock_lo);
+ 
+-         clock_hi = nak_nir_load_sysval(b, NAK_SV_CLOCK + 1, 0);
++         clock_hi = nak_nir_load_sysval(b, sv_hi, 0);
+          nir_ssa_bar_nv(b, clock_hi);
+ 
+          nir_store_var(b, clock, nir_vec2(b, clock_lo, clock_hi), 0x3);
+diff --git a/src/nouveau/compiler/nak_private.h b/src/nouveau/compiler/nak_private.h
+index 57ec68f..e36e351 100644
+--- a/src/nouveau/compiler/nak_private.h
++++ b/src/nouveau/compiler/nak_private.h
+@@ -128,6 +128,9 @@ enum ENUM_PACKED nak_sv {
+    NAK_SV_CLOCK_LO         = 0x50,
+    NAK_SV_CLOCK_HI         = 0x51,
+    NAK_SV_CLOCK            = NAK_SV_CLOCK_LO,
++   /* %globaltimer: device-wide nanosecond timer (clockRealtimeEXT) */
++   NAK_SV_GLOBALTIMER_LO   = 0x52,
++   NAK_SV_GLOBALTIMER_HI   = 0x53,
+    NAK_SV_VARIABLE_RATE    = 0x84,
+ };
+ 
+--- a/src/compiler/nir/nir_divergence_analysis.c	2026-09-28 10:40:54
++++ b/src/compiler/nir/nir_divergence_analysis.c	2026-09-28 10:40:48
+@@ -181,6 +181,25 @@
+    mesa_shader_stage stage = state->stage;
+    bool is_divergent = false;
+ 
++   /* macOS NAK: on NVIDIA, helper pixels skip memory loads and read 0, so a
++    * load from a uniform address in a fragment shader is not uniform once
++    * helpers share the warp (R2UR could take a helper's zero).
++    */
++   if (stage == MESA_SHADER_FRAGMENT) {
++      switch (instr->intrinsic) {
++      case nir_intrinsic_load_global:
++      case nir_intrinsic_load_global_2x32:
++      case nir_intrinsic_load_global_constant:
++      case nir_intrinsic_load_ssbo:
++      case nir_intrinsic_global_atomic:
++      case nir_intrinsic_global_atomic_swap:
++         instr->def.divergent = true;
++         return true;
++      default:
++         break;
++      }
++   }
++
+    switch (instr->intrinsic) {
+    case nir_intrinsic_shader_clock:
+    case nir_intrinsic_ballot:

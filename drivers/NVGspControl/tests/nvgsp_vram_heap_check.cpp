@@ -4,7 +4,7 @@
 #include <cstdlib>
 #include <vector>
 
-// reference: the old first fit in the kext (rescans every object on each move)
+// Reference: the pre-0.126.0 kext first fit (rescan all objects on every move).
 struct Obj { uint64_t phys, bytes; bool live; };
 static bool refFit(const std::vector<Obj> &o, uint64_t start, uint64_t end, uint64_t bytes,
                    uint64_t *out) {
@@ -50,7 +50,7 @@ int main() {
     assert(!h.insert(G1 + 100 * M2, M2));
     h.clear();
 
-    // Randomized comparison against the old algorithm, incl. the window-first policy
+    // randomized comparison against the old algorithm, incl. the window-first policy
     static VramHeap<512> H;
     std::vector<Obj> ref;
     srand(12345);

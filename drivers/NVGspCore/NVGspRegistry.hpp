@@ -4,14 +4,15 @@
 
 namespace nvgsp {
 
-// GSP-RM registry (SET_REGISTRY, rpc 73) built from a
-// "Key=Value;Key2=Value2" spec, the same syntax as NVIDIA's and nouveau's
+// 0.113.0: GSP-RM registry (SET_REGISTRY, rpc 73) built from a
+// "Key=Value;Key2=Value2" spec — the same syntax as NVIDIA's and nouveau's
 // NVreg_RegistryDwords. Numbers (decimal or 0x hex) become DWORD entries,
 // anything else a STRING entry. Layout (nouveau r535 build_registry /
-// NVIDIA PACKED_REGISTRY_TABLE): u32 size, u32 numEntries, numEntries x
-// {u32 nameOffset, u8 type, pad[3], u32 data, u32 length}, then per entry:
-// NUL-terminated key, [STRING value bytes] data = the dword, or the table
-// offset of the string value.
+// NVIDIA PACKED_REGISTRY_TABLE):
+//   u32 size, u32 numEntries,
+//   numEntries x {u32 nameOffset, u8 type, pad[3], u32 data, u32 length},
+//   then per entry: NUL-terminated key, [STRING value bytes]
+// data = the dword, or the table offset of the string value.
 constexpr uint8_t kRegistryTypeDword = 1;
 constexpr uint8_t kRegistryTypeString = 3;
 constexpr uint32_t kRegistryMaxEntries = 32;

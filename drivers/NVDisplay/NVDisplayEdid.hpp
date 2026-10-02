@@ -1,4 +1,4 @@
-// NVDisplayEdid.hpp, tiny freestanding EDID parser shared by NVDisplay (kernel)
+// NVDisplayEdid.hpp — tiny freestanding EDID parser shared by NVDisplay (kernel)
 // and tests/nvdisplay_edid_check.cpp (host).
 //
 // Plain C++14, <stdint.h> only: no library calls, no allocation, no exceptions.
@@ -30,7 +30,7 @@ enum TimingFlags : uint8_t {
     kFlagInterlaced = 0x02,
     kFlagHSyncPositive = 0x04,
     kFlagVSyncPositive = 0x08,
-    kFlagDetailed = 0x10,    // Full timing known (DTD); standard timings only have size+rate
+    kFlagDetailed = 0x10,    // full timing known (DTD); standard timings only have size+rate
 };
 
 struct Timing {

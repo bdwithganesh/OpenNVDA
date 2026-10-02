@@ -4,14 +4,14 @@
 
 <br>
 
-![macOS](https://img.shields.io/badge/macOS-Sonoma%2014.8.9-000000?logo=apple&logoColor=white)
+![macOS](https://img.shields.io/badge/macOS-Tahoe%2026.7-000000?logo=apple&logoColor=white)
 ![GPU](https://img.shields.io/badge/GPU-RTX%204080%20(AD103)-76B900?logo=nvidia&logoColor=white)
 ![Firmware](https://img.shields.io/badge/GSP--RM-r570.144-76B900)
 ![Status](https://img.shields.io/badge/status-experimental-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 [![Stars](https://img.shields.io/github/stars/bdwithganesh/OpenNVDA?style=social)](https://github.com/bdwithganesh/OpenNVDA/stargazers)
 
-**The GPU's own firmware, booted from a macOS kext. A real display driver, compute, video decode, Vulkan, and Metal coming up on top.**
+**RTX 4080 on macOS Tahoe: GSP-RM, an accelerated desktop, Metal and a lot of unfinished driver work.**
 <br>
 Not a framebuffer hack. Not a VM. Bare metal.
 
@@ -32,40 +32,46 @@ We wanted to see how far one person could actually push it. Turns out, pretty fa
 
 ## ✅ What works today
 
-Everything here ran on real hardware, on this exact box:
+The current test machine runs Tahoe 26.7. This is the 2 October 2026 checkpoint, not a release.
 
-| | |
+| Part | Tested setup |
 |---|---|
 | **Board** | MSI X870E GAMING PLUS WIFI |
 | **CPU** | AMD Ryzen 9 7950X |
 | **GPU** | NVIDIA GeForce RTX 4080 16 GB (AD103, Ada Lovelace) |
-| **OS** | macOS Sonoma 14.8.9 |
-| **GPU firmware** | NVIDIA GSP-RM r570.144 |
+| **OS / firmware** | macOS Tahoe 26.7 / NVIDIA GSP-RM r570.144 |
+| **Installed stack** | NVGspControl 0.178.27, NVAccelerator 0.5.17, NVMTLDriver 0.8.69, NVDisplay 0.9.6 |
+| **Published control source** | 0.178.29; host checks and kernel SDK build pass, not installed on the test machine yet |
 
-#### 🟢 Working
+#### 🟢 Checked on the machine
 
-- **GSP-RM boot from a macOS kext.** The FWSEC and SEC2 booter chain is all done by us.
-- **Display:** 4K 60 Hz on DisplayPort, EDID, hotplug, vblank interrupts, DPMS.
-- **Resizable BAR set up by the kext itself.** 16 GiB BAR1, even though macOS only sizes BARs up to 1 GiB.
-- **Write-combined VRAM mappings.** We fixed the PAT so XNU's WC is real: CPU writes to VRAM went from 2.1 to 9.4 GB/s.
-- **Power:** idles in P8 like on Windows, boosts to ~2850 MHz under load.
-- **Compute:** our own QMD submission, with shaders compiled by Mesa's NAK.
-- **Vulkan:** NVK (Mesa) runs on our kext. Host-visible buffers live in VRAM (vkcopy 44 GB/s).
-- **Video decode:** NVDEC H.264 through VideoToolbox, bit-exact against libavcodec. HEVC works too.
+- **Accelerated desktop at 4K60.** WindowServer stays up; the screenshots below show Finder and Safari frames captured from the real scanout surface.
+- **Focused Metal tests:** 39 different cases pass. The separate depth/stencil test passes all 75 checks. These are useful regression checks, not full Metal conformance.
+- **Output LUT effect:** with one fixed gray-ramp input, identity → half gain → identity changes the raster and DisplayPort CRCs, then returns exactly to the original values. The compositor CRC stays the same. Raw receipts are in [the evidence folder](docs/evidence/2026-10-02/README.md).
 
-#### 🟡 Working, needs hardening
+#### 🟡 Working, still being checked
 
-- **Metal:** device, buffers, textures, blits, compute, render, MSAA, tessellation, MPS kernels.
-- **WindowServer composites on our GPU.** Flips go through IOAccelDisplayPipe but are still a CPU copy (6.6 ms per 4K frame).
-- **Activity Monitor:** GPU graph and per-app GPU memory.
+- **Metal and WindowServer** run, but app coverage and long-session stability are incomplete.
+- **Shared-channel recovery** passed an earlier 600-second checked workload on control 0.178.25. It has not been repeated on the current display checkpoint.
+- **Cursor programming** can reach the actual enabled hardware state under a controlled normal composition/LUT pipeline. That has not proved that the cursor bitmap reaches the output. Production still uses the software cursor.
+- **NVK, NVDEC and low-level compute** have earlier focused results. This update includes their source; it does not claim a fresh full Vulkan or video qualification run.
 
-#### 🔴 Not there yet
+#### 🔴 Still blocking a release
 
-- **Full login session on the native Metal path.** Some draws hang the graphics engine in a real user session. This is the main thing being chased.
-- **Hardware cursor.** The core channel throws an exception.
-- **GPU reset recovery without a reboot.** Partial.
-- **Sleep (S3).** GSP comes back, but the display PLL isn't reprogrammed, so the monitor sees no signal.
-- **macOS Tahoe 26.** Not ported yet. Tahoe already installs and boots on the same PC with the GPU driver off.
+- **Hardware cursor output:** CRC capture stops completing when the test cursor is enabled. PIO channel setup and point initialization did not fix it. The failed logs are published too.
+- **Private-channel recovery:** a post-reset mixed workload failed with RC109. Shared containment stays in place.
+- **Real app compatibility:** Geekbench 7 Metal Background Blur aborts on an unsupported AIR typed load. The bounded OpenCL run did not finish either; there is no completed score.
+- **Direct scan-out, production gamma controls, calibrated colour, HDR/VRR, sleep/wake, all-day use and installation qualification** remain open. The code and the screenshots do not establish Apple parity.
+
+### A couple of actual frames
+
+[![Safari running on the Tahoe target](docs/evidence/2026-10-02/safari-on-tahoe.png)](docs/evidence/2026-10-02/safari-on-tahoe.png)
+
+Safari on the target at 20:50 IST, after the unchanged-driver reboot and the 39-case Metal / 75-check depth tests. It shows the OpenNVDA page as it existed before this push.
+
+[![Desktop after the controlled LUT tests](docs/evidence/2026-10-02/desktop-after-lut.png)](docs/evidence/2026-10-02/desktop-after-lut.png)
+
+Desktop at 18:00 IST after the LUT trials and restoration. Both images are original 3840×2160 framebuffer captures. They show rendered desktop frames and the software pointer; separate hardware cursor and LUT stages are not captured by this method. [Logs, CRC values, hashes and what each result actually proves](docs/evidence/2026-10-02/README.md).
 
 ## 📊 The numbers
 
@@ -82,10 +88,10 @@ Everything here ran on real hardware, on this exact box:
 | FP32 compute | 47.27 TFLOPS | 47.38 TFLOPS | **47.72 TFLOPS** |
 | Host ↔ GPU (pinned / shared) | 26.9 / 26.4 GB/s | 26.8 / 26.4 GB/s | 26 GB/s |
 
-On raw compute, the 4080 on macOS keeps up with NVIDIA's own drivers on the same machine.
+These are earlier same-card low-level measurements. They were not rerun for the 2 October Tahoe checkpoint; use them as reference numbers, not a current app-performance claim.
 
 > [!IMPORTANT]
-> These numbers come from our low-level runtime (`nvrun` + NAK shaders), not from Metal apps. Metal on top is much younger. Tiled SGEMM through Metal does about **3.2 TFLOPS** today, and dispatch latency is around **50 µs**. Closing that gap is the main work left.
+> These numbers come from our low-level runtime (`nvrun` + NAK shaders), not from Metal apps. Metal on top is much younger. The earlier Metal measurements were about **3.2 TFLOPS** for tiled SGEMM and **50 µs** dispatch latency. App correctness, recovery and the performance gap all still need work.
 
 <details>
 <summary><b>How these were measured</b></summary>
@@ -152,6 +158,7 @@ You need MacKernelSDK and a workspace from `macos-lab/workspace.sh`, which links
 
 ```sh
 python3 tools/gen_booter_unload.py /path/to/linux-firmware/nvidia/ad103/gsp/booter_unload-570.144.bin
+# Supply your own firmware inputs to tools/nvgsp_package.py; see --help.
 sh tools/build_kext.sh NVGspControl /path/to/MacKernelSDK [gsp-package.bin]
 sh tools/build_kext.sh NVDisplay    /path/to/MacKernelSDK
 ```
@@ -159,7 +166,7 @@ sh tools/build_kext.sh NVDisplay    /path/to/MacKernelSDK
 > [!CAUTION]
 > **No NVIDIA firmware is in this repo, and none ever will be.** GSP-RM, the booters and the VBIOS belong to NVIDIA. You take them from linux-firmware or your own NVIDIA driver install, and `nvgsp_package.py` packs them for the kext.
 
-Host tests live next to each part:
+Run the hardware-free source checks with `sh tests/run_host_checks.sh`. They exercise the actual driver/probe code against mocks and check the shared core helpers. This does not load a driver. Other tests live next to each part:
 - `drivers/NVGspControl/tests`
 - `drivers/nvdec/tests/*/run.sh`
 - `drivers/nvk-macos/tests/nvkmd_macos/run.sh`
@@ -182,8 +189,10 @@ Host tests live next to each part:
 - [ ] Stable login session on the native Metal path
 - [ ] Direct scan-out flips (no CPU copy)
 - [ ] Metal apps at the same speed as the raw numbers
-- [ ] Hardware cursor, sleep/wake, GPU reset recovery
-- [ ] macOS Tahoe 26
+- [ ] Hardware cursor output, sleep/wake, private-channel GPU reset recovery
+- [ ] Production gamma controls and calibrated display validation
+- [x] macOS Tahoe 26 basic bring-up and focused Metal checks
+- [ ] Tahoe app coverage and long-session qualification
 - [ ] PyTorch (MPS), then MLX, on the RTX
 
 ## ☕ Want this to become a real driver?

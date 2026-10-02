@@ -1,0 +1,1011 @@
+--- a/meson.build	2026-05-27 22:32:08
++++ b/meson.build	2026-09-26 02:43:50
+@@ -884,9 +884,9 @@
+   with_gallium_iris, with_gallium_crocus, with_intel_vk, with_intel_hasvk,
+   with_gallium_asahi, with_asahi_vk, with_tools.contains('asahi'),
+   with_gallium_panfrost, with_panfrost_vk,
+-  with_nouveau_vk, with_imagination_vk,
++  with_imagination_vk,
+   with_kosmickrisp_vk,
+-].contains(true)
++].contains(true)  # macOS NAK-only build: nouveau_vk CL shaders skipped
+ 
+ if get_option('mesa-clc') == 'system'
+   prog_mesa_clc = find_program('mesa_clc', native : true)
+@@ -1768,7 +1768,7 @@
+ allow_fallback_for_libdrm = get_option('allow-fallback-for').contains('libdrm')
+ 
+ with_gallium_drisw_kms = false
+-if system_has_kms_drm
++if system_has_kms_drm or host_machine.system() == 'darwin'  # macOS NAK-only build: headers for nak_bindings
+   dep_libdrm = dependency(
+     'libdrm', version : '>=' + _drm_ver,
+     required : with_dri2 or with_dri or with_gbm,
+--- a/src/nouveau/vulkan/meson.build	2026-05-27 22:32:08
++++ b/src/nouveau/vulkan/meson.build	2026-09-26 09:08:28
+@@ -67,16 +67,24 @@
+   'nvk_upload_queue.h',
+   'nvk_wsi.c',
+   'nvk_wsi.h',
+-  'nvkmd/nouveau/nvkmd_nouveau.h',
+-  'nvkmd/nouveau/nvkmd_nouveau_ctx.c',
+-  'nvkmd/nouveau/nvkmd_nouveau_dev.c',
+-  'nvkmd/nouveau/nvkmd_nouveau_mem.c',
+-  'nvkmd/nouveau/nvkmd_nouveau_pdev.c',
+-  'nvkmd/nouveau/nvkmd_nouveau_va.c',
+   'nvkmd/nvkmd.c',
+   'nvkmd/nvkmd.h',
+ )
+ 
++# macOS: NVGspControl kext backend instead of nouveau DRM (nvkmd_macos)
++if host_machine.system() == 'darwin'
++  nvk_files += files('nvkmd/macos/nvkmd_macos.c', 'nvkmd/macos/libdrm_stubs.c')
++else
++  nvk_files += files(
++    'nvkmd/nouveau/nvkmd_nouveau.h',
++    'nvkmd/nouveau/nvkmd_nouveau_ctx.c',
++    'nvkmd/nouveau/nvkmd_nouveau_dev.c',
++    'nvkmd/nouveau/nvkmd_nouveau_mem.c',
++    'nvkmd/nouveau/nvkmd_nouveau_pdev.c',
++    'nvkmd/nouveau/nvkmd_nouveau_va.c',
++  )
++endif
++
+ nvkcl_files = files(
+   'cl/nvk_query.cl',
+ )
+@@ -93,6 +101,11 @@
+   depend_files : vk_entrypoints_gen_depend_files,
+ )
+ 
++if host_machine.system() == 'darwin'
++  nvkcl = []
++  inc_nvkcl_stub = include_directories('nvkcl_stub')
++else
++inc_nvkcl_stub = []
+ nvkcl_spv = custom_target(
+   input : nvkcl_files,
+   output : 'nvkcl.spv',
+@@ -111,6 +124,7 @@
+   output : ['nvkcl.cpp', 'nvkcl.h'],
+   command : [prog_vtn_bindgen2, '@INPUT@', '@OUTPUT@'],
+ )
++endif
+ 
+ nvk_deps = [
+   dep_libdrm,
+@@ -145,16 +159,21 @@
+   include_directories : [
+     inc_include,
+     inc_src,
++    inc_nvkcl_stub,
+   ],
+   dependencies : nvk_deps,
+   c_args : [no_override_init_args, nvk_flags],
+   gnu_symbol_visibility : 'hidden',
+ )
+ 
++nvk_os_link_args = []
++if host_machine.system() == 'darwin'
++  nvk_os_link_args = ['-framework', 'IOKit', '-framework', 'CoreFoundation', '-Wl,-undefined,dynamic_lookup']
++endif
+ libvulkan_nouveau = shared_library(
+   'vulkan_nouveau',
+   link_whole : [libnvk],
+-  link_args: [ld_args_build_id, ld_args_bsymbolic, ld_args_gc_sections],
++  link_args: [ld_args_build_id, ld_args_bsymbolic, ld_args_gc_sections, nvk_os_link_args],
+   gnu_symbol_visibility : 'hidden',
+   install : true,
+ )
+--- a/src/nouveau/vulkan/nvkmd/nvkmd.c	2026-05-27 22:32:08
++++ b/src/nouveau/vulkan/nvkmd/nvkmd.c	2026-09-26 09:04:04
+@@ -4,7 +4,13 @@
+  */
+ 
+ #include "nvkmd.h"
++#ifdef __APPLE__
++VkResult nvkmd_macos_try_create_pdev(struct vk_object_base *log_obj,
++                                     enum nvk_debug debug_flags,
++                                     struct nvkmd_pdev **pdev_out);
++#else
+ #include "nouveau/nvkmd_nouveau.h"
++#endif
+ #include "nv_push.h"
+ #include "util/cache_ops.h"
+ #include "util/u_math.h"
+@@ -88,8 +94,12 @@
+                               enum nvk_debug debug_flags,
+                               struct nvkmd_pdev **pdev_out)
+ {
++#ifdef __APPLE__
++   return nvkmd_macos_try_create_pdev(log_obj, debug_flags, pdev_out);
++#else
+    return nvkmd_nouveau_try_create_pdev(drm_device, log_obj,
+                                         debug_flags, pdev_out);
++#endif
+ }
+ 
+ VkResult MUST_CHECK
+--- a/src/nouveau/vulkan/nvk_instance.c	2026-05-27 22:32:08
++++ b/src/nouveau/vulkan/nvk_instance.c	2026-09-26 09:06:35
+@@ -129,6 +129,21 @@
+       instance->debug_flags |= NVK_DEBUG_ZERO_MEMORY;
+ }
+ 
++#ifdef __APPLE__
++static VkResult
++nvk_macos_enumerate_physical_devices(struct vk_instance *vk_instance)
++{
++   struct vk_physical_device *pdev = NULL;
++   VkResult result = nvk_create_drm_physical_device(vk_instance, NULL, &pdev);
++   if (result == VK_ERROR_INCOMPATIBLE_DRIVER)
++      return VK_SUCCESS;   /* no GPU: zero devices */
++   if (result != VK_SUCCESS)
++      return result;
++   list_addtail(&pdev->link, &vk_instance->physical_devices.list);
++   return VK_SUCCESS;
++}
++#endif
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ nvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+                    const VkAllocationCallbacks *pAllocator,
+@@ -161,10 +176,28 @@
+    nvk_init_debug_flags(instance);
+    nvk_init_dri_options(instance);
+ 
++#ifdef __APPLE__
++   /* No DRM on macOS: one physical device through the NVGspControl kext. */
++   instance->vk.physical_devices.enumerate = nvk_macos_enumerate_physical_devices;
++#else
+    instance->vk.physical_devices.try_create_for_drm =
+       nvk_create_drm_physical_device;
++#endif
+    instance->vk.physical_devices.destroy = nvk_physical_device_destroy;
+ 
++#ifdef __APPLE__
++   /* Mach-O has no GNU build-id note: derive the cache UUID from the
++    * version string (stable per build of this driver). */
++   {
++      struct mesa_sha1 sha1_ctx;
++      uint8_t sha1[SHA1_DIGEST_LENGTH];
++      _mesa_sha1_init(&sha1_ctx);
++      _mesa_sha1_update(&sha1_ctx, PACKAGE_VERSION " nvk-macos",
++                        strlen(PACKAGE_VERSION " nvk-macos"));
++      _mesa_sha1_final(&sha1_ctx, sha1);
++      memcpy(instance->driver_build_sha, sha1, sizeof(instance->driver_build_sha));
++   }
++#else
+    const struct build_id_note *note =
+       build_id_find_nhdr_for_addr(nvk_CreateInstance);
+    if (!note) {
+@@ -182,6 +215,7 @@
+ 
+    STATIC_ASSERT(sizeof(instance->driver_build_sha) == SHA1_DIGEST_LENGTH);
+    copy_build_id_to_sha1(instance->driver_build_sha, note);
++#endif
+ 
+    *pInstance = nvk_instance_to_handle(instance);
+    return VK_SUCCESS;
+--- a/src/nouveau/vulkan/nvk_physical_device.c	2026-05-27 22:32:08
++++ b/src/nouveau/vulkan/nvk_physical_device.c	2026-09-26 09:04:48
+@@ -16,7 +16,9 @@
+ #include "nvk_shader.h"
+ #include "nvk_wsi.h"
+ #include "nvkmd/nvkmd.h"
++#ifndef __APPLE__
+ #include "nvkmd/nouveau/nvkmd_nouveau.h"
++#endif
+ #include "git_sha1.h"
+ #include "util/detect_os.h"
+ #include "util/disk_cache.h"
+@@ -28,7 +30,9 @@
+ #include "vk_shader_module.h"
+ #include "vulkan/wsi/wsi_common.h"
+ 
++#ifndef __APPLE__
+ #include <sys/sysmacros.h>
++#endif
+ 
+ #include "nv_push.h"
+ #include "cl90c0.h"
+--- a/src/nouveau/vulkan/nvk_mem_arena.h	2026-05-27 22:32:08
++++ b/src/nouveau/vulkan/nvk_mem_arena.h	2026-09-26 09:12:23
+@@ -13,7 +13,12 @@
+ 
+ struct nvk_device;
+ 
++#ifdef __APPLE__
++/* nvkmd_macos binds with 2 MiB kernel PTEs */
++#define NVK_MEM_ARENA_MIN_SIZE_LOG2 21
++#else
+ #define NVK_MEM_ARENA_MIN_SIZE_LOG2 16
++#endif
+ #define NVK_MEM_ARENA_MAX_SIZE_LOG2 32
+ #define NVK_MEM_ARENA_MIN_SIZE (1ull << NVK_MEM_ARENA_MIN_SIZE_LOG2)
+ #define NVK_MEM_ARENA_MAX_SIZE (1ull << NVK_MEM_ARENA_MAX_SIZE_LOG2)
+--- a/src/vulkan/runtime/vk_image.h	2026-05-27 22:32:08
++++ b/src/vulkan/runtime/vk_image.h	2026-09-26 09:06:35
+@@ -75,7 +75,7 @@
+    /* wsi_image_create_info::scanout */
+    bool wsi_legacy_scanout;
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
+    /* VK_EXT_drm_format_modifier
+     *
+     * Initialized by vk_image_create/init() to DRM_FORMAT_MOD_INVALID.  It's
+--- a/src/vulkan/runtime/vk_image.c	2026-05-27 22:32:08
++++ b/src/vulkan/runtime/vk_image.c	2026-09-26 09:06:35
+@@ -23,7 +23,7 @@
+ 
+ #include "vk_image.h"
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
+ #include <drm-uapi/drm_fourcc.h>
+ #endif
+ 
+@@ -96,7 +96,7 @@
+       vk_find_struct_const(pCreateInfo->pNext, WSI_IMAGE_CREATE_INFO_MESA);
+    image->wsi_legacy_scanout = wsi_info && wsi_info->scanout;
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
+    image->drm_format_mod = ((1ULL << 56) - 1) /* DRM_FORMAT_MOD_INVALID */;
+ #endif
+ 
+@@ -168,7 +168,7 @@
+    vk_object_free(device, alloc, image);
+ }
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
+ VKAPI_ATTR VkResult VKAPI_CALL
+ vk_common_GetImageDrmFormatModifierPropertiesEXT(UNUSED VkDevice device,
+                                                  VkImage _image,
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/macos/nvkmd_macos.c
+@@ -0,0 +1,659 @@
++/*
++ * nvkmd_macos: NVK kernel-mode-driver backend for macOS on top of the
++ * NVGspControl kext user client (RTX 4080 / AD103, GSP-RM r570.144).
++ *
++ * Kernel interface (NVGspControl >= 0.107.0 user-client selectors):
++ *   17 GR submit async (kernel-built)   18 GR fence wait {seq, timeout_us}
++ *   20 vaBind {va, phys, bytes (0 = unbind 2 MiB), flags}
++ *   21 execSegments {engine} + n x {u64 va, u32 dwords, u32 pad} -> seq
++ *   22 memAlloc {bytes, domain 0 VRAM / 1 SYS} -> {handle, phys}
++ *   23 memFree {handle}        24 vaBindObject {handle, va, kind}
++ *   map type 0x1000 | handle   = CPU mapping of a SYS object
++ *
++ * Model: all engines (3D, compute, copy, 2D) share the kext's single GR
++ * channel, so submissions execute in order and GPU-side waits on our own
++ * fences are implicit; CPU waits poll the GR fence. Memory and VA granule
++ * is 2 MiB (kernel PTE size). Device-local memory is not CPU-mappable (no
++ * ReBAR/BAR1 path yet), so CAN_MAP / GART allocations live in system memory.
++ */
++#include "nvkmd/nvkmd.h"
++#include "nvk_entrypoints.h"
++
++#include "vk_device.h"
++#include "vk_log.h"
++#include "vk_sync.h"
++#include "vk_sync_timeline.h"
++#include "util/os_time.h"
++#include "util/u_math.h"
++#include "util/u_memory.h"
++
++#include <IOKit/IOKitLib.h>
++#include <mach/mach.h>
++#include <string.h>
++#include <time.h>
++#include <stdio.h>
++
++#define MACOS_ERR(obj, err) (fprintf(stderr, "[nvkmd_macos] %s:%d -> %d\n", __func__, __LINE__, (int)(err)), vk_error(obj, err))
++
++VkResult nvkmd_macos_try_create_pdev(struct vk_object_base *log_obj,
++                                     enum nvk_debug debug_flags,
++                                     struct nvkmd_pdev **pdev_out);
++
++#define NVKMD_MACOS_ARENA_BASE 0x2800000000ull
++#define NVKMD_MACOS_ARENA_END  0x3000000000ull
++#define NVKMD_MACOS_GRAN       0x200000ull
++
++struct nvkmd_macos_pdev {
++   struct nvkmd_pdev base;
++   io_connect_t conn;
++   struct vk_sync_type sync_type;
++   struct vk_sync_timeline_type timeline_type;
++   const struct vk_sync_type *sync_types[3];
++};
++
++struct nvkmd_macos_dev {
++   struct nvkmd_dev base;
++   io_connect_t conn;
++   simple_mtx_t va_lock;
++   /* trivial VA allocator: bump + free list of exact-size holes */
++   uint64_t va_next;
++   struct { uint64_t addr, size; } holes[256];
++   uint32_t hole_count;
++};
++
++struct nvkmd_macos_mem {
++   struct nvkmd_mem base;
++   uint32_t handle;
++   uint64_t phys;
++   bool sys;
++};
++
++struct nvkmd_macos_va {
++   struct nvkmd_va base;
++};
++
++struct nvkmd_macos_ctx {
++   struct nvkmd_ctx base;
++   uint32_t last_seq;
++};
++
++/* A binary sync backed by a GR fence sequence number. */
++struct nvkmd_macos_sync {
++   struct vk_sync base;
++   uint32_t seq;        /* 0: not submitted */
++   bool signaled;       /* CPU-signaled */
++};
++
++static io_connect_t
++nvkmd_macos_conn(struct vk_device *vk_dev);
++
++/* ---------------------------------------------------------------- kext */
++
++static VkResult
++kext_fence_wait(io_connect_t conn, uint32_t seq, uint64_t timeout_us)
++{
++   uint64_t in[2] = { seq, MIN2(timeout_us, 5000000) }, out = 0;
++   uint32_t cnt = 1;
++   kern_return_t kr = IOConnectCallMethod(conn, 18, in, 2, NULL, 0,
++                                          &out, &cnt, NULL, NULL);
++   if (kr == kIOReturnTimeout)
++      return VK_TIMEOUT;
++   return kr ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
++}
++
++static bool
++kext_va_bind(io_connect_t conn, uint64_t va, uint64_t phys, uint64_t bytes,
++             uint32_t flags)
++{
++   uint64_t in[4] = { va, phys, bytes, flags };
++   return IOConnectCallMethod(conn, 20, in, 4, NULL, 0, NULL, NULL,
++                              NULL, NULL) == KERN_SUCCESS;
++}
++
++/* ---------------------------------------------------------------- sync */
++
++static VkResult
++macos_sync_init(struct vk_device *device, struct vk_sync *sync, uint64_t v)
++{
++   struct nvkmd_macos_sync *s = container_of(sync, struct nvkmd_macos_sync, base);
++   s->seq = 0;
++   s->signaled = v != 0;
++   return VK_SUCCESS;
++}
++
++static void
++macos_sync_finish(struct vk_device *device, struct vk_sync *sync) { }
++
++static VkResult
++macos_sync_signal(struct vk_device *device, struct vk_sync *sync, uint64_t v)
++{
++   struct nvkmd_macos_sync *s = container_of(sync, struct nvkmd_macos_sync, base);
++   s->signaled = true;
++   return VK_SUCCESS;
++}
++
++static VkResult
++macos_sync_reset(struct vk_device *device, struct vk_sync *sync)
++{
++   struct nvkmd_macos_sync *s = container_of(sync, struct nvkmd_macos_sync, base);
++   s->signaled = false;
++   s->seq = 0;
++   return VK_SUCCESS;
++}
++
++static VkResult
++macos_sync_move(struct vk_device *device, struct vk_sync *dst, struct vk_sync *src)
++{
++   struct nvkmd_macos_sync *d = container_of(dst, struct nvkmd_macos_sync, base);
++   struct nvkmd_macos_sync *s = container_of(src, struct nvkmd_macos_sync, base);
++   d->seq = s->seq;
++   d->signaled = s->signaled;
++   s->seq = 0;
++   s->signaled = false;
++   return VK_SUCCESS;
++}
++
++static VkResult
++macos_sync_wait_many(struct vk_device *device, uint32_t wait_count,
++                     const struct vk_sync_wait *waits,
++                     enum vk_sync_wait_flags wait_flags,
++                     uint64_t abs_timeout_ns)
++{
++   io_connect_t conn = nvkmd_macos_conn(device);
++   for (uint32_t i = 0; i < wait_count; i++) {
++      struct nvkmd_macos_sync *s =
++         container_of(waits[i].sync, struct nvkmd_macos_sync, base);
++      for (;;) {
++         if (s->signaled)
++            break;
++         if (s->seq) {
++            if (wait_flags & VK_SYNC_WAIT_PENDING)
++               break;
++            const uint64_t now = os_time_get_nano();
++            const uint64_t us = abs_timeout_ns > now ?
++                                (abs_timeout_ns - now) / 1000 : 0;
++            VkResult r = kext_fence_wait(conn, s->seq, us);
++            if (r != VK_SUCCESS)
++               return r;
++            s->signaled = true;
++            break;
++         }
++         /* wait-before-submit: poll until a queue submission attaches it */
++         if (os_time_get_nano() >= abs_timeout_ns)
++            return VK_TIMEOUT;
++         os_time_sleep(50);
++      }
++      if (wait_flags & VK_SYNC_WAIT_ANY)
++         return VK_SUCCESS;
++   }
++   return VK_SUCCESS;
++}
++
++static const struct vk_sync_type nvkmd_macos_sync_type_template = {
++   .size = sizeof(struct nvkmd_macos_sync),
++   .features = VK_SYNC_FEATURE_BINARY |
++               VK_SYNC_FEATURE_GPU_WAIT |
++               VK_SYNC_FEATURE_CPU_WAIT |
++               VK_SYNC_FEATURE_CPU_RESET |
++               VK_SYNC_FEATURE_CPU_SIGNAL |
++               VK_SYNC_FEATURE_WAIT_ANY |
++               VK_SYNC_FEATURE_WAIT_PENDING,
++   .init = macos_sync_init,
++   .finish = macos_sync_finish,
++   .signal = macos_sync_signal,
++   .reset = macos_sync_reset,
++   .move = macos_sync_move,
++   .wait_many = macos_sync_wait_many,
++};
++
++/* ----------------------------------------------------------------- mem */
++
++static void
++macos_mem_free(struct nvkmd_mem *_mem)
++{
++   struct nvkmd_macos_mem *mem = container_of(_mem, struct nvkmd_macos_mem, base);
++   struct nvkmd_macos_dev *dev =
++      container_of(_mem->dev, struct nvkmd_macos_dev, base);
++   if (_mem->va)
++      nvkmd_va_free(_mem->va);
++   if (_mem->map) {
++      IOConnectUnmapMemory64(dev->conn, 0x1000 | mem->handle, mach_task_self(),
++                             (mach_vm_address_t)_mem->map);
++   }
++   uint64_t h = mem->handle;
++   IOConnectCallMethod(dev->conn, 23, &h, 1, NULL, 0, NULL, NULL, NULL, NULL);
++   FREE(mem);
++}
++
++static VkResult
++macos_mem_map(struct nvkmd_mem *_mem, struct vk_object_base *log_obj,
++              enum nvkmd_mem_map_flags flags, void *fixed_addr, void **map_out)
++{
++   struct nvkmd_macos_mem *mem = container_of(_mem, struct nvkmd_macos_mem, base);
++   struct nvkmd_macos_dev *dev =
++      container_of(_mem->dev, struct nvkmd_macos_dev, base);
++   if (!mem->sys || fixed_addr)
++      return MACOS_ERR(log_obj, VK_ERROR_MEMORY_MAP_FAILED);
++   mach_vm_address_t addr = 0;
++   mach_vm_size_t size = 0;
++   if (IOConnectMapMemory64(dev->conn, 0x1000 | mem->handle, mach_task_self(),
++                            &addr, &size, kIOMapAnywhere))
++      return MACOS_ERR(log_obj, VK_ERROR_MEMORY_MAP_FAILED);
++   *map_out = (void *)addr;
++   return VK_SUCCESS;
++}
++
++static void
++macos_mem_unmap(struct nvkmd_mem *_mem, enum nvkmd_mem_map_flags flags, void *map)
++{
++   struct nvkmd_macos_mem *mem = container_of(_mem, struct nvkmd_macos_mem, base);
++   struct nvkmd_macos_dev *dev =
++      container_of(_mem->dev, struct nvkmd_macos_dev, base);
++   IOConnectUnmapMemory64(dev->conn, 0x1000 | mem->handle, mach_task_self(),
++                          (mach_vm_address_t)map);
++}
++
++static uint32_t
++macos_mem_log_handle(struct nvkmd_mem *_mem)
++{
++   return container_of(_mem, struct nvkmd_macos_mem, base)->handle;
++}
++
++static const struct nvkmd_mem_ops macos_mem_ops = {
++   .free = macos_mem_free,
++   .map = macos_mem_map,
++   .unmap = macos_mem_unmap,
++   .log_handle = macos_mem_log_handle,
++};
++
++/* ------------------------------------------------------------------ va */
++
++static VkResult
++macos_va_bind_mem(struct nvkmd_va *va, struct vk_object_base *log_obj,
++                  uint64_t va_offset_B, struct nvkmd_mem *_mem,
++                  uint64_t mem_offset_B, uint64_t range_B)
++{
++   struct nvkmd_macos_mem *mem = container_of(_mem, struct nvkmd_macos_mem, base);
++   struct nvkmd_macos_dev *dev = container_of(va->dev, struct nvkmd_macos_dev, base);
++   uint64_t addr = va->addr + va_offset_B;
++   /* Kernel PTEs are 2 MiB. NVK grows heaps in 64 KiB steps; when VA and
++    * memory offset share the same 2 MiB phase, bind the enclosing 2 MiB
++    * window (rebinding the same pages is idempotent). */
++   if (((addr ^ mem_offset_B) & (NVKMD_MACOS_GRAN - 1)) != 0) {
++      fprintf(stderr, "[nvkmd_macos] bind va 0x%llx / mem off 0x%llx phase mismatch\n",
++              (unsigned long long)addr, (unsigned long long)mem_offset_B);
++      return MACOS_ERR(log_obj, VK_ERROR_FEATURE_NOT_PRESENT);
++   }
++   const uint64_t head = addr & (NVKMD_MACOS_GRAN - 1);
++   addr -= head;
++   mem_offset_B -= head;
++   range_B = align64(range_B + head, NVKMD_MACOS_GRAN);
++   if (mem_offset_B + range_B > _mem->size_B)
++      range_B = _mem->size_B - mem_offset_B;
++   /* kext selector 24: {handle, va, kind, mem offset, range} (2 MiB units) */
++   uint64_t in[5] = { mem->handle, addr, va->pte_kind, mem_offset_B, range_B };
++   if (IOConnectCallMethod(dev->conn, 24, in, 5, NULL, 0, NULL, NULL, NULL, NULL)) {
++      fprintf(stderr, "[nvkmd_macos] bind va 0x%llx mem %u off 0x%llx range 0x%llx failed\n",
++              (unsigned long long)addr, mem->handle, (unsigned long long)mem_offset_B,
++              (unsigned long long)range_B);
++      return MACOS_ERR(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   }
++   return VK_SUCCESS;
++}
++
++static VkResult
++macos_va_unbind(struct nvkmd_va *va, struct vk_object_base *log_obj,
++                uint64_t va_offset_B, uint64_t range_B)
++{
++   struct nvkmd_macos_dev *dev = container_of(va->dev, struct nvkmd_macos_dev, base);
++   /* Only whole 2 MiB pages are unbound; partial ranges stay mapped (the
++    * neighbouring sub-allocation may still use the page). */
++   const uint64_t start = align64(va->addr + va_offset_B, NVKMD_MACOS_GRAN);
++   const uint64_t end = (va->addr + va_offset_B + range_B) & ~(NVKMD_MACOS_GRAN - 1);
++   for (uint64_t a = start; a < end; a += NVKMD_MACOS_GRAN)
++      kext_va_bind(dev->conn, a, 0, 0, 0);
++   return VK_SUCCESS;
++}
++
++static void
++macos_va_free(struct nvkmd_va *va)
++{
++   struct nvkmd_macos_dev *dev = container_of(va->dev, struct nvkmd_macos_dev, base);
++   simple_mtx_lock(&dev->va_lock);
++   if (dev->hole_count < ARRAY_SIZE(dev->holes)) {
++      dev->holes[dev->hole_count].addr = va->addr;
++      dev->holes[dev->hole_count].size = va->size_B;
++      dev->hole_count++;
++   }
++   simple_mtx_unlock(&dev->va_lock);
++   FREE(container_of(va, struct nvkmd_macos_va, base));
++}
++
++static const struct nvkmd_va_ops macos_va_ops = {
++   .free = macos_va_free,
++   .bind_mem = macos_va_bind_mem,
++   .unbind = macos_va_unbind,
++};
++
++/* ----------------------------------------------------------------- ctx */
++
++static void
++macos_ctx_destroy(struct nvkmd_ctx *ctx)
++{
++   FREE(container_of(ctx, struct nvkmd_macos_ctx, base));
++}
++
++static VkResult
++macos_ctx_wait(struct nvkmd_ctx *ctx, struct vk_object_base *log_obj,
++               uint32_t wait_count, const struct vk_sync_wait *waits)
++{
++   /* Single in-order GR channel: fences of earlier submissions are already
++    * ordered before anything we submit next. */
++   return VK_SUCCESS;
++}
++
++static VkResult
++macos_ctx_exec(struct nvkmd_ctx *_ctx, struct vk_object_base *log_obj,
++               uint32_t exec_count, const struct nvkmd_ctx_exec *execs)
++{
++   struct nvkmd_macos_ctx *ctx = container_of(_ctx, struct nvkmd_macos_ctx, base);
++   struct nvkmd_macos_dev *dev = container_of(_ctx->dev, struct nvkmd_macos_dev, base);
++   struct { uint64_t va; uint32_t dw, pad; } seg[64];
++   for (uint32_t i = 0; i < exec_count;) {
++      uint32_t n = 0;
++      for (; n < 64 && i < exec_count; ++n, ++i) {
++         seg[n].va = execs[i].addr;
++         seg[n].dw = execs[i].size_B / 4;
++         seg[n].pad = 0;
++      }
++      uint64_t engine = 0, seq = 0;
++      uint32_t cnt = 1;
++      if (IOConnectCallMethod(dev->conn, 21, &engine, 1, seg, n * sizeof(seg[0]),
++                              &seq, &cnt, NULL, NULL))
++         return MACOS_ERR(log_obj, VK_ERROR_DEVICE_LOST);
++      ctx->last_seq = (uint32_t)seq;
++   }
++   return VK_SUCCESS;
++}
++
++static VkResult
++macos_ctx_signal(struct nvkmd_ctx *_ctx, struct vk_object_base *log_obj,
++                 uint32_t signal_count, const struct vk_sync_signal *signals)
++{
++   struct nvkmd_macos_ctx *ctx = container_of(_ctx, struct nvkmd_macos_ctx, base);
++   for (uint32_t i = 0; i < signal_count; i++) {
++      struct nvkmd_macos_sync *s =
++         container_of(signals[i].sync, struct nvkmd_macos_sync, base);
++      s->seq = ctx->last_seq;
++      s->signaled = ctx->last_seq == 0;
++   }
++   return VK_SUCCESS;
++}
++
++static VkResult
++macos_ctx_flush(struct nvkmd_ctx *ctx, struct vk_object_base *log_obj)
++{
++   return VK_SUCCESS;
++}
++
++static VkResult
++macos_ctx_bind(struct nvkmd_ctx *ctx, struct vk_object_base *log_obj,
++               uint32_t bind_count, const struct nvkmd_ctx_bind *binds)
++{
++   for (uint32_t i = 0; i < bind_count; i++) {
++      VkResult r = binds[i].op == NVKMD_BIND_OP_BIND ?
++         nvkmd_va_bind_mem(binds[i].va, log_obj, binds[i].va_offset_B,
++                           binds[i].mem, binds[i].mem_offset_B, binds[i].range_B) :
++         nvkmd_va_unbind(binds[i].va, log_obj, binds[i].va_offset_B, binds[i].range_B);
++      if (r != VK_SUCCESS)
++         return r;
++   }
++   return VK_SUCCESS;
++}
++
++static const struct nvkmd_ctx_ops macos_ctx_ops = {
++   .destroy = macos_ctx_destroy,
++   .wait = macos_ctx_wait,
++   .exec = macos_ctx_exec,
++   .bind = macos_ctx_bind,
++   .signal = macos_ctx_signal,
++   .flush = macos_ctx_flush,
++};
++
++/* ----------------------------------------------------------------- dev */
++
++static VkResult
++macos_dev_alloc_va(struct nvkmd_dev *_dev, struct vk_object_base *log_obj,
++                   enum nvkmd_va_flags flags, uint8_t pte_kind,
++                   uint64_t size_B, uint64_t align_B, uint64_t fixed_addr,
++                   struct nvkmd_va **va_out)
++{
++   struct nvkmd_macos_dev *dev = container_of(_dev, struct nvkmd_macos_dev, base);
++   if (flags & NVKMD_VA_SPARSE)
++      return MACOS_ERR(log_obj, VK_ERROR_FEATURE_NOT_PRESENT);
++   size_B = align64(size_B, NVKMD_MACOS_GRAN);
++   align_B = MAX2(align_B, NVKMD_MACOS_GRAN);
++   uint64_t addr = 0;
++   simple_mtx_lock(&dev->va_lock);
++   if (flags & NVKMD_VA_ALLOC_FIXED) {
++      addr = fixed_addr;
++   } else {
++      for (uint32_t i = 0; i < dev->hole_count; i++) {
++         if (dev->holes[i].size == size_B && !(dev->holes[i].addr & (align_B - 1))) {
++            addr = dev->holes[i].addr;
++            dev->holes[i] = dev->holes[--dev->hole_count];
++            break;
++         }
++      }
++      if (!addr) {
++         addr = align64(dev->va_next, align_B);
++         dev->va_next = addr + size_B;
++      }
++   }
++   simple_mtx_unlock(&dev->va_lock);
++   if (addr < NVKMD_MACOS_ARENA_BASE || addr + size_B > NVKMD_MACOS_ARENA_END)
++      return MACOS_ERR(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   struct nvkmd_macos_va *va = CALLOC_STRUCT(nvkmd_macos_va);
++   if (!va)
++      return MACOS_ERR(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++   va->base.ops = &macos_va_ops;
++   va->base.dev = _dev;
++   va->base.flags = flags;
++   va->base.pte_kind = pte_kind;
++   va->base.addr = addr;
++   va->base.size_B = size_B;
++   *va_out = &va->base;
++   return VK_SUCCESS;
++}
++
++static VkResult
++macos_dev_alloc_mem(struct nvkmd_dev *_dev, struct vk_object_base *log_obj,
++                    uint64_t size_B, uint64_t align_B,
++                    enum nvkmd_mem_flags flags, struct nvkmd_mem **mem_out)
++{
++   struct nvkmd_macos_dev *dev = container_of(_dev, struct nvkmd_macos_dev, base);
++   const bool sys = (flags & (NVKMD_MEM_CAN_MAP | NVKMD_MEM_GART)) != 0;
++   size_B = align64(size_B, NVKMD_MACOS_GRAN);
++   uint64_t in[2] = { size_B, sys ? 1 : 0 }, out[2] = { 0, 0 };
++   uint32_t cnt = 2;
++   if (IOConnectCallMethod(dev->conn, 22, in, 2, NULL, 0, out, &cnt, NULL, NULL))
++      return MACOS_ERR(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   struct nvkmd_macos_mem *mem = CALLOC_STRUCT(nvkmd_macos_mem);
++   if (!mem)
++      return MACOS_ERR(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++   nvkmd_mem_init(_dev, &mem->base, &macos_mem_ops, flags, size_B,
++                  NVKMD_MACOS_GRAN);
++   mem->handle = (uint32_t)out[0];
++   mem->phys = out[1];
++   mem->sys = sys;
++   VkResult r = macos_dev_alloc_va(_dev, log_obj, 0, 0, size_B,
++                                   MAX2(align_B, NVKMD_MACOS_GRAN), 0,
++                                   &mem->base.va);
++   if (r == VK_SUCCESS)
++      r = macos_va_bind_mem(mem->base.va, log_obj, 0, &mem->base, 0, size_B);
++   if (r != VK_SUCCESS) {
++      macos_mem_free(&mem->base);
++      return r;
++   }
++   *mem_out = &mem->base;
++   return VK_SUCCESS;
++}
++
++static VkResult
++macos_dev_alloc_tiled_mem(struct nvkmd_dev *dev, struct vk_object_base *log_obj,
++                          uint64_t size_B, uint64_t align_B, uint8_t pte_kind,
++                          uint16_t tile_mode, enum nvkmd_mem_flags flags,
++                          struct nvkmd_mem **mem_out)
++{
++   return MACOS_ERR(log_obj, VK_ERROR_FEATURE_NOT_PRESENT);
++}
++
++static VkResult
++macos_dev_create_ctx(struct nvkmd_dev *_dev, struct vk_object_base *log_obj,
++                     enum nvkmd_engines engines, struct nvkmd_ctx **ctx_out)
++{
++   struct nvkmd_macos_ctx *ctx = CALLOC_STRUCT(nvkmd_macos_ctx);
++   if (!ctx)
++      return MACOS_ERR(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++   ctx->base.ops = &macos_ctx_ops;
++   ctx->base.dev = _dev;
++   *ctx_out = &ctx->base;
++   return VK_SUCCESS;
++}
++
++static uint64_t
++macos_dev_get_gpu_timestamp(struct nvkmd_dev *dev)
++{
++   return os_time_get_nano();
++}
++
++static void
++macos_dev_destroy(struct nvkmd_dev *_dev)
++{
++   struct nvkmd_macos_dev *dev = container_of(_dev, struct nvkmd_macos_dev, base);
++   simple_mtx_destroy(&dev->va_lock);
++   FREE(dev);
++}
++
++static const struct nvkmd_dev_ops macos_dev_ops = {
++   .destroy = macos_dev_destroy,
++   .get_gpu_timestamp = macos_dev_get_gpu_timestamp,
++   .alloc_mem = macos_dev_alloc_mem,
++   .alloc_tiled_mem = macos_dev_alloc_tiled_mem,
++   .alloc_va = macos_dev_alloc_va,
++   .create_ctx = macos_dev_create_ctx,
++};
++
++/* ---------------------------------------------------------------- pdev */
++
++static struct nvkmd_macos_pdev *g_macos_pdev;
++
++static io_connect_t
++nvkmd_macos_conn(struct vk_device *vk_dev)
++{
++   return g_macos_pdev ? g_macos_pdev->conn : IO_OBJECT_NULL;
++}
++
++static VkResult
++macos_pdev_create_dev(struct nvkmd_pdev *_pdev, struct vk_object_base *log_obj,
++                      struct nvkmd_dev **dev_out)
++{
++   struct nvkmd_macos_pdev *pdev = container_of(_pdev, struct nvkmd_macos_pdev, base);
++   struct nvkmd_macos_dev *dev = CALLOC_STRUCT(nvkmd_macos_dev);
++   if (!dev)
++      return MACOS_ERR(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
++   dev->base.ops = &macos_dev_ops;
++   dev->base.pdev = _pdev;
++   dev->base.va_start = NVKMD_MACOS_ARENA_BASE;
++   dev->base.va_end = NVKMD_MACOS_ARENA_END;
++   list_inithead(&dev->base.mems);
++   simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
++   simple_mtx_init(&dev->va_lock, mtx_plain);
++   dev->va_next = NVKMD_MACOS_ARENA_BASE;
++   dev->conn = pdev->conn;
++   *dev_out = &dev->base;
++   return VK_SUCCESS;
++}
++
++static uint64_t
++macos_pdev_get_vram_used(struct nvkmd_pdev *pdev)
++{
++   return 0;
++}
++
++static void
++macos_pdev_destroy(struct nvkmd_pdev *_pdev)
++{
++   struct nvkmd_macos_pdev *pdev = container_of(_pdev, struct nvkmd_macos_pdev, base);
++   IOServiceClose(pdev->conn);
++   if (g_macos_pdev == pdev)
++      g_macos_pdev = NULL;
++   FREE(pdev);
++}
++
++static const struct nvkmd_pdev_ops macos_pdev_ops = {
++   .destroy = macos_pdev_destroy,
++   .get_vram_used = macos_pdev_get_vram_used,
++   .create_dev = macos_pdev_create_dev,
++};
++
++VkResult
++nvkmd_macos_try_create_pdev(struct vk_object_base *log_obj,
++                            enum nvk_debug debug_flags,
++                            struct nvkmd_pdev **pdev_out)
++{
++   io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
++                                                  IOServiceMatching("NVGspControl"));
++   if (!svc)
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++   io_connect_t conn = IO_OBJECT_NULL;
++   kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
++   IOObjectRelease(svc);
++   if (kr)
++      return vk_errorf(log_obj, VK_ERROR_INCOMPATIBLE_DRIVER,
++                       "NVGspControl user client: 0x%x (needs root)", kr);
++
++   struct nvkmd_macos_pdev *pdev = CALLOC_STRUCT(nvkmd_macos_pdev);
++   if (!pdev) {
++      IOServiceClose(conn);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++   pdev->base.ops = &macos_pdev_ops;
++   pdev->base.debug_flags = debug_flags;
++   pdev->conn = conn;
++   struct nv_device_info *info = &pdev->base.dev_info;
++   *info = (struct nv_device_info) {
++      .type = NV_DEVICE_TYPE_DIS,
++      .device_id = 0x2704,
++      .chipset = 0x193,
++      .device_name = "NVIDIA GeForce RTX 4080 (NVK macOS)",
++      .chipset_name = "AD103",
++      .pci = { .domain = 0, .bus = 1, .dev = 0, .func = 0, .revision_id = 0xa1 },
++      .sm = 89,
++      .gpc_count = 7,
++      .tpc_count = 38,
++      .mp_per_tpc = 2,
++      .max_warps_per_mp = 48,
++      .cls_copy = 0xc7b5,
++      .cls_eng2d = 0x902d,
++      .cls_eng3d = 0xc997,
++      .cls_m2mf = 0xa140,
++      .cls_compute = 0xc9c0,
++      .cls_gpfifo = 0xc86f,
++      .vram_size_B = 14ull << 30,
++      .bar_size_B = 0,
++      .max_smem_per_wg_kB = 99,
++      .sm_smem_sizes_kB = { 0, 8, 16, 32, 64, 100 },
++      .sm_smem_size_count = 6,
++   };
++   pdev->base.bind_align_B = NVKMD_MACOS_GRAN;
++   pdev->sync_type = nvkmd_macos_sync_type_template;
++   pdev->timeline_type = vk_sync_timeline_get_type(&pdev->sync_type);
++   pdev->sync_types[0] = &pdev->sync_type;
++   pdev->sync_types[1] = &pdev->timeline_type.sync;
++   pdev->sync_types[2] = NULL;
++   pdev->base.sync_types = pdev->sync_types;
++   g_macos_pdev = pdev;
++   *pdev_out = &pdev->base;
++   return VK_SUCCESS;
++}
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkmd/macos/libdrm_stubs.c
+@@ -0,0 +1,36 @@
++/* macOS has no DRM. The common Vulkan runtime is built with HAVE_LIBDRM (its
++ * headers are needed by NAK's bindings), so provide inert libdrm entry points:
++ * no DRM devices, every DRM call fails with -ENODEV. NVK on macOS goes
++ * through nvkmd_macos (NVGspControl) instead. */
++#include <errno.h>
++#include <stdint.h>
++#include <xf86drm.h>
++
++int drmGetDevices2(uint32_t flags, drmDevicePtr devices[], int max_devices) { return 0; }
++int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device) { return -ENODEV; }
++void drmFreeDevice(drmDevicePtr *device) { }
++void drmFreeDevices(drmDevicePtr devices[], int count) { }
++int drmDevicesEqual(drmDevicePtr a, drmDevicePtr b) { return 0; }
++int drmGetCap(int fd, uint64_t capability, uint64_t *value) { return -ENODEV; }
++int drmIoctl(int fd, unsigned long request, void *arg) { errno = ENODEV; return -1; }
++int drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle) { return -ENODEV; }
++int drmSyncobjDestroy(int fd, uint32_t handle) { return -ENODEV; }
++int drmSyncobjHandleToFD(int fd, uint32_t handle, int *obj_fd) { return -ENODEV; }
++int drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle) { return -ENODEV; }
++int drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd) { return -ENODEV; }
++int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd) { return -ENODEV; }
++int drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles, int64_t timeout_nsec,
++                   unsigned flags, uint32_t *first_signaled) { return -ENODEV; }
++int drmSyncobjReset(int fd, const uint32_t *handles, uint32_t handle_count) { return -ENODEV; }
++int drmSyncobjSignal(int fd, const uint32_t *handles, uint32_t handle_count) { return -ENODEV; }
++int drmSyncobjTimelineSignal(int fd, const uint32_t *handles, uint64_t *points,
++                             uint32_t handle_count) { return -ENODEV; }
++int drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points, unsigned num_handles,
++                           int64_t timeout_nsec, unsigned flags, uint32_t *first_signaled)
++{ return -ENODEV; }
++int drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points, uint32_t handle_count)
++{ return -ENODEV; }
++int drmSyncobjQuery2(int fd, uint32_t *handles, uint64_t *points, uint32_t handle_count,
++                     uint32_t flags) { return -ENODEV; }
++int drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point, uint32_t src_handle,
++                       uint64_t src_point, uint32_t flags) { return -ENODEV; }
+--- /dev/null
++++ b/src/nouveau/vulkan/nvkcl_stub/nvkcl.h
+@@ -0,0 +1,13 @@
++/* macOS NAK/NVK build without mesa_clc (LLVM/libclc): the precompiled CL
++ * query-copy kernel (cl/nvk_query.cl) is not available, so
++ * vkCmdCopyQueryPoolResults' shader is an empty stub for now. */
++#pragma once
++#include "nir_builder.h"
++static inline void
++nvk_copy_queries(nir_builder *b, nir_def *pool_addr, nir_def *available_stride,
++                 nir_def *reports_start, nir_def *report_count,
++                 nir_def *query_stride, nir_def *first_query,
++                 nir_def *query_count, nir_def *dst_addr, nir_def *dst_stride,
++                 nir_def *flags)
++{
++}
+--- a/src/compiler/nir/nir_divergence_analysis.c	2026-09-28 10:40:54
++++ b/src/compiler/nir/nir_divergence_analysis.c	2026-09-28 10:40:48
+@@ -181,6 +181,25 @@
+    mesa_shader_stage stage = state->stage;
+    bool is_divergent = false;
+ 
++   /* macOS NAK: on NVIDIA, helper pixels skip memory loads and read 0, so a
++    * load from a uniform address in a fragment shader is not uniform once
++    * helpers share the warp (R2UR could take a helper's zero).
++    */
++   if (stage == MESA_SHADER_FRAGMENT) {
++      switch (instr->intrinsic) {
++      case nir_intrinsic_load_global:
++      case nir_intrinsic_load_global_2x32:
++      case nir_intrinsic_load_global_constant:
++      case nir_intrinsic_load_ssbo:
++      case nir_intrinsic_global_atomic:
++      case nir_intrinsic_global_atomic_swap:
++         instr->def.divergent = true;
++         return true;
++      default:
++         break;
++      }
++   }
++
+    switch (instr->intrinsic) {
+    case nir_intrinsic_shader_clock:
+    case nir_intrinsic_ballot:

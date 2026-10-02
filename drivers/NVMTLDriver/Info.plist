@@ -7,7 +7,7 @@
 <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 <key>CFBundleName</key><string>NVMTLDriver</string>
 <key>CFBundlePackageType</key><string>BNDL</string>
-<key>CFBundleShortVersionString</key><string>0.8.13</string>
-<key>CFBundleVersion</key><string>0.8.13</string>
+<key>CFBundleShortVersionString</key><string>0.8.69</string>
+<key>CFBundleVersion</key><string>0.8.69</string>
 <key>NSPrincipalClass</key><string>NVMTLDevice</string>
 </dict></plist>

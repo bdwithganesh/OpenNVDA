@@ -1,8 +1,9 @@
 /*
- * H.264 (ITU-T H.264 / ISO 14496-10) syntax parser for the NVDEC driver: Annex
- * B NAL splitting, SPS, PPS and the bits of the slice header the driver needs
- * (NVDEC firmware parses the slice data and the rest of the header on its own).
- * Plain C99, no allocation, builds on the host and on macOS.
+ * V1: H.264 (ITU-T H.264 / ISO 14496-10) syntax parser for the NVDEC
+ * driver: Annex B NAL splitting, SPS, PPS and the parts of the slice
+ * header that the driver needs (the NVDEC firmware parses the slice data
+ * and the rest of the slice header itself). Plain C99, no allocation,
+ * host- and macOS-buildable.
  */
 #pragma once
 #include <stddef.h>
@@ -25,10 +26,8 @@ enum {
 
 enum { H264_SLICE_P = 0, H264_SLICE_B = 1, H264_SLICE_I = 2, H264_SLICE_SP = 3, H264_SLICE_SI = 4 };
 
-/*
- * One NAL unit inside an Annex B buffer: [data, data + size) starts with the
- * NAL header byte and is still escaped (emulation prevention bytes kept).
- */
+/* One NAL unit inside an Annex B buffer: [data, data + size) starts with the
+ * NAL header byte and is still escaped (emulation prevention bytes kept). */
 typedef struct {
     const uint8_t *data;
     size_t size;
@@ -112,18 +111,14 @@ typedef struct {
     h264_mmco mmco[H264_MAX_MMCO];
 } h264_slice;
 
-/*
- * Parse an SPS / PPS NAL (escaped, with header byte). 0 = ok. PPS needs the SPS
- * table (scaling fall-back, chroma format).
- */
+/* Parse an SPS / PPS NAL (escaped, with header byte). 0 = ok. PPS needs the
+ * SPS table (scaling fall-back, chroma format). */
 int h264_parse_sps(const uint8_t *nal, size_t size, h264_sps *out);
 int h264_parse_pps(const uint8_t *nal, size_t size, const h264_sps *sps_table, h264_pps *out);
 /* Slice header up to and including dec_ref_pic_marking. */
 int h264_parse_slice(const uint8_t *nal, size_t size, const h264_sps *sps_table,
                      const h264_pps *pps_table, h264_slice *out);
 
-/*
- * Default DPB capacity in frames for the SPS level / size (Table A-1), or
- * max_dec_frame_buffering when the VUI gives it.
- */
+/* Default DPB capacity in frames for the SPS level / size (Table A-1),
+ * or max_dec_frame_buffering when the VUI gives it. */
 int h264_dpb_frames(const h264_sps *sps);

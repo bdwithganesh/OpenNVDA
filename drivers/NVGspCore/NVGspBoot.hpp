@@ -1,7 +1,7 @@
 #pragma once
 
-// NVIDIA 570.144 RM_RISCV_UCODE_DESC and normal AD103 WPR metadata inputs. This
-// does not touch the device; all bus addresses must come from a DMA mapper.
+// NVIDIA 570.144 RM_RISCV_UCODE_DESC and normal AD103 WPR metadata inputs.
+// This does not touch the device; all bus addresses must come from a DMA mapper.
 #include "NVGspFbLayout.hpp"
 
 namespace nvgsp {

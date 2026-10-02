@@ -154,8 +154,8 @@ inline bool patchFwsecFrts(const FwsecView &view, uint32_t fuseVersion,
     command.region.offset4K = static_cast<uint32_t>(frtsOffset >> 12);
     command.region.size4K = 0x100;
     command.region.mediaType = 2;
-    // 0x15 = FRTS (boot), 0x19 = SB (unload: restore pre-OS apps, nouveau
-    // NVFW_FALCON_APPIF_DMEMMAPPER_CMD_SB), SB has no command body.
+    // 0.100.0: 0x15 = FRTS (boot), 0x19 = SB (unload: restore pre-OS apps,
+    // nouveau NVFW_FALCON_APPIF_DMEMMAPPER_CMD_SB) — SB has no command body.
     mapper.initCommand = initCommand;
 
     __builtin_memcpy(dmem + view.desc.pkcDataOffset, signature, view.signatureSize);

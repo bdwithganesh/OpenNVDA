@@ -635,7 +635,7 @@ typedef struct
 
   unsigned char  ab_alpha;                                  // VBR/CBR: min/target quality level (1..51); rcmode4: weight of prev frame activity compared to part of the current picture
   unsigned char  ab_beta;                                   // lookahead info1: ratio of inter over intra complexity (fix8); rcmode4: weight of current activity compared to neighbors
-  unsigned short prev_act;                                  // lookahead info2: nextI, depth and valid flag; rcmode4: average activity level of the first reference
+  unsigned short prev_act;                                  // lookahead info2: nextI, depth and valid flag; rcmode4: average activity level of the first reference (L0)
 
   unsigned char  aqMode                             : 3;    // 0: disable adaptive quantization, 1: AQ mode fast, 2: AQ mode full
   unsigned char  dump_aq_stats                      : 1;    // 1: reads aq stats
@@ -946,7 +946,7 @@ typedef struct
 
   unsigned char  ab_alpha;                                  // VBR/CBR: min/target quality level (1..51); rcmode4: weight of prev frame activity compared to part of the current picture
   unsigned char  ab_beta;                                   // lookahead info1: ratio of inter over intra complexity (fix8); rcmode4: weight of current activity compared to neighbors
-  unsigned short prev_act;                                  // lookahead info2: NVENC_LOOKAHEAD_INFO2; rcmode4: average activity level of the first reference
+  unsigned short prev_act;                                  // lookahead info2: NVENC_LOOKAHEAD_INFO2; rcmode4: average activity level of the first reference (L0)
 
   unsigned char  reserved0;
   unsigned char  single_frame_vbv;                          // 1: VBV buffer size is set to average frame size; 0: otherwise
@@ -1867,7 +1867,7 @@ typedef struct
 
   //unsigned char  ab_alpha;                                  // weight of prev frame activity compared to part of the current picture
   //unsigned char  ab_beta;                                   // weight of current activity compared to neighbors
-  //unsigned short prev_act;                                  // average activity level of the first reference
+  //unsigned short prev_act;                                  // average activity level of the first reference (L0)
 } nvenc_vp8_rc_s;                                          // 56 bytes
 
 typedef struct
@@ -2654,7 +2654,7 @@ typedef struct
 
     unsigned char    ab_alpha;                                  // VBR/CBR: min/target quality level (1..51); rcmode4: weight of prev frame activity compared to part of the current picture
     unsigned char    ab_beta;                                   // lookahead info1: ratio of inter over intra complexity (fix8); rcmode4: weight of current activity compared to neighbors
-    unsigned short   prev_act;                                  // lookahead info2: NVENC_LOOKAHEAD_INFO2; rcmode4: average activity level of the first reference
+    unsigned short   prev_act;                                  // lookahead info2: NVENC_LOOKAHEAD_INFO2; rcmode4: average activity level of the first reference (L0)
 
     unsigned char    reserved0;
     unsigned char    single_frame_vbv;                          // 1: VBV buffer size is set to average frame size; 0: otherwise

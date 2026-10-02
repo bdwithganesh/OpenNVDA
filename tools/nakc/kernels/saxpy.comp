@@ -1,0 +1,9 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+layout(local_size_x = 256) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Floats { float v[]; };
+layout(push_constant) uniform Push { Floats x; Floats y; float a; uint n; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < p.n) p.y.v[i] = p.a * p.x.v[i] + p.y.v[i];
+}

@@ -1,0 +1,20 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+// Renders one 3840x2160 A8R8G8B8 frame (pitch 4096 px) of an animated Mandelbrot zoom.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Pix { uint v[]; };
+layout(push_constant) uniform Push { Pix surf; float cx; float cy; float scale; uint maxIter; } p;
+void main() {
+    uvec2 xy = gl_GlobalInvocationID.xy;
+    if (xy.x >= 3840u || xy.y >= 2160u) return;
+    vec2 c = vec2(p.cx, p.cy) + (vec2(xy) - vec2(1920.0, 1080.0)) * p.scale;
+    vec2 z = vec2(0.0);
+    uint i = 0u;
+    for (; i < p.maxIter && dot(z, z) < 4.0; ++i)
+        z = vec2(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y) + c;
+    float t = float(i) / float(p.maxIter);
+    uint r = uint(255.0 * clamp(9.0 * (1.0 - t) * t * t * t, 0.0, 1.0));
+    uint g = uint(255.0 * clamp(15.0 * (1.0 - t) * (1.0 - t) * t * t, 0.0, 1.0));
+    uint b = uint(255.0 * clamp(8.5 * (1.0 - t) * (1.0 - t) * (1.0 - t) * t, 0.0, 1.0));
+    p.surf.v[xy.y * 4096u + xy.x] = 0xff000000u | (r << 16) | (g << 8) | b;
+}

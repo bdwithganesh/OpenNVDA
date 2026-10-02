@@ -1,19 +1,7 @@
 # NVDisplay
 
-The IOFramebuffer driver WindowServer sees. It doesn't program the hardware itself; NVGspControl owns
-the display engine, and NVDisplay asks it for modesets, vblank callbacks, cursor and DPMS.
+The IOFramebuffer part of the stack. WindowServer talks to this driver; NVGspControl owns the hardware programming. NVDisplay publishes the scanout surface, EDID modes, vblank callbacks, hotplug and DPMS hooks.
 
-What it does:
+Current installed/source display version is 0.9.6. The recorded target has a 4K60 accelerated desktop. Hardware cursor production routing is disabled: accepted cursor register state has not established bitmap output. Production gamma, direct scan-out, HDR/VRR and sleep/wake qualification are still open. See [the current evidence](../../docs/evidence/2026-10-02/README.md).
 
-- Publishes the scan-out surface in BAR1 (it follows BAR1 around if NVGspControl resized/moved it)
-- Reads the EDID and builds the mode list from it (`NVDisplayEdid.hpp`)
-- Real vblank interrupts, so the desktop isn't just running on a timer
-- Hotplug, display sleep (DPMS) and wake
-- Kicks `IONDRVFramebuffer` off the device so there's only one framebuffer
-
-Boot-arg `nvdisp-hz` forces a refresh rate if the EDID timing picked is not the one you want.
-
-```sh
-sh tools/build_kext.sh NVDisplay /path/to/MacKernelSDK
-clang++ -std=gnu++17 -I <workspace> tests/nvdisplay_edid_check.cpp -o /tmp/edid && /tmp/edid
-```
+Build from the repo root with `sh tools/build_kext.sh NVDisplay /path/to/MacKernelSDK`. The build only compiles; installation and validation are separate. `sh tests/run_host_checks.sh` includes the EDID host check.

@@ -161,7 +161,7 @@ nvk_CreateDisplayModeKHR(VkPhysicalDevice physicalDevice,
    if (display != display_handle() ||
        p->visibleRegion.width != NVK_MACOS_WIDTH ||
        p->visibleRegion.height != NVK_MACOS_HEIGHT ||
-       (p->refreshRate && p->refreshRate != NVK_MACOS_REFRESH_MHZ))
+       p->refreshRate != NVK_MACOS_REFRESH_MHZ)   /* 0 is invalid too (CTS create_display_mode) */
       return VK_ERROR_INITIALIZATION_FAILED;
    *pMode = mode_handle();
    return VK_SUCCESS;
@@ -398,10 +398,8 @@ macos_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
             return VK_SUCCESS;
          }
       }
-      /*
-       * Images come back only through vkQueuePresentKHR on this thread's queue,
-       * so an app holding every free image cannot make progress.
-       */
+      /* Images come back only through vkQueuePresentKHR on this thread's
+       * queue, so an app holding every free image cannot make progress. */
       if (info->timeout == 0)
          return VK_NOT_READY;
       if (info->timeout != UINT64_MAX && os_time_get_nano() - start >= info->timeout)
@@ -419,10 +417,8 @@ macos_swapchain_queue_present(struct wsi_swapchain *wsi_chain, uint32_t image_in
    assert(image_index < chain->base.image_count);
    image->busy_on_host = false;
 
-   /*
-    * The common code submitted this image's rendering with fences[i]; the
-    * display must not scan it out before the GPU is done with it.
-    */
+   /* The common code submitted this image's rendering with fences[i]; the
+    * display must not scan it out before the GPU is done with it. */
    VkResult result =
       chain->base.wsi->WaitForFences(chain->base.device, 1,
                                      &chain->base.fences[image_index],
@@ -471,10 +467,8 @@ macos_swapchain_destroy(struct wsi_swapchain *wsi_chain,
    return VK_SUCCESS;
 }
 
-/*
- * Swapchain images: linear, dedicated, device-local (VRAM) so window 0 can scan
- * them out directly.
- */
+/* Swapchain images: linear, dedicated, device-local (VRAM) so window 0 can
+ * scan them out directly. */
 static VkResult
 macos_create_vram_image_mem(const struct wsi_swapchain *chain,
                             const struct wsi_image_info *info,
@@ -538,10 +532,8 @@ macos_surface_create_swapchain(VkIcdSurfaceBase *icd_surface, VkDevice _device,
    if (chain == NULL)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   /*
-    * CPU image params + wsi_device->wants_linear = linear images, no blit; the
-    * memory callback is replaced with a VRAM one below.
-    */
+   /* CPU image params + wsi_device->wants_linear = linear images, no blit;
+    * the memory callback is replaced with a VRAM one below. */
    struct wsi_cpu_image_params cpu_params = {
       .base.image_type = WSI_IMAGE_TYPE_CPU,
    };

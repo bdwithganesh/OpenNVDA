@@ -1,0 +1,64 @@
+snapshot exception=00000080 data=00000000 code=00000000 method=0200 type=0 pending=00000000 error=00000000 core=a00c0007 PUT=1d4 GET=1d4
+snapshot usage ASSY=00001112 ARMED=00001112
+snapshot cursor+00 ASSY=c0d0d002 ARMED=c0d0d002
+snapshot cursor+04 ASSY=c0d0d002 ARMED=c0d0d002
+snapshot cursor+08 ASSY=00000000 ARMED=00000000
+snapshot cursor+0c ASSY=00000000 ARMED=00000000
+snapshot cursor+10 ASSY=00000000 ARMED=00000000
+snapshot cursor+14 ASSY=800001cf ARMED=800001cf
+snapshot cursor+18 ASSY=000075ff ARMED=000075ff
+snapshot OLUT+00 ASSY=00040509 ARMED=00040509
+snapshot OLUT+04 ASSY=ffffffff ARMED=ffffffff
+snapshot OLUT+08 ASSY=c0d000e1 ARMED=c0d000e1
+snapshot OLUT+0c ASSY=00000000 ARMED=00000000
+snapshot OCSC+00 ASSY=00000001 ARMED=00000001
+snapshot OCSC+04 ASSY=00010000 ARMED=00010000
+snapshot OCSC+08 ASSY=00000000 ARMED=00000000
+snapshot OCSC+0c ASSY=00000000 ARMED=00000000
+snapshot OCSC+10 ASSY=00000000 ARMED=00000000
+snapshot OCSC+14 ASSY=00000000 ARMED=00000000
+snapshot OCSC+18 ASSY=00010000 ARMED=00010000
+snapshot OCSC+1c ASSY=00000000 ARMED=00000000
+snapshot OCSC+20 ASSY=00000000 ARMED=00000000
+snapshot OCSC+24 ASSY=00000000 ARMED=00000000
+snapshot OCSC+28 ASSY=00000000 ARMED=00000000
+snapshot OCSC+2c ASSY=00010000 ARMED=00010000
+snapshot OCSC+30 ASSY=00000000 ARMED=00000000
+snapshot hash[56]=c0d0d002/00414001
+snapshot hash[60]=c0d0d002/00414001
+snapshot hash[123]=c0d0d001/02400001
+snapshot hash[168]=c0d000e2/0241c001
+snapshot hash[172]=c0d000e2/0241c001
+snapshot hash[235]=c0d000e1/00418001
+snapshot hash[239]=c0d000e1/00418001
+snapshot hash[251]=c0d000f1/00420001
+snapshot hash[255]=c0d000f1/00420001
+snapshot cursor-object+00=00000005
+snapshot cursor-object+04=03f1bf00
+snapshot cursor-object+08=00000000
+snapshot cursor-object+0c=03f1bf7f
+snapshot cursor-object+10=00000000
+snapshot cursor-object+14=00000000
+snapshot cursor-object+18=00000000
+snapshot cursor-object+1c=00000000
+snapshot CRC ASSY=00000000/00000000 ARM=c0d000f1/00030000
+snapshot CRC object=00000005 begin=3efa27000 limit=3efa27fff
+snapshot CRC notifier status=00000000 count=0 overflow=0
+  |   "NVGspControl-vblank-min-ns" = 459130
+  |   "NVGspControl-vblank-hist" = <5d0000003a0900003c0000000a00000007000000>
+  |   "NVGspControl-vblank-en-lost" = 0
+  |   "NVGspControl-vblank-avg-ns" = 17003362
+  |   "NVGspControl-cursor-unstick" = 0
+  |   "NVGspControl-cursor-alloc-status" = 0
+  |   "NVGspControl-vblank-max-ns" = 115093625
+  |   "NVGspControl-cursor-ready" = Yes
+  |   "NVGspControl-cursor-pushbuf-status" = 0
+  |   "NVGspControl-vblank-count" = 2533
+  |   "NVGspControl-status-os-errors" = 0
+  |   "NVGspControl-vblank-clients" = 2
+  |   "NVGspControl-vblank-cb-max-ns" = 8180
+metal_fault_test good: status 4, 0 wrong, 0.00 s: PASS
+726
+Shutdown NOW!
+
+System shutdown time has arrived

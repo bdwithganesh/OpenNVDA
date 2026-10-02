@@ -5,7 +5,7 @@
 
 namespace nvgsp {
 
-// Page tables of one client's user VA arena with 2 MiB and 64 KiB
+// 0.114.0: page tables of one client's user VA arena with 2 MiB and 64 KiB
 // pages (Turing+ MMU v2, nouveau vmmgp100.c layout):
 //   PD0 table = 256 dual entries of 16 bytes, one per 2 MiB region.
 //     qword 0 = a 2 MiB PTE (VALID bit 0), or the PDE of a 64 KiB "LPT"
@@ -22,12 +22,19 @@ namespace nvgsp {
 // Backend B (static dispatch, kernel- and host-safe):
 //   bool read64(uint64_t vram, uint64_t *v); bool write64(uint64_t vram, uint64_t v);
 //   bool zero(uint64_t vram, uint64_t bytes);
+//   bool fill16(uint64_t vram, uint64_t bytes, uint64_t q0, uint64_t q1);   // {q0, q1} repeated
 //   bool allocChunk(uint64_t *phys);            // 2 MiB of VRAM for LPTs
 //   void *allocOwners(uint32_t bytes); void freeOwners(void *p, uint32_t bytes);
 constexpr uint64_t kBigPageBytes = 0x10000;
 constexpr uint32_t kLptEntries = 32;
 constexpr uint32_t kLptBytes = kLptEntries * 8;
 constexpr uint64_t kLptInvalid = 1ULL << 5;                 // PRIV, VALID=0
+// 30 Sep: sparse = VALID 0 + VOL 1 (NVIDIA RM kern_gmmu_gm200.c: "sparse
+// directly in HW by setting the volatile bit when the valid bit is clear";
+// for a dual PDE the big sub-level's VOL with its aperture invalid). An
+// access there reads 0 and a write is dropped instead of an MMU fault, the
+// way the M1 treats wild accesses (metal_fault_test mmu completes on it).
+constexpr uint64_t kSparse = 1ULL << 3;
 constexpr uint32_t kLptPerChunk = 0x200000 / kLptBytes;     // 8192
 constexpr uint32_t kLptChunks = kArenaPages / kLptPerChunk; // 2: one LPT per region
 constexpr uint64_t kPteAddrMask = 0x00FFFFFFFFFFFF00ULL;
@@ -51,6 +58,7 @@ template <class B>
 class ArenaMap {
 public:
     uint64_t tables = 0;                     // 64 contiguous PD0 tables
+    bool sparse = false;                     // unmapped = sparse, not faulting
     uint16_t page[kArenaPages];              // 2 MiB-mode region owner
     uint16_t lpt[kArenaPages];               // 0 = 2 MiB mode, else LPT slot + 1
     uint64_t chunk[kLptChunks];
@@ -67,8 +75,13 @@ public:
     bool init(B &b, uint64_t tablesPhys) {
         release(b);
         tables = tablesPhys;
-        return b.zero(tables, kArenaTablesBytes);
+        if (!b.zero(tables, kArenaTablesBytes)) return false;
+        // every dual entry {big sparse, no small table}, in bulk
+        return !sparse || b.fill16(tables, kArenaTablesBytes, kSparse, 0);
     }
+    uint64_t emptyPd0() const { return sparse ? kSparse : 0; }
+    uint64_t emptyLpt() const { return sparse ? kSparse : kLptInvalid; }
+    uint64_t emptySpt() const { return sparse ? kSparse : 0; }
 
     void release(B &b) {
         for (uint32_t c = 0; c < kLptChunks; ++c) {
@@ -148,18 +161,18 @@ public:
             const uint64_t e = re < va + bytes ? re : va + bytes;
             if (spt[r]) {
                 for (uint64_t q = a; q < e; q += kSmallPageBytes) {
-                    if (!b.write64(sptAddr(r) + sptEntry(q) * 8ULL, 0)) return false;
+                    if (!b.write64(sptAddr(r) + sptEntry(q) * 8ULL, emptySpt())) return false;
                     sptOwnerOf(r, sptEntry(q)) = 0;
                 }
                 if (!maybeFreeSpt(b, r)) return false;
             } else if (!lpt[r] && a == rs && e == re) {
-                if (page[r] && !writePd0(b, r, 0)) return false;
+                if (page[r] && !writePd0(b, r, emptyPd0())) return false;
                 page[r] = 0;
             } else if (lpt[r] || page[r]) {
                 if (!ensureLpt(b, r)) return false;
                 for (uint64_t q = a; q < e; q += kBigPageBytes) {
                     const uint32_t i = entry(q);
-                    if (!b.write64(lptAddr(r) + i * 8ULL, kLptInvalid)) return false;
+                    if (!b.write64(lptAddr(r) + i * 8ULL, emptyLpt())) return false;
                     ownerOf(r, i) = 0;
                 }
                 if (!maybeFreeLpt(b, r)) return false;
@@ -179,7 +192,7 @@ public:
                 bool hit = false;
                 for (uint32_t i = 0; i < kSptEntries; ++i) {
                     if (sptOwnerOf(r, i) != owner) continue;
-                    ok = b.write64(sptAddr(r) + i * 8ULL, 0) && ok;
+                    ok = b.write64(sptAddr(r) + i * 8ULL, emptySpt()) && ok;
                     sptOwnerOf(r, i) = 0;
                     hit = true;
                 }
@@ -188,13 +201,13 @@ public:
                 bool hit = false;
                 for (uint32_t i = 0; i < kLptEntries; ++i) {
                     if (ownerOf(r, i) != owner) continue;
-                    ok = b.write64(lptAddr(r) + i * 8ULL, kLptInvalid) && ok;
+                    ok = b.write64(lptAddr(r) + i * 8ULL, emptyLpt()) && ok;
                     ownerOf(r, i) = 0;
                     hit = true;
                 }
                 if (hit) { *any = true; ok = maybeFreeLpt(b, r) && ok; }
             } else if (page[r] == owner) {
-                ok = writePd0(b, r, 0) && ok;
+                ok = writePd0(b, r, emptyPd0()) && ok;
                 page[r] = 0;
                 *any = true;
             }
@@ -257,7 +270,7 @@ public:
         return true;
     }
 
-    // the owner tag mapping va (0 = unmapped), and how: 1 = 2 MiB
+    // 0.158.0: the owner tag mapping va (0 = unmapped), and how: 1 = 2 MiB
     // PTE, 2 = 64 KiB LPT entry, 3 = 4 KiB SPT entry. For naming an MMU fault.
     uint16_t ownerAt(uint64_t va, uint32_t *how) {
         *how = 0;
@@ -304,6 +317,7 @@ private:
         }
         const uint64_t addr = sptChunk[c] + (s % kSptPerChunk) * uint64_t(kSptBytes);
         if (!b.zero(addr, kSptBytes)) return false;
+        if (sparse && !b.fill16(addr, kSptBytes, kSparse, kSparse)) return false;
         sptUsed[s / 32] |= 1u << (s % 32);
         spt[r] = static_cast<uint16_t>(s + 1);
         ++sptCount;
@@ -313,7 +327,7 @@ private:
         for (uint32_t i = 0; i < kSptEntries; ++i)
             if (sptOwnerOf(r, i)) return true;
         const uint32_t s = spt[r] - 1;
-        if (!writePd0(b, r, 0)) return false;
+        if (!writePd0(b, r, emptyPd0())) return false;
         sptUsed[s / 32] &= ~(1u << (s % 32));
         spt[r] = 0;
         --sptCount;
@@ -324,7 +338,7 @@ private:
                va < kArenaEnd && bytes <= kArenaEnd - va;
     }
     uint64_t pd0Addr(uint32_t r) const {
-        // One 4 KiB PD0 table per 512 MiB; 16-byte dual entry per 2 MiB
+        // one 4 KiB PD0 table per 512 MiB; 16-byte dual entry per 2 MiB
         return tables + (r / 256) * 4096ULL + (r % 256) * 16ULL;
     }
     uint64_t lptAddr(uint32_t r) const {
@@ -361,7 +375,7 @@ private:
         const bool split = page[r] && (old & 1);
         const uint64_t base = pteAddress(old), flags = old & ~kPteAddrMask;
         for (uint32_t i = 0; i < kLptEntries; ++i) {
-            const uint64_t v = split ? ((base + i * kBigPageBytes) >> 4) | flags : kLptInvalid;
+            const uint64_t v = split ? ((base + i * kBigPageBytes) >> 4) | flags : emptyLpt();
             if (!b.write64(addr + i * 8ULL, v)) return false;
             owners[c][(s % kLptPerChunk) * kLptEntries + i] = split ? page[r] : 0;
         }
@@ -377,7 +391,7 @@ private:
         for (uint32_t i = 0; i < kLptEntries; ++i)
             if (ownerOf(r, i)) return true;
         const uint32_t s = lpt[r] - 1;
-        if (!writePd0(b, r, 0)) return false;
+        if (!writePd0(b, r, emptyPd0())) return false;
         used[s / 32] &= ~(1u << (s % 32));
         lpt[r] = 0;
         --lptCount;

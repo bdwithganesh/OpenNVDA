@@ -1,9 +1,7 @@
-/*
- * MacOS has no DRM. The common Vulkan runtime is built with HAVE_LIBDRM (its
+/* macOS has no DRM. The common Vulkan runtime is built with HAVE_LIBDRM (its
  * headers are needed by NAK's bindings), so provide inert libdrm entry points:
- * no DRM devices, every DRM call fails with -ENODEV. NVK on macOS goes through
- * nvkmd_macos (NVGspControl) instead.
- */
+ * no DRM devices, every DRM call fails with -ENODEV. NVK on macOS goes
+ * through nvkmd_macos (NVGspControl) instead. */
 #include <errno.h>
 #include <stdint.h>
 #include <xf86drm.h>

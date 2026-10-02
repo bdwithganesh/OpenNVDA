@@ -1,6 +1,6 @@
-// NVMTLGsp: GPU submission helper for NVMTLDriver (blits for now).
+// NVMTLGsp: GPU submission helper for NVMTLDriver (B4 blit v1).
 //
-// For now blit work runs from the bundle itself: it opens its own NVGspControl user
+// v1 executes blit work from the bundle: it opens its own NVGspControl user
 // client, keeps one 2 MiB SYS staging object bound in its own arena, builds
 // Ampere-CE (NV90B5 method set, proven by NVK/vkcopy on this GPU) method
 // streams in staging, submits them with execSegments(engine 1) and waits
@@ -36,6 +36,12 @@
 // Open (once) the NVGspControl user client + staging. Returns false on
 // failure; all other calls then fail too.
 bool nvGspEnsure(void);
+bool nvGspValidate(void);  // 0.8.31: generation gate before native encoding
+uint64_t nvGspRecoverySerial(void); // successful resource rebinds in this process
+uint64_t nvGspGeneration(void);
+bool nvGspGenerationMatches(uint64_t generation); // pure, no wait/reopen/encoding lock
+void nvGspEncodingBegin(void);
+void nvGspEncodingEnd(void);
 
 // CE copy, both VAs in our arena, any size (chunked at 128 KiB like NVK).
 // Synchronous: returns true once the fence completes.
@@ -45,15 +51,21 @@ bool nvCeCopy(uint64_t dstVa, uint64_t srcVa, uint64_t bytes);
 bool nvCeFill(uint64_t dstVa, uint64_t bytes, uint32_t value);
 
 // GPU heap: MTLBuffers are page-aligned process memory that the kext wires
-// and maps into our GPU VA (NVGspControl >= , selector 33), so compute
+// and maps into our GPU VA (NVGspControl >= 0.134.0, selector 33), so compute
 // and blits use their VA with no staging copies.
 bool nvHeapAlloc(uint64_t bytes, void **cpu, uint64_t *va);
 void nvHeapFree(void *cpu, uint64_t bytes);
 // VA for [cpu, cpu+bytes) if it lies inside the heap, else 0.
 uint64_t nvHeapVa(const void *cpu, uint64_t bytes);
-// map memory we did not allocate (an IOSurface's pages) the same way,
+// 0.2.1: map memory we did not allocate (an IOSurface's pages) the same way,
 // zero-copy; page-aligned start. Unwrap unbinds and unwires, never frees.
 bool nvHeapWrap(void *cpu, uint64_t bytes, uint64_t *va);
+// GPU work that failed on this thread: kind 1 refused/launch, 2 fence timeout
+void nvNoteGpuFailure(uint32_t kind);
+uint32_t nvGpuFailureCount(void);
+uint32_t nvGpuFailureKind(void);
+void nvGpuFailureReset(void);
+bool nvHeapAllocShared(uint64_t bytes, void **cpu, uint64_t *va);   // 0.8.16: GPU-cacheable sysmem
 void nvHeapUnwrap(void *cpu, uint64_t va);
 // VRAM for MTLStorageModePrivate buffers: 64 MiB VRAM objects bound with big
 // pages at 0x2A00000000+, suballocated 64 KiB aligned (first fit). No CPU view.
@@ -72,35 +84,36 @@ bool nvGrLaunch(const uint32_t *code, uint32_t codeWords, uint32_t regs, uint32_
                 const uint32_t *push, uint32_t npush,
                 const uint32_t grid[3], const uint32_t block[3]);
 
-// one GPU submitter per process (recursive). nvExecuteOps holds it
+// 0.6.13: one GPU submitter per process (recursive). nvExecuteOps holds it
 // for a whole command buffer.
 void nvGpuLock(void);
 void nvGpuUnlock(void);
-// batched compute. Between Begin/End (takes the GPU lock) nvGrQueue
+// 0.6.13: batched compute. Between Begin/End (takes the GPU lock) nvGrQueue
 // only appends the launch; nvGrFlush (and End, and every other submitting
 // call) runs what is queued, in order, and waits. Outside a batch nvGrQueue
 // is nvGrLaunch. Flush before the CPU looks at memory a queued launch writes.
 void nvGrBatchBegin(void);
 void nvGrBatchEnd(void);
 bool nvGrFlush(void);
-// native N1 test (NVMTL_NATIVE=1): queued launches as a family kernel command
+// 0.7.0 native N1 test (NVMTL_NATIVE=1): queued launches as a family kernel command
 bool nvGrFlushNative(id cb);
-// native N2: asynchronous commit
+// 0.8.0 native N2: asynchronous commit
 void nvGrBatchBeginNative(void);
 void nvGrBatchEndNative(void);
 void nvNativeDrain(void);
-bool nvNativeEnabled(void);
-bool nvBatchOn(void);
+bool nvNativeEnabled(void);   // 0.8.1
+bool nvBatchOn(void);         // 0.8.4
 void nvGrLabel(const char *what);
 void nvGrNoteTextures(const char *what);
-const char *nvVaState(uint64_t va);         // live / freed / unmapped   // 0.8.12: textures of the next launch (fault dump)   // 0.8.7: name the next queued launch
+const char *nvVaState(uint64_t va);         // 0.8.13: live / freed / unmapped   // 0.8.12: textures of the next launch (fault dump)   // 0.8.7: name the next queued launch
 void nvGrSync(void);          // nvGrFlush + nvNativeDrain: before CPU access or other engines
+extern const char *nvGrWhy;   // 0.8.14: reason for the last refused launch
 bool nvGrQueue(const uint32_t *code, uint32_t codeWords, uint32_t regs, uint32_t slm,
                uint32_t smem, uint32_t barriers,
                const uint32_t *push, uint32_t npush,
                const uint32_t grid[3], const uint32_t block[3]);
 
-// Metal render pipelines on the ADA_A (0xC997) 3D class. One draw is
+// 0.5.0: Metal render pipelines on the ADA_A (0xC997) 3D class. One draw is
 // one self-contained method stream (targets, programs, bindings, state,
 // draw), so whatever NVK or another process left on the shared channel does
 // not matter. Shader addresses point at the 0x80-byte SPH in front of the code.
@@ -120,14 +133,14 @@ typedef struct {
     bool blend;
     uint32_t colorOp, colorSrc, colorDst, alphaOp, alphaSrc, alphaDst;   // OGL enums
     uint32_t writeMask;             // CT_WRITE bits: R 1<<0, G 1<<4, B 1<<8, A 1<<12
-    bool blockLinear;               // WIDTH is pixels, MEMORY holds the block height
+    bool blockLinear;               // 0.5.1: WIDTH is pixels, MEMORY holds the block height
     uint32_t blockHeightLog2;
-    // mip level / slice targets. depth > 1 with depthIsZ picks plane
+    // 0.5.4: mip level / slice targets. depth > 1 with depthIsZ picks plane
     // `layer` of a 3D level; otherwise layer indexes arrayPitch-spaced layers
     uint32_t blockDepthLog2, depth, layer;
     uint64_t arrayPitch;
     bool depthIsZ;
-    uint32_t sx, sy;                // samples per pixel in x / y (MSAA), 0 = 1
+    uint32_t sx, sy;                // 0.5.7: samples per pixel in x / y (MSAA), 0 = 1
 } NV3DTarget;
 
 typedef struct {
@@ -147,8 +160,16 @@ typedef struct {
     uint32_t nrt;
     double vp[6];                   // x, y, w, h, znear, zfar (MTLViewport)
     uint32_t sc[4];                 // x, y, w, h
+    // 0.8.20: viewport/scissor arrays ([[viewport_array_index]]); nvp 0 = vp/sc only
+    uint32_t nvp;
+    double vps[16][6];
+    uint32_t scs[16][4];
+    uint32_t layers;                // layered pass: slices of the targets (renderTargetArrayLength), 0 = not layered
+    uint32_t passId;                // 0.8.22: render pass (encoder) the draw belongs to, 0 = unknown
+    bool fbFetch;                   // 0.8.40: the fragment stage reads colour attachments ([[color(n)]])
+    bool sampleShading;             // fragment requires one invocation per covered sample
     NV3DStage vs, fs;
-    // tessellation (tes.va != 0): generated TCS, the app's
+    // 0.6.0: tessellation (tes.va != 0): generated TCS, the app's
     // post-tessellation vertex function as TES, vs = control point fetch
     NV3DStage tcs, tes;
     uint32_t patchCps, tessParams;
@@ -164,36 +185,38 @@ typedef struct {
     uint32_t cull;                  // 0 none, 1 front, 2 back
     bool frontCCW;
     bool draw;                      // false: only the clears (empty pass)
+    bool rasterOff;                 // 0.8.16: rasterizationEnabled NO (vertex-only pipeline)
+    uint32_t zClipW, zClipH;        // 0.8.16: surface size of a pass with no colour target
     // depth (block-linear zeta surface, 0.5.1)
     uint64_t zVa;                   // 0 = no depth target
     uint32_t zWidthEl, zHeight, zBlockHeightLog2, zFormat;
     bool zClear, zTest, zWrite;
     float zClearValue;
     uint32_t zFunc;                 // OGL 0x200 + MTLCompareFunction
-    uint32_t zBpp;                  // bytes per zeta element (0 = 4)
-    uint32_t aaMode;                // SET_ANTI_ALIAS samples mode, 0 = 1X1
-    // stencil (OGL enums); [0] front, [1] back
+    uint32_t zBpp;                  // 0.5.6: bytes per zeta element (0 = 4)
+    uint32_t aaMode;                // 0.5.7: SET_ANTI_ALIAS samples mode, 0 = 1X1
+    // 0.5.6: stencil (OGL enums); [0] front, [1] back
     bool sTest, sClear;
     uint32_t sClearValue;
     uint32_t sFail[2], sZFail[2], sZPass[2], sFunc[2], sRef[2], sReadMask[2], sWriteMask[2];
 } NV3DDraw;
 
-// block-linear VRAM surfaces (their own objects, PTE kind given,
+// 0.5.1: block-linear VRAM surfaces (their own objects, PTE kind given,
 // e.g. 6 = GENERIC_MEMORY for depth32 and block-linear colour)
 bool nvVramAllocKind(uint64_t bytes, uint32_t kind, uint64_t *va, uint32_t *handle);
 void nvVramFreeKind(uint32_t handle);
 
 bool nvGr3DDraw(const NV3DDraw *d);
 
-// 2D copy between a pitch-linear surface and a block-linear one
+// 0.5.1: 2D copy between a pitch-linear surface and a block-linear one
 // (1 GOB wide, 2^bh GOBs high) on the copy engine. toBL picks the direction.
 bool nvCeCopy2DBL(bool toBL, uint64_t pitchVa, uint32_t pitch, uint64_t blVa, uint32_t blWidthBytes,
                   uint32_t bh, uint32_t widthBytes, uint32_t height);
 
-// region copy between a linear buffer and one level of a block-linear
+// 0.5.2: region copy between a linear buffer and one level of a block-linear
 // texture (blBase = that level in that layer; ylog/zlog its block shape; x in
 // bytes; z the depth slice for 3D)
-// one side of a copy-engine copy. Linear: va is the first byte,
+// 0.6.1: one side of a copy-engine copy. Linear: va is the first byte,
 // pitch the row stride. Block linear: va is the level/slice base, with the
 // level's row bytes / rows / depth / block log2s and the origin inside it.
 typedef struct {

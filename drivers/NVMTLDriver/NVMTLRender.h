@@ -4,7 +4,7 @@
 
 NVMTLKernel *nvRasterKernelForBGRA(bool bgra);
 
-// vp = {x,y,w,h} doubles (MTLViewport, z ignored for now);
+// vp = {x,y,w,h} doubles (MTLViewport, z ignored v1);
 // sc = {x,y,w,h} NSUInteger (MTLScissorRect).
 // RT staging (NVGSP_STAGE_DATA) must hold loaded/cleared bytes on entry.
 // bgra selects the BGRA8 pack order (RGBA8 otherwise).

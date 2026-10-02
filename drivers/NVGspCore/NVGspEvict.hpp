@@ -4,7 +4,7 @@
 
 namespace nvgsp {
 
-// Save / restore of kext-heap VRAM objects across S3 (SR path).
+// 0.127.0: save / restore of kext-heap VRAM objects across S3 (SR path).
 //
 // GSP-RM's FBSR saves only the VRAM RM itself allocated. The user heap
 // ([1 GiB, fbFreeLimit), memAlloc domain 0/2), the per-client arena page
@@ -73,7 +73,7 @@ inline uint32_t buildEvictBatch(const EvictCopy *c, uint32_t n, uint32_t *out, u
     return w;
 }
 
-// fill VRAM (physical, local FB) with a 32-bit value through the
+// 0.147.1: fill VRAM (physical, local FB) with a 32-bit value through the
 // remap constant, for zeroing new objects (a fresh object must never show a
 // previous owner's data, as kernel drivers on Linux guarantee). Lines of at
 // most 2^15 4-byte elements, as NVMTLGsp's virtual fill does.

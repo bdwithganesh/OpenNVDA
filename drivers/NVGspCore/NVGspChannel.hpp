@@ -142,11 +142,11 @@ static_assert(offsetof(NvChannelAllocParams, hmacNonce) == 328,
 static_assert(offsetof(NvChannelAllocParams, tpcConfigId) == 360,
               "tpcConfigId offset");
 
-// Backing-object plan for the safe next live block (no RPC yet): GPFIFO
-// and USERD must exist as RM memory objects before channel alloc. Sizes
-// follow nvidia-push defaults: GPFIFO entries are 8 bytes each; USERD is
-// one 4 KiB page (512 B per channel slot, 8 slots per page). The live
-// block must allocate these with the already-proven
+// Backing-object plan for the safe next live block (no RPC yet):
+// GPFIFO and USERD must exist as RM memory objects before channel alloc.
+// Sizes follow nvidia-push defaults: GPFIFO entries are 8 bytes each;
+// USERD is one 4 KiB page (512 B per channel slot, 8 slots per page).
+// The live block must allocate these with the already-proven
 // NV01_MEMORY_LOCAL_USER path (function 103 + function 10 free) and prove
 // clean teardown BEFORE any 0xc56f channel RPC is attempted.
 constexpr uint32_t kGpfifoEntryBytes = 8;
@@ -165,7 +165,7 @@ inline bool buildChannelAllocParams(uint32_t vaspaceHandle,
     if (!out || !vaspaceHandle || gpFifoEntries < kMinGpfifoEntries ||
         (gpFifoEntries & 1U))
         return false;
-    // + NVDEC0 0x13, NVENC0 0x1b, OFA0 0x33
+    // 0.116.0 (V1): + NVDEC0 0x13, NVENC0 0x1b, OFA0 0x33
     if (engineType != kEngineTypeGraphics && engineType != kEngineTypeCopy0 &&
         engineType != kEngineTypeNull && engineType != 0x13 &&
         engineType != 0x1b && engineType != 0x33)
@@ -213,7 +213,7 @@ static_assert(offsetof(NvCtxDmaAllocParams, limit) == 24,
 // NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS (nvos.h:2483-2500): 40 bytes
 // (36 used + 4 tail pad from pControl's 8 B alignment). nvkms sets only
 // channelInstance, hObjectBuffer and offset; pControl is OUT (host VA,
-// meaningless over GSP-RPC, ignored).
+// meaningless over GSP-RPC — ignored).
 struct NvDispChannelDmaAllocParams {
     uint32_t channelInstance;
     uint32_t hObjectBuffer;

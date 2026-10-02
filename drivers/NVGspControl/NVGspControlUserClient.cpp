@@ -6,11 +6,11 @@ OSDefineMetaClassAndStructors(IOAccelNVGspUserClient, IOUserClient)
 
 bool IOAccelNVGspUserClient::initWithTask(task_t owningTask, void *securityID,
                                           UInt32 type, OSDictionary *properties) {
-    // any process may open us (apps on the desktop use the GPU
+    // 0.150.0: any process may open us (apps on the desktop use the GPU
     // through NVMTLDriver / NVVTDecoder); non-admin clients only get the
     // selectors those need, on objects they own (see externalMethod)
     admin_ = clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) == kIOReturnSuccess;
-    task_ = owningTask;                                   // userMemBind
+    task_ = owningTask;                                   // 0.134.0: userMemBind
     return super::initWithTask(owningTask, securityID, type, properties);
 }
 
@@ -18,12 +18,23 @@ bool IOAccelNVGspUserClient::start(IOService *provider) {
     if (!super::start(provider)) return false;
     driver_ = OSDynamicCast(NVGspControl, provider);
     if (!driver_) return false;
+    driver_->clientLive(this, task_, true);              // 0.177.0
     resetGen_ = driver_->resetGeneration();
-    driver_->noteGpuBusy();            // start ramping out of P8 before the first submit
-    package_ = IOBufferMemoryDescriptor::withOptions(
-        kIOMemoryKernelUserShared | kIODirectionInOut,
-        kNVGspPackageBytes, 4096);
-    if (!package_ || !package_->getBytesNoCopy()) return false;
+    driver_->noteGpuBusy();            // 0.135.0: start ramping out of P8 before the first submit
+    // 0.171.0: the 61 MiB firmware package buffer is made when an admin
+    // client maps it (nvgsp_load), not for every client: each Metal process
+    // wired 61 MiB for nothing, 453 clients held ~28 GiB, new clients then
+    // failed start() ("open failed 0xe00002c7", nil textures) and 2 MiB
+    // contiguous allocations failed (1 Oct 05:47)
+    return true;
+}
+
+// 0.171.0: see start()
+bool IOAccelNVGspUserClient::ensurePackage() {
+    if (package_) return true;
+    package_ = IOBufferMemoryDescriptor::withOptions(kIOMemoryKernelUserShared | kIODirectionInOut,
+                                                     kNVGspPackageBytes, 4096);
+    if (!package_ || !package_->getBytesNoCopy()) { OSSafeReleaseNULL(package_); return false; }
     bzero(package_->getBytesNoCopy(), kNVGspPackageBytes);
     return true;
 }
@@ -35,34 +46,39 @@ void IOAccelNVGspUserClient::stop(IOService *provider) {
 }
 
 IOReturn IOAccelNVGspUserClient::clientClose() {
-    // owner cleanup; 0.110.0: also hands a presented screen back.
+    // 0.107.0: owner cleanup; 0.110.0: also hands a presented screen back.
+    if (driver_) driver_->clientChannelClose(this);   // 0.178.0: before its memory goes
     if (driver_) driver_->memFreeAll(this);
+    if (driver_) driver_->clientLive(this, task_, false);   // 0.177.0
     if (!isInactive()) terminate();
     return kIOReturnSuccess;
 }
 
 IOReturn IOAccelNVGspUserClient::clientMemoryForType(
     UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) {
-    // Type 0x1000 | handle = a sysmem memory object of this client. a
-    // CPU-visible VRAM object (memAlloc domain 2) maps its BAR1 range
-    // write-combined.
-    if ((type & 0xfffff000) == 0x1000 && driver_ && options && memory) {
+    // 0.107.0: type 0x1000 | handle = a sysmem memory object of this client.
+    // 0.123.0: a CPU-visible VRAM object (memAlloc domain 2) maps its BAR1
+    // range write-combined.
+    // 0.162.0: type 0x40000000 | handle for any handle (the 0x1000 form only
+    // reaches 0xfff).
+    const bool wide = (type & 0xc0000000) == 0x40000000;
+    if ((wide || (type & 0xfffff000) == 0x1000) && driver_ && options && memory) {
         bool vram = false;
-        IOMemoryDescriptor *d = driver_->memUserDescriptor(this, type & 0xfff, &vram);
+        IOMemoryDescriptor *d = driver_->memUserDescriptor(this, wide ? type & 0x3fffffff : type & 0xfff, &vram);
         if (!d) return kIOReturnBadArgument;
         *options = kIOMapAnywhere | (vram ? kIOMapWriteCombineCache : 0);
         *memory = d;
         return kIOReturnSuccess;
     }
-    if (!admin_) return kIOReturnNotPrivileged;   // shared window / package: admin only
-    // type 1 = the CPU/GPU shared window (GPU VA 0x30_0000_0000).
+    if (!admin_) return kIOReturnNotPrivileged;   // 0.150.0: shared window / package: admin only
+    // 0.102.0: type 1 = the CPU/GPU shared window (GPU VA 0x30_0000_0000).
     if (type == 1 && driver_ && driver_->sharedWindowDescriptor() && options && memory) {
         *options = kIOMapAnywhere;
         driver_->sharedWindowDescriptor()->retain();
         *memory = driver_->sharedWindowDescriptor();
         return kIOReturnSuccess;
     }
-    if (type != 0 || !package_ || !options || !memory)
+    if (type != 0 || !options || !memory || !ensurePackage())
         return kIOReturnBadArgument;
     *options = kIOMapAnywhere;
     package_->retain();
@@ -122,7 +138,7 @@ IOReturn IOAccelNVGspUserClient::submit(
     if (!self || !self->driver_ || !arguments ||
         arguments->scalarOutputCount != 1)
         return kIOReturnBadArgument;
-    // >4 KiB inputs arrive as structureInputDescriptor.
+    // 0.58.0: >4 KiB inputs arrive as structureInputDescriptor.
     IOMemoryDescriptor *md = arguments->structureInputDescriptor;
     const UInt64 size = md ? md->getLength() : arguments->structureInputSize;
     if (size < 4 || (size & 3) || size > 0x40000 ||
@@ -203,7 +219,7 @@ IOReturn IOAccelNVGspUserClient::rpc(
     return r;
 }
 
-// scalar in {vram offset, count, write}; struct in = words to
+// 0.81.0: scalar in {vram offset, count, write}; struct in = words to
 // write, struct out = words read (<= 1024 dwords).
 IOReturn IOAccelNVGspUserClient::vram(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
@@ -230,7 +246,7 @@ IOReturn IOAccelNVGspUserClient::vram(
         static_cast<UInt32 *>(arguments->structureOutput), count, false);
 }
 
-// struct in = core channel method words (<= 256 dwords).
+// 0.83.0: struct in = core channel method words (<= 256 dwords).
 IOReturn IOAccelNVGspUserClient::core(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
@@ -243,7 +259,7 @@ IOReturn IOAccelNVGspUserClient::core(
     return self->driver_->submitCore(words, static_cast<UInt32>(arguments->structureInputSize / 4));
 }
 
-// scalar in {log index, offset}; struct out <= 4096 bytes.
+// 0.87.0: scalar in {log index, offset}; struct out <= 4096 bytes.
 IOReturn IOAccelNVGspUserClient::gsplog(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
@@ -257,7 +273,7 @@ IOReturn IOAccelNVGspUserClient::gsplog(
         static_cast<UInt8 *>(arguments->structureOutput), n);
 }
 
-// in-kext DP modeset on head 0; scalar out = step status (0 = pass).
+// 0.93.0: in-kext DP modeset on head 0; scalar out = step status (0 = pass).
 IOReturn IOAccelNVGspUserClient::modeset(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
@@ -270,7 +286,7 @@ IOReturn IOAccelNVGspUserClient::modeset(
     return r;
 }
 
-// boot modeset - no-op (cache capture only) when the VBIOS mode is lit.
+// 0.100.7: boot modeset — no-op (cache capture only) when the VBIOS mode is lit.
 IOReturn IOAccelNVGspUserClient::modesetLight(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
@@ -282,7 +298,7 @@ IOReturn IOAccelNVGspUserClient::modesetLight(
     return r;
 }
 
-// GSP SR cycle (suspend + resume + modeset) without system sleep.
+// 0.100.0: GSP SR cycle (suspend + resume + modeset) without system sleep.
 IOReturn IOAccelNVGspUserClient::srcycle(
     OSObject *target, void *, IOExternalMethodArguments *) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
@@ -290,7 +306,7 @@ IOReturn IOAccelNVGspUserClient::srcycle(
     return self->driver_->srCycle();
 }
 
-// 10 scalars = setMode timing; out = modeset code.
+// 0.137.0 (D4): 10 scalars = setMode timing; out = modeset code.
 IOReturn IOAccelNVGspUserClient::setMode(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
@@ -312,7 +328,7 @@ IOReturn IOAccelNVGspUserClient::cursorTest(
     return self->driver_->cursorTest(static_cast<UInt32>(arguments->scalarInput[0]));
 }
 
-// scalar out = 1 when someone else submitted to GR since our last
+// 0.145.0: scalar out = 1 when someone else submitted to GR since our last
 // submission, so our class state (NVK tex/sampler pools, SLM) must be re-pushed.
 IOReturn IOAccelNVGspUserClient::grStateOwner(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
@@ -323,9 +339,27 @@ IOReturn IOAccelNVGspUserClient::grStateOwner(
     return kIOReturnSuccess;
 }
 
+// No memory allocation, MMIO, fence wait or arena change. Native work must
+// validate the connection even when an app reuses every existing resource.
+IOReturn IOAccelNVGspUserClient::generationStatus() const {
+    if (!driver_) return kIOReturnOffline;
+    if (driver_->resetBusy()) return kIOReturnNotReady;
+    return resetGen_ == driver_->resetGeneration() ? kIOReturnSuccess : kIOReturnOffline;
+}
+
 IOReturn IOAccelNVGspUserClient::externalMethod(
     uint32_t selector, IOExternalMethodArguments *arguments,
     IOExternalMethodDispatch *, OSObject *, void *) {
+    // 37 (0.174.0): validate this client's generation, without submitting
+    // work. Allowed for non-admin clients; used before native encoding.
+    if (selector == 37) {
+        if (!arguments || arguments->scalarInputCount || arguments->structureInputSize ||
+            arguments->structureInputDescriptor || arguments->scalarOutputCount != 1 ||
+            !arguments->scalarOutput) return kIOReturnBadArgument;
+        const IOReturn r = generationStatus();
+        if (r == kIOReturnSuccess) arguments->scalarOutput[0] = resetGen_;
+        return r;
+    }
     static const IOExternalMethodDispatch methods[] = {
         {commit, 1, 0, 0, 0},
         {boot, 0, 0, 0, 0},
@@ -344,49 +378,67 @@ IOReturn IOAccelNVGspUserClient::externalMethod(
         {modeset, 0, 0, 1, 0},
         {srcycle, 0, 0, 0, 0},
         {modesetLight, 0, 0, 1, 0},
-        {submitAsync, 0, kIOUCVariableStructureSize, 1, 0},   // 17
-        {fenceWait, 2, 0, 1, 0},                              // 18
-        {gpuReset, 0, 0, 0, 0},                               // 19
-        {vaBind, 4, 0, 0, 0},                                 // 20
-        {execSegments, 1, kIOUCVariableStructureSize, 1, 0},  // 21
-        {memAlloc, 2, 0, 2, 0},                               // 22
+        {submitAsync, 0, kIOUCVariableStructureSize, 1, 0},   // 17 (0.103.0)
+        {fenceWait, 2, 0, 1, 0},                              // 18 (0.103.0)
+        {gpuReset, 0, 0, 0, 0},                               // 19 (0.104.0)
+        {vaBind, 4, 0, 0, 0},                                 // 20 (0.105.0)
+        {execSegments, 1, kIOUCVariableStructureSize, 1, 0},  // 21 (0.106.0)
+        {memAlloc, 2, 0, 2, 0},                               // 22 (0.107.0)
         {memFree, 1, 0, 0, 0},                                // 23
         {vaBindObject, kIOUCVariableStructureSize, 0, 0, 0},  // 24 (3 or 5 scalars)
-        {vaUnbind, 2, 0, 0, 0},                               // 25
-        {memInfo, 0, 0, 3, 0},                                // 26
-        {present, 6, 0, 0, 0},                                // 27
-        {presentStop, 0, 0, 0, 0},                            // 28
-        {ceFenceWait, 2, 0, 1, 0},                            // 29
-        {videoOpen, 1, 0, 2, 0},                              // 30
-        {engineFenceWait, 3, 0, 1, 0},                        // 31
-        {accelGo, 0, 0, 0, 0},                                // 32
-        {userMemBind, 4, 0, 1, 0},                            // 33
-        {setMode, 10, 0, 1, 0},                               // 34
-        {cursorTest, 1, 0, 0, 0},                             // 35
-        {grStateOwner, 0, 0, 1, 0},                           // 36
+        {vaUnbind, 2, 0, 0, 0},                               // 25 (0.109.0)
+        {memInfo, 0, 0, 3, 0},                                // 26 (0.109.0)
+        {present, 6, 0, 0, 0},                                // 27 (0.110.0)
+        {presentStop, 0, 0, 0, 0},                            // 28 (0.110.0)
+        {ceFenceWait, 2, 0, 1, 0},                            // 29 (0.112.0)
+        {videoOpen, 1, 0, 2, 0},                              // 30 (0.116.0)
+        {engineFenceWait, 3, 0, 1, 0},                        // 31 (0.116.0)
+        {accelGo, 0, 0, 0, 0},                                // 32 (0.132.0)
+        {userMemBind, 4, 0, 1, 0},                            // 33 (0.134.0)
+        {setMode, 10, 0, 1, 0},                               // 34 (0.137.0)
+        {cursorTest, 1, 0, 0, 0},                             // 35 (0.138.0)
+        {grStateOwner, 0, 0, 1, 0},                           // 36 (0.145.0)
+        {nullptr, 0, 0, 0, 0},                                // 37: handled above (0.174.0)
+        {memAdopt, 1, 0, 2, 0},                               // 38 (0.177.0)
+        {diagnosticChannelKick, 1, 0, 0, 0},                 // 39 (0.177.2), admin only
+        {clientChannel, 1, 0, 1, 0},                          // 40 (0.178.0)
     };
     if (selector >= sizeof(methods) / sizeof(methods[0]))
         return kIOReturnUnsupported;
     if (!admin_) {
         switch (selector) {
         case 18: case 21: case 22: case 23: case 24: case 25: case 26: case 29:   // fence wait, submit, memory, VA
-        case 30: case 31: case 33:                                                // video engines, user pages
+        case 30: case 31: case 33: case 38: case 40:                              // video engines, user pages, adopt, own GR channel
             break;
         default:
             return kIOReturnNotPrivileged;   // peek/poke, RPC, PRAMIN, modeset, reset, ...
         }
     }
-    // after a GPU reset the channel, fence sequence and VA space
+    // 0.110.0: after a GPU reset the channel, fence sequence and VA space
     // are new; a client from before it must not submit, wait or bind
     // against them (its fence numbers would alias the new sequence).
     // Freeing, present-stop and memInfo stay allowed for cleanup.
     switch (selector) {
     case 17: case 18: case 20: case 21: case 22: case 24: case 25: case 27: case 29:
-    case 30: case 31:
-        if (!driver_ || resetGen_ != driver_->resetGeneration()) return kIOReturnOffline;
+    case 30: case 31: case 33: case 38: case 39: case 40: {
+        // 0.164.0: while a reset runs nobody allocates, binds or submits.
+        // A client that reopened in that window bound into tables the reset
+        // then dropped (WindowServer's staging gone, CE fault, reset again).
+        const IOReturn r = generationStatus();
+        if (r != kIOReturnSuccess) return r;
         break;
+    }
     default:
         break;
+    }
+    // 0.178.6: own GR channel before the client's first allocation or
+    // submission, so none of its GR work ever ran on the shared channel
+    // 0.178.10: up to 3 tries (an open can fail on a busy GSP); the kext
+    // drains the shared engines before a late channel goes live
+    if (ownTries_ < 3 && driver_ && (selector == 5 || selector == 6 || selector == 17 || selector == 21 || selector == 22) &&
+        driver_->ownChannelAuto()) {
+        UInt32 chid = 0;
+        ownTries_ = driver_->clientChannelOpen(this, &chid) == kIOReturnSuccess ? 3 : ownTries_ + 1;
     }
     return super::externalMethod(selector, arguments,
                                  const_cast<IOExternalMethodDispatch *>(&methods[selector]),
@@ -395,7 +447,7 @@ IOReturn IOAccelNVGspUserClient::externalMethod(
 
 #undef super
 
-// struct in = GR pushbuffer words; scalar out = fence sequence.
+// 0.103.0: struct in = GR pushbuffer words; scalar out = fence sequence.
 IOReturn IOAccelNVGspUserClient::submitAsync(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
@@ -412,7 +464,7 @@ IOReturn IOAccelNVGspUserClient::submitAsync(
     return r;
 }
 
-// scalar in {seq, timeout us}; scalar out = completed sequence.
+// 0.103.0: scalar in {seq, timeout us}; scalar out = completed sequence.
 IOReturn IOAccelNVGspUserClient::fenceWait(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
@@ -423,12 +475,12 @@ IOReturn IOAccelNVGspUserClient::fenceWait(
     const IOReturn r = self->driver_->waitGrFence(
         static_cast<UInt32>(arguments->scalarInput[0]),
         static_cast<UInt32>(arguments->scalarInput[1] > 5000000 ? 5000000 : arguments->scalarInput[1]),
-        &done);
+        &done, self);
     arguments->scalarOutput[0] = done;
     return r;
 }
 
-// GPU reset without reboot (asynchronous; see NVGspControl::gpuReset).
+// 0.104.0: GPU reset without reboot (asynchronous; see NVGspControl::gpuReset).
 IOReturn IOAccelNVGspUserClient::gpuReset(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
@@ -436,7 +488,7 @@ IOReturn IOAccelNVGspUserClient::gpuReset(
     return self->driver_->gpuReset();
 }
 
-// scalar in {va, phys, bytes (0 = unbind one 2 MiB page), flags}.
+// 0.105.0: scalar in {va, phys, bytes (0 = unbind one 2 MiB page), flags}.
 IOReturn IOAccelNVGspUserClient::vaBind(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
@@ -447,9 +499,9 @@ IOReturn IOAccelNVGspUserClient::vaBind(
                                  static_cast<UInt32>(arguments->scalarInput[3]));
 }
 
-// scalar in {engine}; struct in = n x {u64 va, u32 dwords, u32 flags};
+// 0.106.0: scalar in {engine}; struct in = n x {u64 va, u32 dwords, u32 flags};
 // scalar out = fence sequence (wait: selector 18 GR, 29 CE, 31 any engine;
-// engine 2 + n = video engine n after selector 30).
+// 0.116.0: engine 2 + n = video engine n after selector 30).
 IOReturn IOAccelNVGspUserClient::execSegments(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
@@ -474,7 +526,7 @@ IOReturn IOAccelNVGspUserClient::execSegments(
     return r;
 }
 
-// scalar in {bytes, domain 0 VRAM / 1 SYS / 2 CPU-visible VRAM}; out {handle, phys}.
+// 0.107.0: scalar in {bytes, domain 0 VRAM / 1 SYS / 2 CPU-visible VRAM (0.123.0)}; out {handle, phys}.
 IOReturn IOAccelNVGspUserClient::memAlloc(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
@@ -490,12 +542,35 @@ IOReturn IOAccelNVGspUserClient::memAlloc(
     return r;
 }
 
+// 0.177.0: scalar in {handle of an object this process's pre-reset client owns}; out {handle, phys}.
+IOReturn IOAccelNVGspUserClient::memAdopt(
+    OSObject *target, void *, IOExternalMethodArguments *arguments) {
+    auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
+    if (!self || !self->driver_ || !arguments || arguments->scalarInputCount != 1 ||
+        arguments->scalarOutputCount != 2)
+        return kIOReturnBadArgument;
+    const UInt32 h = static_cast<UInt32>(arguments->scalarInput[0]);
+    UInt64 phys = 0;
+    const IOReturn r = self->driver_->memAdopt(self, self->task_, h, &phys);
+    arguments->scalarOutput[0] = r == kIOReturnSuccess ? h : 0;
+    arguments->scalarOutput[1] = phys;
+    return r;
+}
+
 IOReturn IOAccelNVGspUserClient::memFree(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
     if (!self || !self->driver_ || !arguments || arguments->scalarInputCount != 1)
         return kIOReturnBadArgument;
     return self->driver_->memFree(self, static_cast<UInt32>(arguments->scalarInput[0]));
+}
+
+IOReturn IOAccelNVGspUserClient::diagnosticChannelKick(
+    OSObject *target, void *, IOExternalMethodArguments *arguments) {
+    auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
+    if (!self || !self->driver_ || !arguments || arguments->scalarInputCount != 1 ||
+        arguments->scalarInput[0] > 0xffffffffULL) return kIOReturnBadArgument;
+    return self->driver_->diagnosticChannelKick(static_cast<UInt32>(arguments->scalarInput[0]));
 }
 
 // scalar in {handle, va, flags (PTE kind)}.
@@ -511,7 +586,7 @@ IOReturn IOAccelNVGspUserClient::vaBindObject(
         part ? arguments->scalarInput[3] : 0, part ? arguments->scalarInput[4] : 0);
 }
 
-// scalar in {uaddr, bytes, va, flags (bits 7:0 PTE kind)}; out {handle}.
+// 0.134.0: scalar in {uaddr, bytes, va, flags (bits 7:0 PTE kind)}; out {handle}.
 // 4 KiB aligned; the pages stay wired until memFree(handle).
 IOReturn IOAccelNVGspUserClient::userMemBind(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
@@ -527,7 +602,7 @@ IOReturn IOAccelNVGspUserClient::userMemBind(
     return r;
 }
 
-// scalar in {va, bytes}; 2 MiB aligned range in the user VA arena.
+// 0.109.0: scalar in {va, bytes}; 2 MiB aligned range in the user VA arena.
 IOReturn IOAccelNVGspUserClient::vaUnbind(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
@@ -536,7 +611,7 @@ IOReturn IOAccelNVGspUserClient::vaUnbind(
     return self->driver_->vaUnbind(self, arguments->scalarInput[0], arguments->scalarInput[1]);
 }
 
-// scalar out {VRAM heap bytes, VRAM used, SYS used} (all clients).
+// 0.109.0: scalar out {VRAM heap bytes, VRAM used, SYS used} (all clients).
 IOReturn IOAccelNVGspUserClient::memInfo(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
@@ -546,7 +621,7 @@ IOReturn IOAccelNVGspUserClient::memInfo(
                                   &arguments->scalarOutput[2]);
 }
 
-// scalar in {handle, offset, pitch, width, height, format}.
+// 0.110.0: scalar in {handle, offset, pitch, width, height, format}.
 IOReturn IOAccelNVGspUserClient::present(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
@@ -566,7 +641,7 @@ IOReturn IOAccelNVGspUserClient::presentStop(
     return self->driver_->presentStop(self);
 }
 
-// scalar in {seq, timeout us}; scalar out = completed CE sequence.
+// 0.112.0: scalar in {seq, timeout us}; scalar out = completed CE sequence.
 IOReturn IOAccelNVGspUserClient::ceFenceWait(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
@@ -582,7 +657,7 @@ IOReturn IOAccelNVGspUserClient::ceFenceWait(
     return r;
 }
 
-// scalar in {video engine 0 NVDEC0 / 1 NVENC0 / 2 OFA0};
+// 0.116.0 (V1): scalar in {video engine 0 NVDEC0 / 1 NVENC0 / 2 OFA0};
 // out {setup stage (12 = ready), RM status of that stage}. Idempotent.
 IOReturn IOAccelNVGspUserClient::videoOpen(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
@@ -598,9 +673,9 @@ IOReturn IOAccelNVGspUserClient::videoOpen(
     return r;
 }
 
-// scalar in {engine (0 GR, 1 CE, 2 + video index), seq, timeout us};
+// 0.116.0: scalar in {engine (0 GR, 1 CE, 2 + video index), seq, timeout us};
 // scalar out = completed sequence.
-// let NVAccelerator match. Its personality has IOResourceMatch
+// 0.132.0: let NVAccelerator (B4) match. Its personality has IOResourceMatch
 // NVAcceleratorGo, so it starts only when userspace asks, after the GSP chain,
 // under a file-based crash guard (a kernel-set NVRAM marker did not survive a
 // panic loop, live 26 Sep).
@@ -623,7 +698,24 @@ IOReturn IOAccelNVGspUserClient::engineFenceWait(
         static_cast<UInt32>(arguments->scalarInput[0]),
         static_cast<UInt32>(arguments->scalarInput[1]),
         static_cast<UInt32>(arguments->scalarInput[2] > 5000000 ? 5000000 : arguments->scalarInput[2]),
-        &done);
+        &done, self);
     arguments->scalarOutput[0] = done;
+    return r;
+}
+
+// 0.178.0: scalar in {1 open, 0 close}; out = physical chid of the client's
+// own GR channel. Its later GR submissions (selectors 9, 17, 21 engine 0) and
+// GR fence waits (18, 31 engine 0) use that channel and its sequence numbers.
+IOReturn IOAccelNVGspUserClient::clientChannel(
+    OSObject *target, void *, IOExternalMethodArguments *arguments) {
+    auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
+    if (!self || !self->driver_ || !arguments || arguments->scalarInputCount != 1 ||
+        arguments->scalarOutputCount != 1 || arguments->scalarInput[0] > 1)
+        return kIOReturnBadArgument;
+    UInt32 chid = 0;
+    IOReturn r = kIOReturnSuccess;
+    if (arguments->scalarInput[0]) r = self->driver_->clientChannelOpen(self, &chid);
+    else self->driver_->clientChannelClose(self);
+    arguments->scalarOutput[0] = chid;
     return r;
 }

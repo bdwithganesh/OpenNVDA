@@ -1,9 +1,9 @@
 /*
- * HEVC (ITU-T H.265) syntax parser for the NVDEC driver: SPS, PPS (tiles and
- * scaling lists too) and the first part of the slice segment header, up to the
- * long-term RPS, which is all the driver needs; NVDEC firmware parses the rest,
- * skipping sw_hdr_skip_length bits. Reuses the Annex B splitter and bit reader
- * from h264_parse. Plain C99.
+ * V1: HEVC (ITU-T H.265) syntax parser for the NVDEC driver: SPS, PPS
+ * (incl. tiles, scaling lists) and the first part of the slice segment
+ * header (up to the long-term RPS, which is what the driver needs; the
+ * NVDEC firmware parses the rest, skipping sw_hdr_skip_length bits).
+ * Uses the Annex B splitter and bit reader of h264_parse. Plain C99.
  */
 #pragma once
 #include <stddef.h>

@@ -1,10 +1,10 @@
-// NVMTLRender: the first, very simple render path. Vertex shaders run as
-// compute launches (clip positions go to a param area), then a fixed GLSL
-// rasterizer runs per pixel per triangle and the result is copied back into
-// the texture's buffer. No fixed-function raster/ROP, MSAA, depth or blending
-// yet. We take both windings, ignore cull/frontFace, and the fragment side
-// is constant colour only.
+// NVMTLRender: M6 v1 render path (B4). Vertex shaders run as compute
+// launches (clip positions to a param area); a fixed GLSL rasterizer runs
+// per pixel per triangle; results copy back to the texture's buffer.
+// Fixed-function raster/ROP, MSAA, depth and blending are deferred (v1
+// accepts both windings, ignores cull/frontFace, constant-color FS only).
 #import <Foundation/Foundation.h>
+#import "NVMTLLog.h"
 #import <Metal/Metal.h>
 #import "NVMTLCompiler.h"
 #import "NVMTLGsp.h"
@@ -116,7 +116,7 @@ bool nvRenderDraw(NVMTLKernel *vs, const float fsColor[4],
     uint32_t block[3] = {256, 1, 1};
     // Guard: VS writes OUT[gid] for gid < grid*block; over-launch writes
     // past vCount but inside the 64 KiB VSOUT for vCount <= 4093.
-    if (vCount > 4093 || vCount == 0) { NSLog(@"NVMTLRender: vertexCount %lu out of range for now", (unsigned long)vCount); return false; }
+    if (vCount > 4093 || vCount == 0) { NSLog(@"NVMTLRender: vertexCount %lu out of v1 range", (unsigned long)vCount); return false; }
     const uint32_t *code = vs.code.bytes;
     if (!nvGrLaunch(code, (uint32_t)(vs.code.length / 4), vs.regs, vs.slm, vs.smem, vs.barriers,
                     push, nPush, grid, block)) {

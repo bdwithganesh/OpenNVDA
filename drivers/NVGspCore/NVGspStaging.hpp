@@ -58,7 +58,7 @@ public:
     const WprMeta *metadata() const { return ready_ ? &meta_ : nullptr; }
     // Booter/GSP write back into the DMA copy (verified, bootCount); NVIDIA
     // resets them before every bootstrap (kernel_gsp_tu102.c:816), so each
-    // boot, incl. the S3 re-boot, re-publishes the pristine metadata.
+    // boot — incl. the S3 re-boot — re-publishes the pristine metadata.
     bool rewriteMetadata() { return ready_ && metadata_.write(0, &meta_, sizeof(meta_)); }
     uint32_t appVersion() const { return ready_ ? appVersion_ : 0; }
 

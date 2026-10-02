@@ -1,0 +1,30 @@
+{
+  "results": [
+    {
+      "receipt": "lut-identity-before.txt",
+      "crc": [
+        "0ab14391",
+        "7f406264",
+        "5cf9eeb7"
+      ]
+    },
+    {
+      "receipt": "lut-half-gain.txt",
+      "crc": [
+        "0ab14391",
+        "7a53fd22",
+        "8c99cfba"
+      ]
+    },
+    {
+      "receipt": "lut-identity-after.txt",
+      "crc": [
+        "0ab14391",
+        "7f406264",
+        "5cf9eeb7"
+      ]
+    }
+  ],
+  "verified": "fixed opaque gray ramp; stable three captures per phase; identity restored exactly; compositor unchanged, raster and DP/SF differ for half gain; all resource restorations/free pass",
+  "not_verified": "calibrated physical colour accuracy, visible hardware cursor or production routing"
+}

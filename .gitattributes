@@ -1,0 +1,4 @@
+# A patch contains upstream context lines, including significant blank-line markers.
+*.patch -whitespace
+# Keep captured raw log spacing as recorded.
+docs/evidence/**/*.txt -whitespace

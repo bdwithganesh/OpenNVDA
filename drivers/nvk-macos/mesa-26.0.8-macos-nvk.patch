@@ -1088,7 +1088,7 @@ index 0000000..2e51ae9
 +   if (display != display_handle() ||
 +       p->visibleRegion.width != NVK_MACOS_WIDTH ||
 +       p->visibleRegion.height != NVK_MACOS_HEIGHT ||
-+       (p->refreshRate && p->refreshRate != NVK_MACOS_REFRESH_MHZ))
++       p->refreshRate != NVK_MACOS_REFRESH_MHZ)   /* 0 is invalid too (CTS create_display_mode) */
 +      return VK_ERROR_INITIALIZATION_FAILED;
 +   *pMode = mode_handle();
 +   return VK_SUCCESS;
@@ -1751,25 +1751,191 @@ diff --git a/src/nouveau/vulkan/nvk_queue.c b/src/nouveau/vulkan/nvk_queue.c
  nvk_queue_submit_exec(struct nvk_queue *queue,
                        struct vk_queue_submit *submit)
  {
-@@ -218,6 +221,18 @@
+@@ -217,6 +220,16 @@
+       nvk_descriptor_table_flush_map(dev, &dev->samplers);
        nvk_heap_flush_maps(dev, &dev->shader_heap);
        assert(dev->event_heap.arena.mem_flags & NVKMD_MEM_COHERENT);
- 
-+#ifdef __APPLE__
-+      /* One GR channel for every device: re-push our context and queue
-+       * state when some other context ran on it since our last submit. */
-+      if (nvkmd_macos_ctx_state_lost(queue->exec_ctx)) {
-+         result = nvk_queue_init_context_state(queue);
-+         if (result != VK_SUCCESS)
-+            return result;
-+         nvk_queue_state_finish(dev, &queue->state);
-+         nvk_queue_state_init(&queue->state);
-+      }
-+#endif
 +
++#ifdef __APPLE__
++      /* The shared GR channel may change after an owner query. Queue the
++       * restore together with this submission, without a separate ioctl. */
++      result = nvk_queue_init_context_state(queue);
++      if (result != VK_SUCCESS)
++         return result;
++      nvk_queue_state_finish(dev, &queue->state);
++      nvk_queue_state_init(&queue->state);
++#endif
+ 
        result = nvk_queue_state_update(queue, &queue->state);
        if (result != VK_SUCCESS)
-          return result;
+@@ -244,19 +257,32 @@
+    if (result != VK_SUCCESS)
+       goto fail;
+ 
++#ifdef __APPLE__
++   /* Restore packets and command buffers must enter the kernel together;
++    * an intervening Metal submission otherwise invalidates the cached state. */
++   uint32_t max_execs = util_dynarray_num_elements(&queue->macos_pending_pushes,
++                                                 struct nvkmd_ctx_exec);
+    for (unsigned i = 0; i < submit->command_buffer_count; i++) {
+       struct nvk_cmd_buffer *cmd =
+          container_of(submit->command_buffers[i], struct nvk_cmd_buffer, vk);
+-
+-      const uint32_t max_execs =
++      const uint32_t count =
+          util_dynarray_num_elements(&cmd->pushes, struct nvk_cmd_push);
+-      STACK_ARRAY(struct nvkmd_ctx_exec, execs, max_execs);
+-      uint32_t exec_count = 0;
+-
++      if (count > UINT32_MAX - max_execs)
++         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++      max_execs += count;
++   }
++   STACK_ARRAY(struct nvkmd_ctx_exec, execs, max_execs);
++   if (execs == NULL)
++      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++   uint32_t exec_count = 0;
++   util_dynarray_foreach(&queue->macos_pending_pushes, struct nvkmd_ctx_exec, e)
++      execs[exec_count++] = *e;
++   for (unsigned i = 0; i < submit->command_buffer_count; i++) {
++      struct nvk_cmd_buffer *cmd =
++         container_of(submit->command_buffers[i], struct nvk_cmd_buffer, vk);
+       util_dynarray_foreach(&cmd->pushes, struct nvk_cmd_push, push) {
+          if (push->range == 0)
+             continue;
+-
+          execs[exec_count++] = (struct nvkmd_ctx_exec) {
+             .addr = push->addr,
+             .size_B = push->range,
+@@ -264,6 +290,40 @@
+             .no_prefetch = push->no_prefetch,
+          };
+       }
++   }
++   result = nvkmd_ctx_exec(queue->exec_ctx, &queue->vk.base, exec_count, execs);
++   STACK_ARRAY_FINISH(execs);
++   if (result != VK_SUCCESS)
++      goto fail;
++   if (util_dynarray_num_elements(&queue->macos_pending_pushes,
++                                  struct nvkmd_ctx_exec) > 0) {
++      result = nvk_mem_stream_flush(dev, &queue->push_stream,
++                                    queue->exec_ctx, NULL);
++      if (result != VK_SUCCESS)
++         goto fail;
++      util_dynarray_clear(&queue->macos_pending_pushes);
++   }
++#else
++   for (unsigned i = 0; i < submit->command_buffer_count; i++) {
++      struct nvk_cmd_buffer *cmd =
++         container_of(submit->command_buffers[i], struct nvk_cmd_buffer, vk);
++
++      const uint32_t max_execs =
++         util_dynarray_num_elements(&cmd->pushes, struct nvk_cmd_push);
++      STACK_ARRAY(struct nvkmd_ctx_exec, execs, max_execs);
++      uint32_t exec_count = 0;
++
++      util_dynarray_foreach(&cmd->pushes, struct nvk_cmd_push, push) {
++         if (push->range == 0)
++            continue;
++
++         execs[exec_count++] = (struct nvkmd_ctx_exec) {
++            .addr = push->addr,
++            .size_B = push->range,
++            .incomplete = push->incomplete,
++            .no_prefetch = push->no_prefetch,
++         };
++      }
+ 
+       result = nvkmd_ctx_exec(queue->exec_ctx, &queue->vk.base,
+                               exec_count, execs);
+@@ -273,6 +333,8 @@
+       if (result != VK_SUCCESS)
+          goto fail;
+    }
++
++#endif
+ 
+    result = nvkmd_ctx_signal(queue->exec_ctx, &queue->vk.base,
+                              submit->signal_count, submit->signals);
+@@ -320,8 +382,25 @@
+    if (nv_push_dw_count(push) == 0)
+       return VK_SUCCESS;
+ 
++#ifdef __APPLE__
++   uint64_t addr;
++   void *map;
++   const uint32_t size_B = nv_push_dw_count(push) * 4;
++   VkResult result = nvk_mem_stream_alloc(dev, &queue->push_stream, size_B, 4,
++                                          &addr, &map);
++   if (result != VK_SUCCESS)
++      return result;
++   memcpy(map, push->start, size_B);
++   struct nvkmd_ctx_exec *exec = util_dynarray_grow(&queue->macos_pending_pushes,
++                                                  struct nvkmd_ctx_exec, 1);
++   if (exec == NULL)
++      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++   *exec = (struct nvkmd_ctx_exec) { .addr = addr, .size_B = size_B };
++   return VK_SUCCESS;
++#else
+    return nvk_mem_stream_push(dev, &queue->push_stream, queue->exec_ctx,
+                               push->start, nv_push_dw_count(push), NULL);
++#endif
+ }
+ 
+ static VkResult
+@@ -450,6 +529,9 @@
+    if (result != VK_SUCCESS)
+       goto fail_bind_ctx;
+ 
++#ifdef __APPLE__
++   util_dynarray_init(&queue->macos_pending_pushes, NULL);
++#endif
+    result = nvk_queue_init_context_state(queue);
+    if (result != VK_SUCCESS)
+       goto fail_push_stream;
+@@ -459,6 +541,9 @@
+    return VK_SUCCESS;
+ 
+ fail_push_stream:
++#ifdef __APPLE__
++   util_dynarray_fini(&queue->macos_pending_pushes);
++#endif
+    nvk_mem_stream_sync(dev, &queue->push_stream, queue->exec_ctx);
+    nvk_mem_stream_finish(dev, &queue->push_stream);
+ fail_bind_ctx:
+@@ -482,6 +567,9 @@
+ void
+ nvk_queue_destroy(struct nvk_device *dev, struct nvk_queue *queue)
+ {
++#ifdef __APPLE__
++   util_dynarray_fini(&queue->macos_pending_pushes);
++#endif
+    nvk_mem_stream_sync(dev, &queue->push_stream, queue->exec_ctx);
+    nvk_mem_stream_finish(dev, &queue->push_stream);
+    if (queue->draw_cb0 != NULL) {
+diff --git a/src/nouveau/vulkan/nvk_queue.h b/src/nouveau/vulkan/nvk_queue.h
+--- a/src/nouveau/vulkan/nvk_queue.h
++++ b/src/nouveau/vulkan/nvk_queue.h
+@@ -7,6 +7,9 @@
+ 
+ #include "nvk_mem_stream.h"
+ #include "nv_push.h"
++#ifdef __APPLE__
++#include "util/u_dynarray.h"
++#endif
+ 
+ #include "vk_queue.h"
+ #include "nvkmd/nvkmd.h"
+@@ -46,6 +49,9 @@
+     * command buffer.
+     */
+    struct nvk_mem_stream push_stream;
++#ifdef __APPLE__
++   struct util_dynarray macos_pending_pushes;
++#endif
+ 
+    struct nvk_queue_state state;
+ 
 diff --git a/src/nouveau/vulkan/nvk_shader.c b/src/nouveau/vulkan/nvk_shader.c
 --- a/src/nouveau/vulkan/nvk_shader.c
 +++ b/src/nouveau/vulkan/nvk_shader.c
@@ -2611,7 +2777,7 @@ new file mode 100644
 +   /* IOUserClient::mapClientMemory64 lets the caller's cache bits override the
 +    * kext's (kIOMapUserOptionsMask), so BAR1 VRAM must ask for WC itself;
 +    * with only kIOMapAnywhere it maps uncached (~2 GB/s writes, 26 Sep). */
-+   if (IOConnectMapMemory64(dev->conn, 0x1000 | mem->handle, mach_task_self(),
++   if (IOConnectMapMemory64(dev->conn, (mem->handle < 0x1000 ? 0x1000 | mem->handle : 0x40000000u | mem->handle), mach_task_self(),
 +                            &addr, &size,
 +                            kIOMapAnywhere | (mem->cpu_vram ? kIOMapWriteCombineCache : 0)))
 +      return MACOS_ERR(log_obj, VK_ERROR_MEMORY_MAP_FAILED);
@@ -2625,7 +2791,7 @@ new file mode 100644
 +   struct nvkmd_macos_mem *mem = container_of(_mem, struct nvkmd_macos_mem, base);
 +   struct nvkmd_macos_dev *dev =
 +      container_of(_mem->dev, struct nvkmd_macos_dev, base);
-+   IOConnectUnmapMemory64(dev->conn, 0x1000 | mem->handle, mach_task_self(),
++   IOConnectUnmapMemory64(dev->conn, (mem->handle < 0x1000 ? 0x1000 | mem->handle : 0x40000000u | mem->handle), mach_task_self(),
 +                          (mach_vm_address_t)map);
 +}
 +
@@ -3727,3 +3893,18 @@ diff --git a/src/vulkan/wsi/wsi_common_headless.c b/src/vulkan/wsi/wsi_common_he
        cpu_params = (struct wsi_cpu_image_params) {
           .base.image_type = WSI_IMAGE_TYPE_CPU,
        };
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -1974,6 +1974,11 @@
+ 
+    if (wsi->sw)
+       req_props |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
++#ifdef __APPLE__
++   /* nvk macOS layer WSI copies every frame out on the CPU: write-combined
++    * BAR1 VRAM (the first coherent type) reads at a few frames a second */
++   req_props |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
++#endif
+ 
+    return wsi_select_memory_type(wsi, req_props, 0 /* deny_props */, type_bits);
+ }

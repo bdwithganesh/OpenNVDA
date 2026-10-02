@@ -4,19 +4,19 @@
 
 namespace nvgsp {
 
-// Ownership table for the user VA arena (GPU VA
+// 0.109.0: ownership table for the user VA arena (GPU VA
 // 0x28_0000_0000..0x30_0000_0000, 32 GiB, 2 MiB PTEs = 16384 pages).
 //
-// Each entry says what the page's PTE points at right now:
-//   0                    unbound
+// Each entry holds who the page's PTE currently points at:
+//   0                  unbound
 //   1..kArenaRawOwner-1  memory-object handle (vaBindObject)
-//   kArenaRawOwner       raw physical bind (selector 20), no object
+//   kArenaRawOwner     raw physical bind (selector 20), no object
 //
-// Earlier memFree released an object's pages while its PTEs were still
-// valid, so the GPU could keep reading/writing freed VRAM or freed kernel
-// sysmem through a stale VA. With this table memFree/memFreeAll can find
-// and unbind exactly the pages that still point at the object, and
-// vaBindObject can refuse to overwrite another client's live mapping.
+// Before 0.109.0 memFree released an object's pages while its PTEs stayed
+// valid, so the GPU could still read/write freed VRAM or freed kernel
+// sysmem chunks through a stale VA. The table lets memFree/memFreeAll find
+// and unbind exactly the pages that still point at the object, and lets
+// vaBindObject refuse to overwrite another client's live mapping.
 constexpr uint64_t kArenaBase = 0x2800000000ULL;
 constexpr uint64_t kArenaEnd = 0x3000000000ULL;
 constexpr uint64_t kArenaPageBytes = 0x200000ULL;
@@ -45,8 +45,8 @@ inline void arenaMark(uint16_t *table, uint32_t first, uint32_t count,
         table[first + i] = owner;
 }
 
-// Next maximal run of pages equal to `owner` at or after `start`. Returns
-// false when there is none. Used to unbind a freed object with one
+// Next maximal run of pages equal to `owner` at or after `start`.
+// Returns false when there is none. Used to unbind a freed object with one
 // PTE-range write per contiguous run.
 inline bool arenaNextRun(const uint16_t *table, uint16_t owner, uint32_t start,
                          uint32_t *first, uint32_t *count) {

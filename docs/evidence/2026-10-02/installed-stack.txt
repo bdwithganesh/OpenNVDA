@@ -1,0 +1,12 @@
+Fri Oct  2 21:00:25 IST 2026
+ProductName:		macOS
+ProductVersion:		26.7
+BuildVersion:		25G229
+   93    0 0xffffff800572d000 0x78000    0x78000    org.local.macosdevicelab.NVGspControl (0.178.27) F0696807-8D59-3C87-889A-B7329E50987D <19 7 6 3>
+  119    0 0xffffff7f96dcf000 0x72c8     0x72c8     org.local.macosdevicelab.NVDisplay (0.9.6) 42836377-48CF-35F4-AF5D-92034BA79B24 <116 19 9 7 6 3 1>
+  137    0 0xffffff7f96dbd000 0xaed8     0xaed8     org.local.macosdevicelab.NVAccelerator (0.5.17) B72BAAA7-0F2A-387F-8F9F-75CDC90C5CF5 <136 117 116 83 19 9 7 6 3 1>
+system_metal_version
+0.8.69
+library_metal_version
+0.8.69
+736

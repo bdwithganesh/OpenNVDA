@@ -1,7 +1,5 @@
-/*
- * Minimal MD5 (RFC 1321) for comparing decoded frames with the reference
- * digests of tools/nvdec/gen_vectors.py. Header-only, portable C99.
- */
+/* Minimal MD5 (RFC 1321) for comparing decoded frames with the reference
+ * digests of tools/nvdec/gen_vectors.py. Header-only, portable C99. */
 #pragma once
 #include <stddef.h>
 #include <stdint.h>

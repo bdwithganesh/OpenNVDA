@@ -1,0 +1,165 @@
+Fri Oct  2 18:19:30 IST 2026
+kern.boottime: { sec = 1790945330, usec = 76553 } Fri Oct  2 18:18:50 2026
+726
+before exception=00000080 data=00000000 code=00000000 method=0200 type=0 pending=00000000 error=00000000 core=200b0000 PUT=14 GET=14
+before usage ASSY=00001110 ARMED=00001110
+before cursor+00 ASSY=00000000 ARMED=00000000
+before cursor+04 ASSY=00000000 ARMED=00000000
+before cursor+08 ASSY=00000000 ARMED=00000000
+before cursor+0c ASSY=00000000 ARMED=00000000
+before cursor+10 ASSY=00000000 ARMED=00000000
+before cursor+14 ASSY=000000e9 ARMED=000000e9
+before cursor+18 ASSY=000002ff ARMED=000002ff
+before OLUT+00 ASSY=00000000 ARMED=00000000
+before OLUT+04 ASSY=cccccccc ARMED=cccccccc
+before OLUT+08 ASSY=00000000 ARMED=00000000
+before OLUT+0c ASSY=00000000 ARMED=00000000
+before OCSC+00 ASSY=00000000 ARMED=00000000
+before OCSC+04 ASSY=00000000 ARMED=00000000
+before OCSC+08 ASSY=00000000 ARMED=00000000
+before OCSC+0c ASSY=00000000 ARMED=00000000
+before OCSC+10 ASSY=00000000 ARMED=00000000
+before OCSC+14 ASSY=00000000 ARMED=00000000
+before OCSC+18 ASSY=00000000 ARMED=00000000
+before OCSC+1c ASSY=00000000 ARMED=00000000
+before OCSC+20 ASSY=00000000 ARMED=00000000
+before OCSC+24 ASSY=00000000 ARMED=00000000
+before OCSC+28 ASSY=00000000 ARMED=00000000
+before OCSC+2c ASSY=00000000 ARMED=00000000
+before OCSC+30 ASSY=00000000 ARMED=00000000
+cursor PIO setup transport=00000000 pushbuffer=0 allocation=0 idle=yes
+window-before window PUT=58 GET=58 composition=00010000 factor=00000000 ILUT=00000000/00000000/00000000 interlock=00000000/00000000 exception=00000080/00000000/00000000 method=0200 type=0
+window guard: remembered PUT88/currentPUT88, no direct presenter, ILUT bounds, identity FMT, disabled CSC/LUT stages and vacant PB verified
+rpc function=103 transport=00000000 bytes=244 rpc=00000000 rm=00000000 result=success
+RM backing offset=3f1be8000 size=10000 attr=10800000
+table readback and manual descriptor/RAMHT preservation verified; gain=1.0
+OCSC identity override=yes
+OLUT submit=00000000 (fetch result only)
+OLUT exception=00000080 data=00000000 code=00000000 method=0200 type=0 pending=00000000 error=00000000 core=200b0000 PUT=88 GET=88
+OLUT usage ASSY=00001110 ARMED=00001110
+OLUT cursor+00 ASSY=00000000 ARMED=00000000
+OLUT cursor+04 ASSY=00000000 ARMED=00000000
+OLUT cursor+08 ASSY=00000000 ARMED=00000000
+OLUT cursor+0c ASSY=00000000 ARMED=00000000
+OLUT cursor+10 ASSY=00000000 ARMED=00000000
+OLUT cursor+14 ASSY=000000e9 ARMED=000000e9
+OLUT cursor+18 ASSY=000002ff ARMED=000002ff
+OLUT OLUT+00 ASSY=00040509 ARMED=00040509
+OLUT OLUT+04 ASSY=ffffffff ARMED=ffffffff
+OLUT OLUT+08 ASSY=c0d000e1 ARMED=c0d000e1
+OLUT OLUT+0c ASSY=00000000 ARMED=00000000
+OLUT OCSC+00 ASSY=00000001 ARMED=00000001
+OLUT OCSC+04 ASSY=00010000 ARMED=00010000
+OLUT OCSC+08 ASSY=00000000 ARMED=00000000
+OLUT OCSC+0c ASSY=00000000 ARMED=00000000
+OLUT OCSC+10 ASSY=00000000 ARMED=00000000
+OLUT OCSC+14 ASSY=00000000 ARMED=00000000
+OLUT OCSC+18 ASSY=00010000 ARMED=00010000
+OLUT OCSC+1c ASSY=00000000 ARMED=00000000
+OLUT OCSC+20 ASSY=00000000 ARMED=00000000
+OLUT OCSC+24 ASSY=00000000 ARMED=00000000
+OLUT OCSC+28 ASSY=00000000 ARMED=00000000
+OLUT OCSC+2c ASSY=00010000 ARMED=00010000
+OLUT OCSC+30 ASSY=00000000 ARMED=00000000
+OLUT window PUT=8c GET=8c composition=00000080 factor=00000011 ILUT=00040508/c0d000e2/00000000 interlock=00000001/00000000 exception=00000080/00000000/00000000 method=0200 type=0
+OLUT armed-match=yes
+window-trial window PUT=8c GET=8c composition=00000080 factor=00000011 ILUT=00040508/c0d000e2/00000000 interlock=00000001/00000000 exception=00000080/00000000/00000000 method=0200 type=0
+paired core-armed=yes window-fetch/ASSY-match=yes window-ARM=unpublished
+cursor-output original-point=00000000 free=4
+window-before window PUT=8c GET=8c composition=00000080 factor=00000011 ILUT=00040508/c0d000e2/00000000 interlock=00000001/00000000 exception=00000080/00000000/00000000 method=0200 type=0
+window guard: remembered PUT88/currentPUT140, no direct presenter, ILUT bounds, identity FMT, disabled CSC/LUT stages and vacant PB verified
+CRC-before exception=00000080 data=00000000 code=00000000 method=0200 type=0 pending=00000000 error=00000000 core=200b0000 PUT=88 GET=88
+CRC-before usage ASSY=00001110 ARMED=00001110
+CRC-before cursor+00 ASSY=00000000 ARMED=00000000
+CRC-before cursor+04 ASSY=00000000 ARMED=00000000
+CRC-before cursor+08 ASSY=00000000 ARMED=00000000
+CRC-before cursor+0c ASSY=00000000 ARMED=00000000
+CRC-before cursor+10 ASSY=00000000 ARMED=00000000
+CRC-before cursor+14 ASSY=000000e9 ARMED=000000e9
+CRC-before cursor+18 ASSY=000002ff ARMED=000002ff
+rpc function=103 transport=00000000 bytes=244 rpc=00000000 rm=00000000 result=success
+fixture upload/readback verified bytes=35389440 opaque3840x2160 gray-ramp/pitch16384
+CRC start-ARM=yes stop/exact-unreference=yes
+CRC notifier status=00020001 count=2 overflow=0
+CRC last compositor=0ab14391 raster=7f406264 primary-DP-SF=5cf9eeb7 frames=2
+CRC start-ARM=yes stop/exact-unreference=yes
+CRC notifier status=00010001 count=1 overflow=0
+CRC last compositor=0ab14391 raster=7f406264 primary-DP-SF=5cf9eeb7 frames=1
+CRC start-ARM=yes stop/exact-unreference=yes
+CRC notifier status=00010001 count=1 overflow=0
+CRC last compositor=0ab14391 raster=7f406264 primary-DP-SF=5cf9eeb7 frames=1
+fixture three-captures stable=yes hardware-ARM=unpublished
+cursor PIO point=00400040 fetch/ASSY=yes PIO-ARM=unpublished
+cursor: same RM backing/manual DMA/red64px/relative0/control; normal composition is comparison variable
+normal-cursor submit=00000000 (fetch result only)
+normal-cursor exception=00000080 data=00000000 code=00000000 method=0200 type=0 pending=00000000 error=00000000 core=200b0000 PUT=194 GET=194
+normal-cursor usage ASSY=00001112 ARMED=00001112
+normal-cursor cursor+00 ASSY=c0d0d002 ARMED=c0d0d002
+normal-cursor cursor+04 ASSY=c0d0d002 ARMED=c0d0d002
+normal-cursor cursor+08 ASSY=00000000 ARMED=00000000
+normal-cursor cursor+0c ASSY=00000000 ARMED=00000000
+normal-cursor cursor+10 ASSY=00000000 ARMED=00000000
+normal-cursor cursor+14 ASSY=800001cf ARMED=800001cf
+normal-cursor cursor+18 ASSY=000075ff ARMED=000075ff
+normal-cursor armed-match=yes first-exception-change=no
+CRC-timeout exception=00000080 data=00000000 code=00000000 method=0200 type=0 pending=00000000 error=00000000 core=a00c0007 PUT=1d4 GET=1d4
+CRC-timeout usage ASSY=00001112 ARMED=00001112
+CRC-timeout cursor+00 ASSY=c0d0d002 ARMED=c0d0d002
+CRC-timeout cursor+04 ASSY=c0d0d002 ARMED=c0d0d002
+CRC-timeout cursor+08 ASSY=00000000 ARMED=00000000
+CRC-timeout cursor+0c ASSY=00000000 ARMED=00000000
+CRC-timeout cursor+10 ASSY=00000000 ARMED=00000000
+CRC-timeout cursor+14 ASSY=800001cf ARMED=800001cf
+CRC-timeout cursor+18 ASSY=000075ff ARMED=000075ff
+CRC-state ASSY=00000000/00000000 ARM=c0d000f1/00030000
+CRC start-ARM=yes stop/exact-unreference=no
+cursor-output-exit=1
+  |   "NVGspControl-post-init-phase" = 33
+  |   "NVGspControl-status-os-errors" = 0
+726
+snapshot exception=00000080 data=00000000 code=00000000 method=0200 type=0 pending=00000000 error=00000000 core=a00c0007 PUT=1d4 GET=1d4
+snapshot usage ASSY=00001112 ARMED=00001112
+snapshot cursor+00 ASSY=c0d0d002 ARMED=c0d0d002
+snapshot cursor+04 ASSY=c0d0d002 ARMED=c0d0d002
+snapshot cursor+08 ASSY=00000000 ARMED=00000000
+snapshot cursor+0c ASSY=00000000 ARMED=00000000
+snapshot cursor+10 ASSY=00000000 ARMED=00000000
+snapshot cursor+14 ASSY=800001cf ARMED=800001cf
+snapshot cursor+18 ASSY=000075ff ARMED=000075ff
+snapshot OLUT+00 ASSY=00040509 ARMED=00040509
+snapshot OLUT+04 ASSY=ffffffff ARMED=ffffffff
+snapshot OLUT+08 ASSY=c0d000e1 ARMED=c0d000e1
+snapshot OLUT+0c ASSY=00000000 ARMED=00000000
+snapshot OCSC+00 ASSY=00000001 ARMED=00000001
+snapshot OCSC+04 ASSY=00010000 ARMED=00010000
+snapshot OCSC+08 ASSY=00000000 ARMED=00000000
+snapshot OCSC+0c ASSY=00000000 ARMED=00000000
+snapshot OCSC+10 ASSY=00000000 ARMED=00000000
+snapshot OCSC+14 ASSY=00000000 ARMED=00000000
+snapshot OCSC+18 ASSY=00010000 ARMED=00010000
+snapshot OCSC+1c ASSY=00000000 ARMED=00000000
+snapshot OCSC+20 ASSY=00000000 ARMED=00000000
+snapshot OCSC+24 ASSY=00000000 ARMED=00000000
+snapshot OCSC+28 ASSY=00000000 ARMED=00000000
+snapshot OCSC+2c ASSY=00010000 ARMED=00010000
+snapshot OCSC+30 ASSY=00000000 ARMED=00000000
+snapshot hash[56]=c0d0d002/00414001
+snapshot hash[60]=c0d0d002/00414001
+snapshot hash[123]=c0d0d001/02400001
+snapshot hash[168]=c0d000e2/0241c001
+snapshot hash[172]=c0d000e2/0241c001
+snapshot hash[235]=c0d000e1/00418001
+snapshot hash[239]=c0d000e1/00418001
+snapshot hash[251]=c0d000f1/00420001
+snapshot hash[255]=c0d000f1/00420001
+snapshot cursor-object+00=00000005
+snapshot cursor-object+04=03f1bf00
+snapshot cursor-object+08=00000000
+snapshot cursor-object+0c=03f1bf7f
+snapshot cursor-object+10=00000000
+snapshot cursor-object+14=00000000
+snapshot cursor-object+18=00000000
+snapshot cursor-object+1c=00000000
+snapshot CRC ASSY=00000000/00000000 ARM=c0d000f1/00030000
+snapshot CRC object=00000005 begin=3efa27000 limit=3efa27fff
+snapshot CRC notifier status=00000000 count=0 overflow=0

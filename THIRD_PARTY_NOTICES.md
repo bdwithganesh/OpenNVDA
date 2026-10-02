@@ -26,7 +26,7 @@ These are NVIDIA's published video engine interface headers (open-gpu-doc / open
 
 | Path | Licence |
 |---|---|
-| `drivers/nvk-macos/mesa-26.0.8-macos-nvk.patch` | Applies to Mesa 26.0.8 (NVK, the Vulkan runtime, WSI). Mesa is MIT. The touched files keep their Mesa copyright headers (Collabora Ltd., Red Hat Inc., Intel Corporation and the other Mesa contributors). Our changes are under the same MIT terms. |
+| `drivers/nvk-macos/mesa-26.0.8-macos-nvk.patch`, `tools/nakc/mesa-26.0.8-macos-nak.patch`, `tools/nakc/mesa-26.0.8-macos-nvk.patch` | Applies to Mesa 26.0.8 (NVK, the Vulkan runtime, WSI). Mesa is MIT. The touched files keep their Mesa copyright headers (Collabora Ltd., Red Hat Inc., Intel Corporation and the other Mesa contributors). Our changes are under the same MIT terms. |
 
 ## Read, not copied
 

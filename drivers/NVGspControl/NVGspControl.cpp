@@ -1,11 +1,9 @@
 #include "NVGspControl.hpp"
 #include "../NVGspCore/NVGspExec.hpp"
 #include "../NVGspCore/NVGspKernelApi.hpp"
-#if __has_include("../NVGspCore/NVGspBooterUnloadBlob.hpp")
 #include "../NVGspCore/NVGspBooterUnloadBlob.hpp"
-#else
-#error "NVIDIA's booter_unload image is not in the repo, make it first: python3 tools/gen_booter_unload.py <linux-firmware>/nvidia/ad103/gsp/booter_unload-570.144.bin"
-#endif
+#include "../NVGspCore/NVGspGrContext.hpp"
+#include "../NVGspCore/NVGspDisplayLut.hpp"
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOPlatformExpert.h>
@@ -17,10 +15,10 @@
 OSDefineMetaClassAndStructors(NVGspControl, IOService)
 
 namespace {
-// All BAR0 accesses reuse one mapping (the kext's persistent doorbell
-// map, published in start()) instead of creating and tearing down a 16
-// MiB device mapping for every PRAMIN access or doorbell. Callers still
-// do map->release(), sharedBar0Map() hands out a retained reference.
+// 0.117.0 (B7): BAR0 accesses reuse one mapping (the kext's persistent
+// doorbell map, published in start()) instead of creating and tearing
+// down a 16 MiB device mapping per PRAMIN access / doorbell. Callers keep
+// their map->release(): sharedBar0Map() hands out a retained reference.
 IOMemoryMap *gBar0Map = nullptr;
 IOPCIDevice *gBar0Pci = nullptr;
 
@@ -122,8 +120,7 @@ bool praminPteAccess(IOPCIDevice *pci, UInt64 physicalAddress,
     if (ok && write) {
         __builtin_memcpy(&lo, pte, 4);
         __builtin_memcpy(&hi, reinterpret_cast<const UInt8 *>(pte) + 4, 4);
-        // put in the address/kind before VALID; when removing, clear VALID
-        // first
+        // Install address/kind before VALID. During removal clear VALID first.
         ok = validLast ? (bar0.write(dataOffset + 4, hi) &&
                           bar0.write(dataOffset, lo))
                        : (bar0.write(dataOffset, lo) &&
@@ -179,11 +176,11 @@ bool praminZeroRange(IOPCIDevice *pci, UInt64 physicalAddress, UInt64 bytes) {
     return ok && restoreOk;
 }
 
-// Writes `count` consecutive 4 KiB PTEs (template | page<<8, page =
-// firstPage + i) into one page table through a single PRAMIN window.
-// firstPage == ~0 writes zeros (removal, with VALID cleared first as
-// the low word). The table must not cross a 64 KiB window. The last PTE
-// gets verified by reading it back.
+// 0.38.0: write `count` consecutive 4 KiB PTEs (template | page<<8,
+// page = firstPage + i) into one page table through a single PRAMIN
+// window; firstPage == ~0 writes zero (removal, VALID cleared first as
+// the low word). The table must not cross a 64 KiB window. Verifies
+// the last PTE by readback.
 bool praminWritePteRun(IOPCIDevice *pci, UInt64 pteAddress, UInt64 firstPage,
                        UInt32 count, UInt64 templateBits,
                        UInt32 stride = 8, UInt64 pageStep = 1) {
@@ -216,7 +213,7 @@ bool praminWritePteRun(IOPCIDevice *pci, UInt64 pteAddress, UInt64 firstPage,
         ok = firstPage == ~0ULL
             ? (bar0.write(at, lo) && bar0.write(at + 4, hi))
             : (bar0.write(at + 4, hi) && bar0.write(at, lo));
-        // dual PDE: the upper 8 bytes (small-PT half) stay zero
+        // Dual PDE: upper 8 bytes (small-PT half) stay zero.
         if (ok && stride == 16)
             ok = bar0.write(at + 8, 0) && bar0.write(at + 12, 0);
     }
@@ -230,11 +227,10 @@ bool praminWritePteRun(IOPCIDevice *pci, UInt64 pteAddress, UInt64 firstPage,
     return ok && restoreOk;
 }
 
-// Helpers for a single PRAMIN window (the range has to stay inside one
-// 64 KiB window). praminHashRange is FNV-1a over the bytes, same as the
-// BAR1 GOP hash. praminWritePattern writes the head dwords, then
-// fillCount copies of fill, then the tail dwords, all contiguous from
-// physicalAddress.
+// 0.43.0: single-PRAMIN-window helpers (range must stay inside one
+// 64 KiB window). praminHashRange: FNV-1a over bytes, same algorithm as
+// the BAR1 GOP hash. praminWritePattern: head dwords, then fillCount
+// copies of fill, then tail dwords, contiguous from physicalAddress.
 bool praminHashRange(IOPCIDevice *pci, UInt64 physicalAddress, UInt32 bytes,
                      UInt64 *hashOut) {
     if (!pci || !hashOut || !bytes || (physicalAddress & 3) || (bytes & 3) ||
@@ -309,28 +305,25 @@ bool praminWritePattern(IOPCIDevice *pci, UInt64 physicalAddress,
     return ok && restoreOk;
 }
 
-// BAR1 remap for the GOP surface. After GSP boots, BAR1 runs in virtual
-// mode (NV_PBUS_BAR1_BLOCK 0x1704: PTR 27:0, TARGET 29:28, MODE 31)
-// with nothing mapped at BAR1 offset 0, so CPU/WindowServer writes stop
-// reaching VRAM.
-// We walk instance -> PDB (RAMIN +0x200) -> PD3[0] -> PD2[0] -> PD1[0]
-// -> PD0 (ver2: PDE aperture 2:1, addr 32:8 <<12). If PD0[0..17] are
-// all empty, install 18 x 2 MiB PTEs (BAR1 VA [0,36 MiB) -> VRAM [0,36
-// MiB)) and do a full TLB invalidate through
-// NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE (0xBB30B0:
-// ALL_VA|ALL_PDB|TRIGGER, poll till TRIGGER clears), the way
-// kgmmuCommitTlbInvalidate_TU102 does it.
+// 0.45.0: BAR1 remap for the GOP surface. After GSP boot BAR1 runs in
+// virtual mode (NV_PBUS_BAR1_BLOCK 0x1704: PTR 27:0, TARGET 29:28,
+// MODE 31) with nothing mapped at BAR1 offset 0, so CPU/WindowServer
+// writes no longer reach VRAM. Walk instance -> PDB (RAMIN +0x200) ->
+// PD3[0] -> PD2[0] -> PD1[0] -> PD0 (ver2: PDE aperture 2:1, addr 32:8
+// <<12). If PD0[0..17] are all empty, install 18 x 2 MiB PTEs (BAR1 VA
+// [0,36 MiB) -> VRAM [0,36 MiB)), then a full TLB invalidate through
+// NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE (0xBB30B0: ALL_VA|ALL_PDB|
+// TRIGGER, poll TRIGGER clear) as kgmmuCommitTlbInvalidate_TU102 does.
 struct Bar1Remap {
     UInt32 block, pdbLo, pdbHi, invalidateFinal;
     UInt64 inst, pdb, pd3e, pd2e, pd1e, pd0Table, pd0First, pd0Last;
-    UInt32 usedSlots, stage;  // stage = how far the walk got
+    UInt32 usedSlots, stage;  // stage: how far the walk got
     bool installed, invalidated;
-    // PD0[0] is a big (64K) page table that GSP owns
+    // 0.47.0: PD0[0] big (64K) page table owned by GSP.
     UInt64 bigPt, bigValidMask, bigFirstValid;
     UInt32 bigFilled, hugeFilled;
-    // the BAR1 bind that's actually live is
-    // NV_VIRTUAL_FUNCTION_PRIV_BAR1_BLOCK (VF 0xF40 -> BAR0 0xB80F40),
-    // not the legacy 0x1704
+    // 0.49.0: the live BAR1 bind is NV_VIRTUAL_FUNCTION_PRIV_BAR1_BLOCK
+    // (VF 0xF40 -> BAR0 0xB80F40), not legacy 0x1704.
     UInt32 vfBlockBefore, vfBlockAfter, bindStatus;
     bool physicalBound;
 };
@@ -353,7 +346,7 @@ bool bar1RemapGop(IOPCIDevice *pci, Bar1Remap *out) {
     }
     Bar0Io bar0{map};
     bool ok = bar0.read(0x1704, &out->block);
-    // MODE virtual, TARGET vidmem
+    // MODE virtual, TARGET vidmem.
     ok = ok && (out->block >> 31) == 1 && ((out->block >> 28) & 3) == 0;
     out->inst = UInt64(out->block & 0x0fffffffU) << 12;
     UInt64 pdbWord = 0;
@@ -384,10 +377,10 @@ bool bar1RemapGop(IOPCIDevice *pci, Bar1Remap *out) {
         if (lo || hi) ++out->usedSlots;
     }
     if (ok) out->stage = 5;
-    // Editing those PTEs showed BAR1 traffic never reaches the tables we
-    // walked (reads come back 0xBAD0ACxx). In the GSP-client split the
-    // CPU-RM (us) owns BAR1, so we bind BAR1 back to PHYSICAL mode exactly
-    // like kbusBar1InstBlkBind_TU102 does for bIsModePhysical: write
+    // 0.49.0: 0.47/0.48 PTE edits proved BAR1 traffic never reaches the
+    // walked tables (reads = 0xBAD0ACxx). CPU-RM (us) owns BAR1 in the
+    // GSP-client split, so bind BAR1 back to PHYSICAL mode exactly as
+    // kbusBar1InstBlkBind_TU102 does for bIsModePhysical: write
     // NV_VIRTUAL_FUNCTION_PRIV_BAR1_BLOCK = MODE_PHYSICAL|TARGET_VID|PTR 0,
     // then poll BIND_STATUS (0xB80F50) BAR1_PENDING 0:0 / OUTSTANDING 1:1.
     bool vfOk = bar0.read(0x00B80F40, &out->vfBlockBefore);
@@ -404,14 +397,19 @@ bool bar1RemapGop(IOPCIDevice *pci, Bar1Remap *out) {
             out->stage = 7;
         }
     }
+    // 0.161.1: already physical counts as bound. Since the 0.146.6 early
+    // BAR1 pass, the second finishBar1() found the bind it had made itself
+    // and reported "not installed", so bar1-live went No and CPU-visible
+    // VRAM allocations were refused. bar1-live still needs the 2 MiB hash.
+    if (vfOk && (out->vfBlockBefore >> 31) == 0) out->physicalBound = true;
     bar0.read(0x00B80F40, &out->vfBlockAfter);
     out->installed = out->physicalBound;
     map->release();
     return ok;
 }
 
-// writes `count` dwords at physicalAddress, in pieces per 64 KiB PRAMIN
-// window
+// 0.57.0: write `count` dwords at physicalAddress, chunked per 64 KiB
+// PRAMIN window.
 bool praminWriteWords(IOPCIDevice *pci, UInt64 physicalAddress,
                       const UInt32 *words, UInt32 count) {
     while (count) {
@@ -427,10 +425,10 @@ bool praminWriteWords(IOPCIDevice *pci, UInt64 physicalAddress,
     return true;
 }
 
-// Read-only GR hang diagnostics under one BAR0 map: VF MMU fault
-// ADDR_LO/HI, INST_LO/HI, INFO, STATUS (0xBB3080..94, tu102/ga102
+// 0.40.0: read-only GR hang diagnostics under one BAR0 map: VF MMU
+// fault ADDR_LO/HI, INST_LO/HI, INFO, STATUS (0xBB3080..94, tu102/ga102
 // dev_vm.h at FULL_PHYS_OFFSET 0xB80000), PGRAPH status/intr/exception
-// (0x400700/0x400100/0x400108), FECS mailbox0/1, current/new ctx and
+// (0x400700/0x400100/0x400108) and FECS mailbox0/1, current/new ctx,
 // 0x409c18 (nouveau gf100 offsets).
 constexpr UInt32 kGrDiagCount = 14;
 bool readGrDiag(IOPCIDevice *pci, UInt32 *out) {
@@ -572,29 +570,27 @@ void NVGspControl::gspDoorbell(void *ctx) {
     *reg = 0;
 }
 
-// Resizable BAR, done by the kext itself. macOS IOPCIFamily only sizes BARs up
-// to 1 GiB, and with BIOS ReBAR on it drops BAR1 completely (seen at 16/8/2
-// GiB). So macOS keeps its 256 MiB BAR1 (OpenCore ResizeAppleGpuBars 8) and,
-// before anything maps BAR1, this code does what Linux pci_resize_resource
-// does: GPU decode off, set the BAR1 size in the ReBAR control (ext cap 0x15),
-// place BAR1 above DRAM, set the root port's (GPP0) 64-bit prefetch window
-// around BAR1 + BAR3, decode on.
-// Watch out for DRAM: it ends at TOM2 = 0x18_9000_0000 (96 GiB plus the 2.25
-// GiB PCI hole hoisted above 4 GiB). An earlier try put BAR1 at
-// 0x18_0000_0000, so its first 2.25 GiB sat on top of RAM, the
-// console/NVDisplay/GSP got RAM as "VRAM" and the platform reset in a loop.
-// Now:
+// 0.130.0 / 0.131.0: Resizable BAR done by the kext. macOS IOPCIFamily only
+// sizes BARs up to 1 GiB: with BIOS ReBAR on it drops BAR1 entirely (live 26
+// Sep, at 16/8/2 GiB). So macOS keeps its 256 MiB BAR1 (OpenCore
+// ResizeAppleGpuBars 8) and, before anything maps BAR1, this code does what
+// Linux pci_resize_resource does: GPU decode off, ReBAR control (ext cap 0x15)
+// BAR1 size, BAR1 placed above DRAM, the root port's (GPP0) 64-bit prefetch
+// window around BAR1 + BAR3, decode on.
+// 0.131.0 after the 0.130.3 boot loop: BAR1 had been put at 0x18_0000_0000,
+// but DRAM ends at TOM2 = 0x18_9000_0000 (96 GiB + the 2.25 GiB PCI hole
+// hoisted above 4 GiB), so its first 2.25 GiB overlapped RAM (the offset-0
+// mismatch was RAM being read) and the console/NVDisplay/GSP got RAM as
+// "VRAM" -> platform reset. Now:
 //  - BAR1 base = align_up(max(TOM2 (AMD MSR C001_001D when SYSCFG.MtrrTom2En),
-// end of macOS's own BAR1/BAR3), size); BAR3 stays wherever macOS put it.
-//  - verify: new BAR1 + 0 reads the same as old BAR1 + 0, and the far end
-// decodes.
+//    macOS's own BAR1/BAR3 ends), size); BAR3 stays where macOS put it.
+//  - verify: new BAR1 + 0 reads what old BAR1 + 0 read, far end decoded.
 //  - boot guard: NVRAM nvgsp-rebar-boot is set (flash forced) before the
-// change and cleared 90 s after a good GSP chain; if it's still set on the
-// next start, the last resize never came up, so skip.
-//  - the kernel console is switched off across the move and pointed at the new
-// place after (kPEBaseAddressChange); saveDeviceState() so IOPCIFamily
-// restores our setup.
-// NVRAM nvgsp-rebar = BAR1 size in GiB (e.g. "16"); missing or 0 = off.
+//    change and cleared 90 s after a good GSP chain; if it is still set at
+//    the next start, the previous resize never came up -> skip.
+//  - the kernel console is disabled across the move and re-pointed after
+//    (kPEBaseAddressChange); saveDeviceState() so IOPCIFamily restores ours.
+// NVRAM nvgsp-rebar = BAR1 size in GiB (e.g. "16"); absent/0 = off.
 static IORegistryEntry *nvramOptions() {
     return IORegistryEntry::fromPath("/options", gIODTPlane);
 }
@@ -615,8 +611,8 @@ static UInt32 nvramU32(const char *key) {
     return v;
 }
 
-// value nullptr = delete; the write goes to flash right away (a reset later
-// in this boot still has to see it)
+// value nullptr = delete; the write is flushed to flash right away (a reset
+// later in this boot must still see it)
 static void nvramSetSync(const char *key, const char *value) {
     IORegistryEntry *options = nvramOptions();
     if (!options) return;
@@ -631,7 +627,7 @@ static void nvramSetSync(const char *key, const char *value) {
     options->release();
 }
 
-// AMD TOM2 (top of DRAM above 4 GiB), 0 if not AMD or not enabled
+// AMD TOM2 (top of DRAM above 4 GiB), 0 if not AMD / not enabled
 static UInt64 amdTom2() {
     UInt32 a, b, c, d;
     __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0));
@@ -653,8 +649,8 @@ IODeviceMemory *NVGspControl::bar3Dev() const {
     return bar3Mem_ ? bar3Mem_ : pci_ ? pci_->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress3) : nullptr;
 }
 
-// only map the first `bytes` of BAR1, mapping the whole 16 GiB BAR1 in the
-// kernel for every debug hash would cost gigabytes of page tables
+// Map only the first `bytes` of BAR1: a whole 16 GiB BAR1 kernel mapping per
+// debug hash would cost gigabytes of page tables.
 IOMemoryMap *NVGspControl::mapBar1Head(IOByteCount bytes) const {
     IODeviceMemory *b = bar1Dev();
     if (!b || !bytes) return nullptr;
@@ -662,7 +658,7 @@ IOMemoryMap *NVGspControl::mapBar1Head(IOByteCount bytes) const {
     return b->createMappingInTask(kernel_task, 0, kIOMapAnywhere, 0, bytes);
 }
 
-// a ring submit used to cost ~13 us, nearly all of it PRAMIN
+// 0.151.0: a ring submit used to cost ~13 us, nearly all of it PRAMIN
 // window traffic: each access reads 0x1700, moves the window, reads it back,
 // writes, reads the data back and restores the window, and every read is a
 // PCIe round trip. BAR1 runs in physical mode (offset = VRAM address, ReBAR
@@ -717,8 +713,7 @@ bool NVGspControl::rebarProgram(IOPCIDevice *bridge, UInt32 ctrl, UInt64 bar1, U
     pci_->configWrite32(0x1c, static_cast<UInt32>(bar3) | lo3);
     pci_->configWrite32(0x20, static_cast<UInt32>(bar3 >> 32));
     // bridge: close the window first (base > limit), then set the upper
-    // halves, then open it, so it never covers some random range in
-    // between
+    // halves, then open it, so it never spans a stray range in between
     const UInt32 w = bridge->configRead32(0x24);
     bridge->configWrite32(0x24, 0x0000fff0 | (w & 0x000f000f));
     bridge->configWrite32(0x28, static_cast<UInt32>(winBase >> 32));
@@ -736,7 +731,7 @@ static UInt64 fnvHash(const volatile UInt8 *p, unsigned n) {
     return h;
 }
 
-// FNV of 4 KiB at `off` of `mem`, ~0 if it can't be mapped
+// FNV of 4 KiB at `off` of `mem`, ~0 if it cannot be mapped
 static UInt64 hashDevPage(IODeviceMemory *mem, UInt64 off) {
     IOMemoryMap *mp = mem->createMappingInTask(kernel_task, 0, kIOMapAnywhere, off, 4096);
     if (!mp) return ~0ULL;
@@ -759,14 +754,14 @@ bool NVGspControl::rebarResize() {
     UInt32 cap = 0, entry = 8, capReg = 0, n = 0;
     UInt64 size = 0;
     if (!wantGiB) goto out;
-    stage = 11;                                   // guard: the last resize never came up
+    stage = 11;                                   // guard: last resize never came up
     if (nvramU32("nvgsp-rebar-boot")) {
-        nvramSetSync("nvgsp-rebar-boot", nullptr);   // one skipped boot arms it again
+        nvramSetSync("nvgsp-rebar-boot", nullptr);   // one skipped boot re-arms it
         goto out;
     }
     stage = 2;
-    // walk it ourselves, IOPCIFamily's extendedFindPCICapability misses it on
-    // this GPU (the ReBAR ext cap sits at 0xbb0, 7th in the chain)
+    // own walk: IOPCIFamily's extendedFindPCICapability misses it on this GPU
+    // (live 0.130.0: ReBAR ext cap sits at 0xbb0, 7th in the chain)
     for (UInt32 off = 0x100, i = 0; off >= 0x100 && off < 0x1000 && i < 64; ++i) {
         const UInt32 h = pci_->configRead32(off);
         if (h == 0xffffffffU || h == 0) break;
@@ -812,11 +807,11 @@ bool NVGspControl::rebarResize() {
         const UInt64 tom2 = amdTom2();
         setProperty("NVGspControl-rebar-tom2", tom2, 64);
         setProperty("NVGspControl-rebar-old-window", oldWinBase, 64);
-        // Candidates: 1. what the firmware does with BIOS ReBAR on (Windows
-        // put BAR1 at 0xF8_0000_0000, 16 GiB, and BAR3 at 0xFC_0000_0000):
-        // top-down under the AMD reserved HT hole at 0xFD_0000_0000, with
-        // BAR3 right after BAR1. 2. just above DRAM/macOS's BARs, BAR3 left
-        // where macOS put it. Either way it has to clear TOM2.
+        // Candidates (0.131.0): 1. what the firmware does with BIOS ReBAR on
+        // (Windows AllocConfig 26 Sep: BAR1 0xF8_0000_0000 16 GiB, BAR3
+        // 0xFC_0000_0000): top-down under the AMD reserved HT hole at
+        // 0xFD_0000_0000, BAR3 right after BAR1. 2. just above DRAM/macOS's
+        // BARs, BAR3 left where macOS put it. Each must clear TOM2.
         UInt64 floor = oldBar1 + old1->getLength();
         if (oldBar3 + bar3Bytes > floor) floor = oldBar3 + bar3Bytes;
         if (tom2 > floor) floor = tom2;
@@ -829,14 +824,14 @@ bool NVGspControl::rebarResize() {
         UInt64 hOnes = 14695981039346656037ULL;
         for (unsigned i = 0; i < 4096; ++i) { hOnes ^= 0xff; hOnes *= 1099511628211ULL; }
         const UInt64 h0 = hashDevPage(old1, 0);
-        const UInt64 h3 = hashDevPage(old3, 0);   // BAR3 can legitimately read all-ones before GSP is up
+        const UInt64 h3 = hashDevPage(old3, 0);   // BAR3 may legitimately read all-ones pre-GSP
         stage = 7;
         if (h0 == ~0ULL || !tom2) goto out;
         setProperty("NVGspControl-rebar-hash-old0", h0, 64);
         setProperty("NVGspControl-rebar-hash-old3", h3, 64);
-        // guard goes on before we touch anything
+        // guard on before touching anything
         nvramSetSync("nvgsp-rebar-boot", "1");
-        // kernel console off during the move (it writes through the old BAR1)
+        // kernel console off across the move (it writes through the old BAR1)
         IOPlatformExpert *pl = getPlatform();
         PE_Video con;
         bzero(&con, sizeof(con));
@@ -851,8 +846,7 @@ bool NVGspControl::rebarResize() {
         stage = 8;
         for (int k = 0; k < 2 && !m1; ++k) {
             const UInt64 b1 = cand[k].bar1, b3 = cand[k].bar3;
-            // never below the top of DRAM, never overlapping BAR3, BAR3 32 MiB
-            // aligned
+            // never below DRAM top, never overlapping BAR3, BAR3 32 MiB aligned
             if (b1 < tom2 || b3 < tom2 || (b3 < b1 + size && b3 + bar3Bytes > b1) || (b3 & (bar3Bytes - 1)))
                 continue;
             const UInt64 wb = b3 < b1 ? b3 : b1;
@@ -881,10 +875,15 @@ bool NVGspControl::rebarResize() {
             goto out;
         }
         setProperty("NVGspControl-rebar-target", base1, 64);
-        // IOPCIFamily restores its saved config on power transitions, so save
-        // ours
+        // IOPCIFamily restores its saved config on power transitions: save ours.
+        // 0.161.0: saveDeviceState() is IOPCIFamily's On -> Doze step (config
+        // space goes to the shadow), so pair it with restoreDeviceState() to
+        // come back On. Left in Doze, Tahoe's IOPCIDevice::getResources() keeps
+        // saying "nub VGA is not powered" and the Aux KC NVDisplay never probes.
         pci_->saveDeviceState();
         bridge->saveDeviceState();
+        bridge->restoreDeviceState();
+        pci_->restoreDeviceState();
         if (conInBar1) {
             con.v_baseAddr = (base1 + (conPhys - oldBar1)) | (con.v_baseAddr & 3);
             pl->setConsoleInfo(&con, kPEBaseAddressChange);
@@ -924,19 +923,19 @@ bool NVGspControl::start(IOService *provider) {
     if (!pci_ || pci_->configRead16(kIOPCIConfigVendorID) != 0x10de ||
         pci_->configRead16(kIOPCIConfigDeviceID) != 0x2704)
         return false;
-    rebarOkCall_ = thread_call_allocate(&NVGspControl::rebarOkCallout, this);
-    rebarResize();   // before anything maps BAR1
-    // GSP command queue doorbell
+    rebarOkCall_ = thread_call_allocate(&NVGspControl::rebarOkCallout, this);   // 0.131.0
+    rebarResize();   // 0.130.0: before anything maps BAR1
+    // 0.100.5: GSP command-queue doorbell.
     doorbellMap_ = pci_->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
     if (doorbellMap_ && doorbellMap_->getLength() > 0x110c04)
         init_.setDoorbell(&NVGspControl::gspDoorbell, this);
-    if (doorbellMap_ && doorbellMap_->getLength() >= 0x01000000) {
+    if (doorbellMap_ && doorbellMap_->getLength() >= 0x01000000) {   // 0.117.0
         gBar0Pci = pci_;
         gBar0Map = doorbellMap_;
     }
-    // GPU identity for System Information / About This Mac (the framebuffer
-    // alone reports 33 MB, which is just the scanout surface): model string
-    // and total VRAM from the usable-FB register (MiB).
+    // 0.100.3: GPU identity for System Information / About This Mac (the
+    // framebuffer alone reports 33 MB, the scan-out surface): model string and
+    // total VRAM from the usable-FB register (MiB).
     {
         static const char kModel[] = "NVIDIA GeForce RTX 4080";
         OSData *model = OSData::withBytes(kModel, sizeof(kModel));
@@ -968,15 +967,15 @@ bool NVGspControl::start(IOService *provider) {
         setProperty("NVGspControl-bar1-ring", bar1Direct_);
     }
     setProperty("NVGspControl-ready", true);
-    // S3 sleep/wake interest (quiesce + daemon-driven resume)
+    // 0.96.0: S3 sleep/wake interest (quiesce + daemon-driven resume).
     sleepWakeNotifier_ = registerSleepWakeInterest(&NVGspControl::sleepWakeHandler, this);
     setProperty("NVGspControl-sleepwake-interest", sleepWakeNotifier_ != nullptr);
-    // callout for when the slow path drives itself
+    // 0.99.0: slow-path self-drive callout.
     resumeCall_ = thread_call_allocate(&NVGspControl::resumeDriveCallout, this);
-    // RC -> automatic GPU reset (NVRAM nvgsp-autoreset=1)
+    // 0.115.0: RC -> automatic GPU reset (NVRAM nvgsp-autoreset=1).
     autoResetCall_ = thread_call_allocate(&NVGspControl::autoResetCallout, this);
-    boostCall_ = thread_call_allocate(&NVGspControl::boostCallout, this);
-    // user-client ABI level for NVK (nvkmd_macos): 114 = arena
+    boostCall_ = thread_call_allocate(&NVGspControl::boostCallout, this);    // 0.135.0
+    // 0.114.0: user-client ABI level for NVK (nvkmd_macos): 114 = arena
     // binds at 64 KiB granularity, VRAM suballocation safe.
     setProperty("NVGspControl-abi", kUserAbi, 32);
     setProperty("NVGspControl-exec-segment-flags", nvgsp::kExecSupportedFlags, 32);
@@ -1014,7 +1013,7 @@ void NVGspControl::stop(IOService *provider) {
         dispSave_ = nullptr;
     }
     init_.setDoorbell(nullptr, nullptr);
-    if (gBar0Map == doorbellMap_) {   // no new users of the cache
+    if (gBar0Map == doorbellMap_) {   // 0.117.0: no new users of the cache
         gBar0Map = nullptr;
         gBar0Pci = nullptr;
     }
@@ -1053,26 +1052,27 @@ void NVGspControl::stop(IOService *provider) {
     pd0Address_ = 0;
     ctxHugeInstalled_ = 0;
     gr3dOk_ = false;
-    lastGrOwner_ = nullptr;
+    lastGrOwner_ = nullptr;                  // 0.145.0
     rcEvents_ = mmuFaultEvents_ = otherEvents_ = 0;
     bar1Finished_ = false;
-    bar1Live_ = false;
+    bar1Live_ = false;                       // 0.123.0
     grPersistent_ = false;
     subPbOff_ = subSeq_ = 0;
     scratchOffset_ = 0;
     scratchHuge_ = 0;
     pdbAddress_ = 0;
     vramVaTables_ = 0;
-    arenaDropAllLocked(false);               // stop frees the contexts
+    arenaDropAllLocked(false);               // 0.111.0: stop frees the contexts
     scratchTry_ = 0;
     scratchRetry_ = false;
     ceChunk_ = 0;
     ceMapped_ = ceStarted_ = cePersistent_ = false;
     ceToken_ = cePbOff_ = ceSeq_ = 0;
-    ceOutstanding_ = 0;
+    ceOutstanding_ = 0;                      // 0.112.0
     ceUserdOffset_ = ceInstOffset_ = ceMthdOffset_ = 0;
-    videoDropLocked();
-    freeSavedVramLocked();
+    videoDropLocked();                       // 0.116.0
+    clientChannelsDropLocked();              // 0.178.0
+    freeSavedVramLocked();                   // 0.127.0
     thawLocked();
     wndOwnsScreen_ = false;
     fbHugeInstalled_ = 0;
@@ -1127,8 +1127,8 @@ IOReturn NVGspControl::executeBoot() {
     const bool identityOk = io.read(kBoot0, &boot0) &&
         io.read(kGspUcode9Fuse, &gspFuse);
     const nvgsp::WprMeta *meta = gsp_.metadata();
-    // fresh WPR metadata on every boot (the S3 re-boot saw the first boot's
-    // verified/bootCount and the GSP RISC-V halted, mbox0 0x80000000)
+    // 0.99.1: fresh WPR metadata for every boot (S3 re-boot saw the first
+    // boot's verified/bootCount and the GSP RISC-V halted, mbox0 0x80000000).
     setProperty("NVGspControl-exec-meta-rewritten", gsp_.rewriteMetadata());
     setProperty("NVGspControl-exec-vbios-ok", vbiosOk);
     if (!vbiosOk || !identityOk || !meta) {
@@ -1140,16 +1140,15 @@ IOReturn NVGspControl::executeBoot() {
     if (!busMasterBefore) pci_->setBusMasterEnable(true);
     const bool busMaster = (pci_->configRead16(kIOPCIConfigCommand) & 4) != 0;
 
-    // Get the last prerequisite ready before the first register write. If
-    // this allocation fails, the running GOP state is left untouched.
+    // Stage the final prerequisite before the first register write. If this
+    // allocation fails the running GOP state remains untouched.
     nvgsp::FwsecStaging fwsec;
     const bool fwsecStage = busMaster &&
         fwsec.stage(vbios.fwsec, gspFuse & 0xff, meta->frtsOffset,
                     nullptr, vbios.dmaImageSize);
 
-    // NVIDIA's normal boot: reset GSP into Falcon, run the board
-    // FWSEC/FRTS, reset GSP into RISC-V, program the LibOS args, then run
-    // SEC2 Booter Load.
+    // NVIDIA normal boot: reset GSP into Falcon, execute board FWSEC/FRTS,
+    // reset GSP into RISC-V, program LibOS args, then run SEC2 Booter Load.
     const bool gspFalconReset = fwsecStage &&
         resetPulse(io, 0x001103c0, 0x001100f4) &&
         io.write(0x00111668, 0) &&
@@ -1227,8 +1226,8 @@ IOReturn NVGspControl::executeBoot() {
     setProperty("NVGspControl-exec-sec2-mailbox0", booterResult.mailbox0, 32);
     setProperty("NVGspControl-exec-riscv-cpuctl", riscvCpuCtl, 32);
     setProperty("NVGspControl-executed", executed_);
-    // mid-point GOP hash (end of executeBoot, before any --status poll),
-    // to separate FWSEC/SEC2/GSP boot problems from the phase machine
+    // 0.9.4: mid-point GOP hash (end of executeBoot, before any --status
+    // poll). Isolates FWSEC/SEC2/GSP boot vs the phase machine.
     gopSurfaceHashMid_ = 0;
     gopSurfaceHashMidOk_ = false;
     IODeviceMemory *bar1Mid =
@@ -1249,10 +1248,10 @@ IOReturn NVGspControl::executeBoot() {
         }
         if (bar1Map) bar1Map->release();
     }
-    // Identity proof while BAR1 is still physical: VRAM[0,4K) read via
-    // PRAMIN has to hash the same as BAR1+0 read at the same moment.
-    // This doesn't depend on content (a content check fails as soon as a
-    // logged-in WindowServer redraws the surface).
+    // 0.46.0: identity proof while BAR1 is still physical: VRAM[0,4K)
+    // via PRAMIN must hash equal to BAR1+0 read at the same moment.
+    // Content-independent (0.45.0's content gate failed once a logged-in
+    // WindowServer had redrawn the surface).
     UInt64 vramMid = 0;
     gopAtVram0_ = gopSurfaceHashMidOk_ &&
         praminHashRange(pci_, 0, 4096, &vramMid) &&
@@ -1316,7 +1315,7 @@ bool NVGspControl::hashBar1Range(UInt64 offset, unsigned len, UInt64 *hash) {
 }
 
 namespace {
-// decimal append without libc (safe in the kext)
+// 0.9.5: decimal append without libc (kext-safe).
 void appendDec(char *dst, size_t size, size_t *pos, UInt32 v) {
     char tmp[10];
     unsigned n = 0;
@@ -1332,7 +1331,7 @@ void appendStr(char *dst, size_t size, size_t *pos, const char *s) {
 } // namespace
 
 IOReturn NVGspControl::setExperimentFlags(UInt32 flags) {
-    // only before --boot, the chain reads the flags while it runs
+    // Only before --boot: the chain reads the flags while it runs.
     if (executed_) return kIOReturnNotPermitted;
     experimentFlags_ = flags;
     if (flags & 1) drawTest_ = true;
@@ -1345,7 +1344,7 @@ void NVGspControl::finishBar1() {
     if (bar1Finished_ || !pci_) return;
     bar1Finished_ = true;
     markBoot("bar1");
-    // BAR1 remap (persists past teardown on purpose),
+    // 0.45.0: BAR1 remap (persists past teardown on purpose),
     // then a CPU-side BAR1+0 hash vs the pre-GSP GOP hash.
     Bar1Remap b1{};
     const bool walked = bar1RemapGop(pci_, &b1);
@@ -1384,8 +1383,8 @@ void NVGspControl::finishBar1() {
     bool bar1HashOk = false;
     IODeviceMemory *bar1 = bar1Dev();
     IOMemoryMap *bar1Map = bar1 ? mapBar1Head(0x201000) : nullptr;
-    // identity check at BAR1 +2 MiB (our huge PTE range) against PRAMIN
-    // VRAM at 2 MiB
+    // 0.47.0: identity check at BAR1 +2 MiB (our huge PTE
+    // range) against PRAMIN VRAM @2 MiB.
     if (bar1Map && bar1Map->getLength() >= 0x201000) {
         const volatile UInt8 *bytes =
             reinterpret_cast<const volatile UInt8 *>(
@@ -1403,8 +1402,9 @@ void NVGspControl::finishBar1() {
     UInt64 vram2m = 0;
     const bool vram2mOk = praminHashRange(pci_, 0x200000, 4096,
                                           &vram2m);
-    // raw evidence: RAMIN 0x200..0x20f (PDB, ADR_LIMIT), BAR1 and
-    // PRAMIN words at 0 and 2 MiB, PD0[1] readback
+    // 0.48.0: raw evidence — RAMIN 0x200..0x20f (PDB,
+    // ADR_LIMIT), BAR1 and PRAMIN words at 0 and 2 MiB, PD0[1]
+    // readback.
     {
         UInt64 raw[10]{};
         PraminPteResult q{};
@@ -1432,9 +1432,8 @@ void NVGspControl::finishBar1() {
     }
     setProperty("NVGspControl-bar1-hash-2m", bar1Hash, 64);
     setProperty("NVGspControl-bar1-vram-hash-2m", vram2m, 64);
-    // resized BAR1 confirmed working after GSP boot, so clear the boot
-    // guard 90 s later (a crash before that means the next boot skips the
-    // resize)
+    // 0.131.0: resized BAR1 proven after GSP boot -> clear the boot guard
+    // 90 s later (a crash before that skips the resize on the next boot)
     if (rebar_.active && !rebarOkArmed_ && rebarOkCall_ && bar1HashOk && vram2mOk &&
         b1.installed && bar1Hash == vram2m) {
         UInt64 deadline = 0;
@@ -1445,8 +1444,8 @@ void NVGspControl::finishBar1() {
     setProperty("NVGspControl-bar1-live",
                 bar1HashOk && vram2mOk && b1.installed &&
                 bar1Hash == vram2m);
-    // remember the identity-mapped BAR1 for CPU-visible VRAM (this runs
-    // inside pollStatusLocked, lock_ is already held)
+    // 0.123.0: remember the identity-mapped BAR1 for CPU-visible VRAM.
+    // (Runs inside pollStatusLocked: lock_ is already held.)
     {
         IODeviceMemory *b = bar1Dev();
         bar1Live_ = bar1HashOk && vram2mOk && b1.installed && bar1Hash == vram2m;
@@ -1456,9 +1455,9 @@ void NVGspControl::finishBar1() {
     }
 }
 
-// end of the CPU-visible part of the VRAM heap ([1 GiB, end)): the heap end
-// capped by the BAR1 size (BAR1 is in physical mode, so offset = VRAM phys).
-// 0 when BAR1 isn't live or doesn't go past 1 GiB (256 MiB BAR1).
+// 0.123.0: end of the CPU-visible part of the VRAM heap ([1 GiB, end)): the
+// heap end capped by the BAR1 size (BAR1 physical mode: offset = VRAM phys).
+// 0 when BAR1 is not live or does not reach past 1 GiB (256 MiB BAR1).
 UInt64 NVGspControl::vramCpuWindowEnd() const {
     if (!bar1Live_ || !fbFreeLimit_) return 0;
     const UInt64 heapEnd = ((fbFreeLimit_ + 1) & ~0x1fffffULL) - (64ULL << 20);
@@ -1466,11 +1465,10 @@ UInt64 NVGspControl::vramCpuWindowEnd() const {
     return end > 0x40000000ULL ? end : 0;
 }
 
-// MSI interrupt path. Vector v lives in LEAF[v/32] bit v%32 of the VF CPU
-// interrupt tree (BAR0 0xB80000 + 0x1000); its subtree is leaf/2 and gets
-// enabled in TOP_EN_SET[0]. We use several vectors
-// (kVecGsp/kVecDisp/kVecGrNs) from INTR_GET_KERNEL_TABLE, and the MSI EOI
-// goes through XVE_CYA_2 (AD103).
+// 0.70.0: MSI interrupt path. Vector v lives in LEAF[v/32] bit v%32 of the
+// VF CPU interrupt tree (BAR0 0xB80000 + 0x1000); its subtree is leaf/2 and
+// is enabled in TOP_EN_SET[0]. 0.74.0: several vectors (kVecGsp/kVecDisp/
+// kVecGrNs) from INTR_GET_KERNEL_TABLE; MSI EOI via XVE_CYA_2 (AD103).
 bool NVGspControl::armInterrupts(const UInt32 *vectors) {
     if (intrArmed_ || !pci_) return false;
     int msiIndex = -1;
@@ -1503,9 +1501,8 @@ bool NVGspControl::armInterrupts(const UInt32 *vectors) {
     setProperty("NVGspControl-intr-vectors", vec_, sizeof(vec_));
     intrArmed_ = true;
     irq_->enable();
-    // display: enable head-0 LAST_DATA (vblank) at the FE
-    // (kheadReadPendingVblank_v03_00 checks FE_RM_INTR_STAT_HEAD_TIMING
-    // LAST_DATA)
+    // Display: enable head-0 LAST_DATA (vblank) at the FE (kheadReadPending
+    // Vblank_v03_00 tests FE_RM_INTR_STAT_HEAD_TIMING LAST_DATA).
     if (vec_[kVecDisp] != ~0U) {
         UInt32 en = 0;
         bar0.read(0x611D80, &en);
@@ -1590,14 +1587,13 @@ void NVGspControl::serviceInterrupt() {
                 bar0.write(nvgsp::falcon::kBase + 0x3e8, 1);  // INTR_RETRIGGER(0)
                 setProperty("NVGspControl-intr-last-irqstat", irqstat, 32);
             } else if (k == kVecDisp) {
-                // Clear the leaf (W1C) FIRST, then drain the FE source in a
-                // loop. Doing FE first and then the leaf meant a vblank
-                // landing in between got latched in FE but its leaf edge
-                // was wiped, so vblank stalled until some unrelated MSI
-                // came along (gaps up to 4.58 s).
+                // 0.76.0: leaf W1C FIRST, then drain the FE source in a
+                // loop. 0.75.0 cleared FE then leaf, so a vblank landing in
+                // between was latched in FE but its leaf edge was wiped:
+                // vblank stalled until an unrelated MSI (max gap 4.58 s).
                 bar0.write(leafReg, bit);
-                // GSP-RM owns EN_HEAD_TIMING too; if our LAST_DATA enable
-                // got dropped, count it and put it back
+                // 0.78.0: GSP-RM owns EN_HEAD_TIMING too; if our LAST_DATA
+                // enable was dropped, count it and put it back.
                 {
                     UInt32 en = 0;
                     bar0.read(0x611D80, &en);
@@ -1620,7 +1616,7 @@ void NVGspControl::serviceInterrupt() {
                                 UInt64 ns = 0;
                                 absolutetime_to_nanoseconds(now - lastVblank_, &ns);
                                 if (!vblankMinNs_ || ns < vblankMinNs_) vblankMinNs_ = ns;
-                                // interval histogram: <12, <24, <40, <80, >=80 ms
+                                // 0.79.0: interval histogram <12, <24, <40, <80, >=80 ms
                                 vblankHist_[ns < 12000000 ? 0 : ns < 24000000 ? 1
                                             : ns < 40000000 ? 2 : ns < 80000000 ? 3 : 4]++;
                                 if (ns > vblankMaxNs_) vblankMaxNs_ = ns;
@@ -1628,10 +1624,9 @@ void NVGspControl::serviceInterrupt() {
                             }
                             lastVblank_ = now;
                             ++vblanks_;
-                            // clients get called after lock_ is dropped
-                            // (IOFramebuffer's VBL proc can block for
-                            // seconds, which made service times go up to
-                            // 8.8 s)
+                            // 0.80.0: clients are called after lock_ is
+                            // dropped (0.79.0: IOFramebuffer's VBL proc can
+                            // block for seconds -> service max 8.8 s).
                             vblankDeliver_ = true;
                             vblankDeliverAt_ = now;
                         }
@@ -1642,19 +1637,18 @@ void NVGspControl::serviceInterrupt() {
                         break;   // not ours to clear
                     }
                 }
-                // a display source we don't handle must not flood the
-                // machine with interrupts
+                // An unhandled display source must not storm the machine.
                 if (dispOther_ > 2000) disarmVector(kVecDisp);
             } else {
                 bar0.write(leafReg, bit);                     // GR/CE non-stall: pulse
-                // wake up submitRing / fence sleepers (a fence landed)
+                // 0.75.0: wake submitRing / fence sleepers (fence landed).
                 IOLockWakeup(lock_, &vecCount_[k], false);
-                stampDeliverMask_ |= k == kVecCeNs ? 2U : 1U;
+                stampDeliverMask_ |= k == kVecCeNs ? 2U : 1U;   // 0.152.0
+                if (k != kVecCeNs) stampAdvanceLocked();         // 0.178.12
             }
         }
         if (!any) ++intrSpurious_;
-        // every key published costs an OSNumber and vblank runs at 60
-        // Hz
+        // Publishing costs an OSNumber per key; vblank runs at 60 Hz.
         if ((intrCount_ & 63) == 1 || !any || intrCount_ < 8) {
             setProperty("NVGspControl-intr-count", intrCount_, 32);
             setProperty("NVGspControl-intr-gsp", vecCount_[kVecGsp], 32);
@@ -1710,7 +1704,7 @@ void NVGspControl::serviceInterrupt() {
     const StampFn sfn = stampFn_;
     void *const sref = stampRef_;
     ulk();
-    if (stampMask && sfn) sfn(sref, stampMask);
+    if (stampMask && sfn) sfn(sref, stampMask);        // 0.152.0
     deliverHotplug();
     if (deliver) {
         UInt64 t0 = 0, t1 = 0, ns = 0;
@@ -1726,7 +1720,7 @@ void NVGspControl::serviceInterrupt() {
 IOReturn NVGspControl::pingGsp(UInt64 *nsOut, UInt64 *viaIntrOut) {
     if (!lock_) return kIOReturnNotReady;
     lk(__LINE__);
-    if (postInitPhase_ != 33 || sleeping_ || pingOutstanding_) {
+    if (postInitPhase_ != 33 || sleeping_ || pingOutstanding_ || userRpcActive_ || userRpcOutstanding_) {
         ulk();
         return kIOReturnBusy;
     }
@@ -1745,8 +1739,8 @@ IOReturn NVGspControl::pingGsp(UInt64 *nsOut, UInt64 *viaIntrOut) {
         ulk();
         return kIOReturnIOError;
     }
-    // GSP-RM only raises SWGEN0 for async events; RPC replies are polled
-    // (nouveau r535_gsp_msgq_wait, NVIDIA _kgspRpcRecvPoll)
+    // 0.100.11: GSP-RM signals SWGEN0 only for asynchronous events; RPC
+    // replies are polled (nouveau r535_gsp_msgq_wait, NVIDIA _kgspRpcRecvPoll).
     for (UInt32 ms = 0; pingOutstanding_ && ms < 7000; ++ms) {
         pollStatusLocked();
         if (!pingOutstanding_) break;
@@ -1761,7 +1755,7 @@ IOReturn NVGspControl::pingGsp(UInt64 *nsOut, UInt64 *viaIntrOut) {
     setProperty("NVGspControl-ping-count", pings_, 32);
     setProperty("NVGspControl-ping-last-ns", ns, 64);
     setProperty("NVGspControl-ping-last-via-intr", done && pingViaIntr_);
-    // read-only snapshot of the interrupt path after each ping
+    // 0.73.0: interrupt-path snapshot after each ping (read-only).
     if (intrBar0_ && vec_[kVecGsp] < 256) {
         Bar0Io bar0{intrBar0_};
         UInt32 d[8]{};
@@ -1782,14 +1776,14 @@ IOReturn NVGspControl::pingGsp(UInt64 *nsOut, UInt64 *viaIntrOut) {
     return done ? kIOReturnSuccess : kIOReturnTimeout;
 }
 
-// In-kernel API for NVFramebuffer without a link dependency:
+// 0.75.0: in-kernel API for NVFramebuffer without a link dependency:
 // callPlatformFunction("nvgsp-vblank-register", false, fn, ref, 0, 0) where
 // fn is void (*)(void *ref, UInt32 count, UInt64 uptimeAbs), called from the
 // MSI workloop on every head-0 vblank. "nvgsp-vblank-unregister" removes it.
 IOReturn NVGspControl::callPlatformFunction(const OSSymbol *name, bool wait,
                                             void *p1, void *p2, void *p3,
                                             void *p4) {
-    // hardware cursor API for NVDisplay
+    // 0.84.0: hardware cursor API for NVDisplay.
     if (name && name->isEqualTo("nvgsp-cursor-image"))
         return cursorImage(static_cast<const UInt32 *>(p1),
                            static_cast<UInt32>(reinterpret_cast<uintptr_t>(p2)),
@@ -1801,7 +1795,7 @@ IOReturn NVGspControl::callPlatformFunction(const OSSymbol *name, bool wait,
         return cursorShow(p1 != nullptr);
     if (name && name->isEqualTo("nvgsp-dpms"))
         return dpSetPower(p1 != nullptr);
-    // p1 = SInt32 *milli-degrees C. GPU temperature from the
+    // 0.143.0 (M28): p1 = SInt32 *milli-degrees C. GPU temperature from the
     // thermal sensor at 0x020460 (nouveau gp100_temp_get): bits 16:3 are
     // degrees in 1/256 steps; bit 29 = valid, bit 30 = shadowed copy (what
     // this card reports, ~45 C idle, which matches the Linux reading).
@@ -1816,16 +1810,17 @@ IOReturn NVGspControl::callPlatformFunction(const OSSymbol *name, bool wait,
         setProperty("NVGspControl-gpu-temp-mC", static_cast<UInt32>(mC), 32);
         return kIOReturnSuccess;
     }
-    // p1 = const UInt32[10] timing (see setMode), p2 = UInt32 *code.
+    // 0.137.0: p1 = const UInt32[10] timing (see setMode), p2 = UInt32 *code.
     if (name && name->isEqualTo("nvgsp-set-mode")) {
         UInt32 code = ~0U;
         const IOReturn r = setMode(static_cast<const UInt32 *>(p1), &code);
         if (p2) *static_cast<UInt32 *>(p2) = code;
         return r;
     }
-    // for NVAccelerator, no link dependency:
+    // 0.152.0 (native N1) for NVAccelerator, no link dependency:
     // "nvgsp-stamp-region"   p1 = UInt64[3] out {VRAM/BAR1 offset, GPU VA, bytes}
     // "nvgsp-stamp-register" p1 = StampFn, p2 = ref (p1 null: unregister)
+    // "nvgsp-stamp-poll"     advance CPU-ordered stamps after real ring fences
     // "nvgsp-submit-stamp"   p1 = NVGspKernelSubmit* (see NVGspControl.hpp)
     if (name && name->isEqualTo("nvgsp-stamp-region")) {
         if (!p1) return kIOReturnBadArgument;
@@ -1852,6 +1847,13 @@ IOReturn NVGspControl::callPlatformFunction(const OSSymbol *name, bool wait,
         }
         return kIOReturnSuccess;
     }
+    if (name && name->isEqualTo("nvgsp-stamp-poll")) {
+        if (!lock_) return kIOReturnNotReady;
+        lk(__LINE__);
+        stampAdvanceLocked();
+        ulk();
+        return kIOReturnSuccess;
+    }
     if (name && name->isEqualTo("nvgsp-stamp-register")) {
         if (!lock_) return kIOReturnNotReady;
         lk(__LINE__);
@@ -1869,7 +1871,7 @@ IOReturn NVGspControl::callPlatformFunction(const OSSymbol *name, bool wait,
         return submitSegments(ks->owner, ks->engine, ks->va, ks->dwords, ks->flags, ks->n,
                               &ks->seqOut, ks->stampVa, ks->stampValue);
     }
-    // PGRAPH status for utilization sampling (Activity Monitor):
+    // 0.159.0: PGRAPH status for utilization sampling (Activity Monitor):
     // *p1 = NV_PGRAPH_STATUS (bit 0 busy). A plain BAR0 read, no lock.
     if (name && name->isEqualTo("nvgsp-gr-busy")) {
         UInt32 *out = static_cast<UInt32 *>(p1);
@@ -1879,12 +1881,55 @@ IOReturn NVGspControl::callPlatformFunction(const OSSymbol *name, bool wait,
         if (m) m->release();
         return ok ? kIOReturnSuccess : kIOReturnIOError;
     }
-    if (name && name->isEqualTo("nvgsp-flip-copy"))
+    // 0.167.0: "nvgsp-ring-progress" p1 = UInt32[4] out {GR submitted, GR
+    // done, CE submitted, CE done}. The display pipe notes the submitted
+    // values when WindowServer queues a flip and copies the surface only once
+    // the done values have passed them: the family queues a flip before the
+    // GPU has drawn it and we track no per-resource events.
+    if (name && name->isEqualTo("nvgsp-ring-progress")) {
+        UInt32 *out = static_cast<UInt32 *>(p1);
+        if (!out || !lock_) return kIOReturnBadArgument;
+        lk(__LINE__);
+        Ring r{};
+        UInt32 v = 0;
+        out[0] = out[1] = out[2] = out[3] = 0;
+        bool ok = true;
+        if (anyClientChannelLocked()) {   // 0.178.12: GR work is on many rings: the ordered stamp
+            stampAdvanceLocked();
+            out[0] = stampQueued_; out[1] = stampQHead_ == stampQTail_ ? stampQueued_ : stampWritten_;
+        } else if (grRing(&r)) { out[0] = *r.seq; ok = readRingSem(r, &v); out[1] = v; } else { ok = false; }
+        if (ok && ceRing(&r)) { out[2] = *r.seq; v = 0; ok = readRingSem(r, &v); out[3] = v; }
+        ulk();
+        return ok ? kIOReturnSuccess : kIOReturnNotReady;
+    }
+    if (name && name->isEqualTo("nvgsp-flip-copy"))                // 0.154.0
         return flipCopy(static_cast<NVGspFlipCopy *>(p1));
     if (name && name->isEqualTo("nvgsp-hotplug-register")) {
         hotplugFn_ = reinterpret_cast<HotplugFn>(p1);
         hotplugRef_ = p2;
         return armHotplug();
+    }
+    // 0.173.0: "nvgsp-reset-register" p1 = ResetDoneFn(void *ref), p2 = ref
+    // (p1 null: unregister p2). Called after a GPU reset (or S3 re-boot) brought
+    // GR back, without lock_: the display pipe puts its last frame back into
+    // the scan-out memory the reset wiped (the screen stayed black until the
+    // next WindowServer flip, 1 Oct 08:00).
+    if (name && name->isEqualTo("nvgsp-reset-register")) {
+        if (!lock_) return kIOReturnNotReady;
+        lk(__LINE__);
+        IOReturn ret = kIOReturnNoResources;
+        for (UInt32 c = 0; c < 4; ++c) {
+            if (p1 && !resetDoneFn_[c]) {
+                resetDoneFn_[c] = reinterpret_cast<ResetDoneFn>(p1); resetDoneRef_[c] = p2;
+                ret = kIOReturnSuccess; break;
+            }
+            if (!p1 && resetDoneRef_[c] == p2) {
+                resetDoneFn_[c] = nullptr; resetDoneRef_[c] = nullptr;
+                ret = kIOReturnSuccess; break;
+            }
+        }
+        ulk();
+        return ret;
     }
     const bool reg = name && name->isEqualTo("nvgsp-vblank-register");
     const bool unreg = name && name->isEqualTo("nvgsp-vblank-unregister");
@@ -1915,7 +1960,7 @@ IOReturn NVGspControl::callPlatformFunction(const OSSymbol *name, bool wait,
     return ret;
 }
 
-// live debug surface (no reboot for every experiment)
+// 0.80.0: live debug surface (no reboot per experiment).
 IOReturn NVGspControl::peekBar0(UInt32 offset, UInt32 count, UInt32 *out) {
     if (!pci_ || !out || !count || count > 64 || (offset & 3)) return kIOReturnBadArgument;
     IOMemoryMap *map = sharedBar0Map(pci_);
@@ -1930,8 +1975,8 @@ IOReturn NVGspControl::peekBar0(UInt32 offset, UInt32 count, UInt32 *out) {
 }
 
 IOReturn NVGspControl::vramAccess(UInt64 offset, UInt32 *words, UInt32 count, bool write) {
-    // VRAM read/write through the PRAMIN window under lock_ (the window
-    // at BAR0 0x1700 is shared with every in-kernel PRAMIN user)
+    // 0.81.0: VRAM read/write through the PRAMIN window under lock_ (the
+    // window at BAR0 0x1700 is shared with every in-kernel PRAMIN user).
     if (!lock_ || !pci_ || !words || !count || count > 1024 || (offset & 3))
         return kIOReturnBadArgument;
     lk(__LINE__);
@@ -1939,7 +1984,16 @@ IOReturn NVGspControl::vramAccess(UInt64 offset, UInt32 *words, UInt32 count, bo
     if (write) {
         ok = praminWriteWords(pci_, offset, words, count);
     } else {
-        for (UInt32 i = 0; ok && i < count; i += 2) {
+        // The public DWORD ABI allows offset&7 == 4; PTE access does not.
+        // Consume that leading high DWORD, then read aligned pairs.
+        UInt32 i = 0;
+        if (offset & 4) {
+            UInt64 v = 0;
+            PraminPteResult r{};
+            ok = praminPteAccess(pci_, offset - 4, &v, false, false, &r);
+            if (ok) words[i++] = static_cast<UInt32>(v >> 32);
+        }
+        for (; ok && i < count; i += 2) {
             UInt64 v = 0;
             PraminPteResult r{};
             ok = praminPteAccess(pci_, offset + i * 4, &v, false, false, &r);
@@ -1952,9 +2006,9 @@ IOReturn NVGspControl::vramAccess(UInt64 offset, UInt32 *words, UInt32 count, bo
 }
 
 IOReturn NVGspControl::pokeBar0(UInt32 offset, UInt32 value) {
-    // Display engine window only (PDISP 0x610000-0x6FFFFF, channel user
-    // areas included), everything else stays read-only from userspace.
-    // Plus the PMGR VPLL block 0x00e000-0x00effc for display PLL bring-up.
+    // Display engine window only (PDISP 0x610000-0x6FFFFF incl. channel
+    // user areas); everything else stays read-only from userspace.
+    // 0.100.2: + PMGR VPLL block 0x00e000-0x00effc (display PLL bring-up).
     if (!pci_ || (offset & 3) ||
         !((offset >= 0x610000 && offset <= 0x6FFFFC) ||
           (offset >= 0x00e000 && offset <= 0x00effc)))
@@ -1966,6 +2020,38 @@ IOReturn NVGspControl::pokeBar0(UInt32 offset, UInt32 value) {
         ret = bar0.write(offset, value) ? kIOReturnSuccess : kIOReturnIOError;
     }
     if (map) map->release();
+    return ret;
+}
+
+// Dedicated admin probe ABI: resolve the reserved channel token through RM.
+// No arbitrary MMIO offset, production channel or caller token is accepted.
+IOReturn NVGspControl::diagnosticChannelKick(UInt32 handle) {
+    if (handle != 0xc0e9006f) return kIOReturnBadArgument;
+    const UInt32 generation = resetGeneration();
+    UInt32 req[7] = {0xc0d00001, handle, 0xc36f0108, 0, 4, 0, 0};
+    UInt8 reply[112]{};
+    UInt32 bytes = sizeof(reply), result = ~0U, status = ~0U, token = 0;
+    const IOReturn rpc = userRpc(76, reinterpret_cast<const UInt8 *>(req), sizeof(req), reply, &bytes, &result);
+    if (rpc != kIOReturnSuccess) return rpc;
+    if (bytes >= 108) {
+        __builtin_memcpy(&status, reply + 92, 4);
+        __builtin_memcpy(&token, reply + 104, 4);
+    }
+    if (result || status || !token || (token & 0xffff) != 9)
+        return kIOReturnNotReady;
+    lk(__LINE__);
+    IOReturn ret = kIOReturnOffline;
+    if (!resetBusy_ && generation == resetGeneration()) {
+        IOMemoryMap *map = sharedBar0Map(pci_);
+        ret = kIOReturnNoMemory;
+        if (map && map->getLength() >= 0x00BB0094) {
+            Bar0Io bar0{map};
+            ret = bar0.write(0x00BB0090, token) ? kIOReturnSuccess : kIOReturnIOError;
+            if (ret == kIOReturnSuccess) setProperty("NVGspControl-probe-channel-token", token, 32);
+        }
+        if (map) map->release();
+    }
+    ulk();
     return ret;
 }
 
@@ -2025,7 +2111,7 @@ void NVGspControl::markBoot(const char *tag) {
 bool NVGspControl::waitRpcSlotLocked(UInt32 ms) {
     for (UInt32 t = 0;; ++t) {
         if (postInitPhase_ != 33 || sleeping_) return false;
-        if (!userRpcOutstanding_ && !pingOutstanding_) return true;
+        if (!userRpcActive_ && !userRpcOutstanding_ && !pingOutstanding_) return true;
         if (t >= ms) return false;
         ulk();
         IOSleep(1);
@@ -2041,16 +2127,21 @@ IOReturn NVGspControl::userRpc(UInt32 function, const UInt8 *params, UInt32 byte
         ulk();
         return kIOReturnBusy;
     }
+    // The interrupt/poll thread clears outstanding when the reply arrives.
+    // Keep ownership until this caller copies it: another sleeping caller
+    // can acquire lock_ before we do and otherwise overwrite our reply.
+    userRpcActive_ = true;
     userRpcFunction_ = function;
     userRpcOutstanding_ = true;
     userRpcReplyBytes_ = 0;
-    if (!init_.enqueueRpc(function, params, bytes)) {
+    userRpcSeq_ = 0x80000000U | (++userRpcSeqCounter_ & 0x7fffffffU);   // 0.178.9
+    if (!init_.enqueueRpc(function, params, bytes, userRpcSeq_)) {
         userRpcOutstanding_ = false;
+        userRpcActive_ = false;
         ulk();
         return kIOReturnIOError;
     }
-    // drive the status queue ourselves (we don't depend on the daemon
-    // poll)
+    // Drive the status queue ourselves (no dependency on the daemon poll).
     for (UInt32 ms = 0; userRpcOutstanding_ && ms < 5000; ++ms) {
         pollStatusLocked();
         if (!userRpcOutstanding_) break;
@@ -2064,6 +2155,7 @@ IOReturn NVGspControl::userRpc(UInt32 function, const UInt8 *params, UInt32 byte
     if (n) __builtin_memcpy(reply, userRpcReply_, n);
     *replyBytes = n;
     if (rpcResult) *rpcResult = done ? userRpcResult_ : ~0U;
+    userRpcActive_ = false;
     ++userRpcs_;
     setProperty("NVGspControl-user-rpc-count", userRpcs_, 32);
     setProperty("NVGspControl-user-rpc-last-function", function, 32);
@@ -2071,10 +2163,10 @@ IOReturn NVGspControl::userRpc(UInt32 function, const UInt8 *params, UInt32 byte
     return done ? kIOReturnSuccess : kIOReturnTimeout;
 }
 
-// Kernel-managed core channel pushbuffer (4 KiB at dispPbBackingOffset_,
-// PUT/GET at BAR0 0x680000/4). Words get appended at corePut_, and the PB
-// wraps with a DMA JUMP to 0 like the window PB. We wait for GET == PUT
-// (fetched), not for the UPDATE to arm.
+// 0.83.0: kernel-managed core channel pushbuffer (4 KiB at
+// dispPbBackingOffset_, PUT/GET at BAR0 0x680000/4). Words are appended at
+// corePut_; the PB wraps with a DMA JUMP to 0 like the window PB. Waits for
+// GET == PUT (fetched), not for the UPDATE to arm.
 IOReturn NVGspControl::submitCore(const UInt32 *words, UInt32 count) {
     if (!lock_ || !pci_ || !words || !count || count > 256) return kIOReturnBadArgument;
     lk(__LINE__);
@@ -2111,7 +2203,7 @@ IOReturn NVGspControl::submitCore(const UInt32 *words, UInt32 count) {
     return ret;
 }
 
-// the VBIOS leaves SET_WINDOW_INTERLOCK_FLAGS = window 0
+// 0.138.0 (D1): the VBIOS leaves SET_WINDOW_INTERLOCK_FLAGS = window 0
 // armed, so a core UPDATE that does not rewrite the interlocks waits for a
 // window-0 UPDATE that is interlocked with the core, and every later core
 // method (cursor, OLUT, notifier) queues behind it. That stall is what made
@@ -2143,9 +2235,13 @@ IOReturn NVGspControl::coreUnstick() {
 UInt32 NVGspControl::coreException() {
     UInt32 stat = 0;
     IOMemoryMap *map = sharedBar0Map(pci_);
-    if (map && map->getLength() >= 0x611030) {
+    if (map && map->getLength() >= 0x611858) {
         Bar0Io bar0{map};
-        if (bar0.read(0x611020, &stat) && (stat & 0x10000000U)) {
+        UInt32 pending = 0;
+        // FE_EXCEPT retains an ACKed snapshot, including VALID/type NONE.
+        // Only the live core interrupt source establishes a pending fault.
+        if (bar0.read(0x611854, &pending) && (pending & 1U) &&
+            bar0.read(0x611020, &stat) && (stat & 0x10000000U)) {
             UInt32 data = 0, code = 0;
             bar0.read(0x611024, &data);
             bar0.read(0x611028, &code);
@@ -2161,14 +2257,49 @@ UInt32 NVGspControl::coreException() {
     return stat;
 }
 
-// hardware cursor (head 0), nvkms EvoSetCursorImageC3 + MoveCursorC3
+IOReturn NVGspControl::waitCursorArmed(UInt32 usage, const UInt32 state[7]) {
+    if (!pci_ || !state) return kIOReturnBadArgument;
+    IOMemoryMap *map = sharedBar0Map(pci_);
+    if (!map || map->getLength() < 0x68a0a4) {
+        if (map) map->release();
+        return kIOReturnNoMemory;
+    }
+    Bar0Io bar0{map};
+    IOReturn result = kIOReturnTimeout;
+    for (UInt32 ms = 0; ms < 200; ++ms) {
+        UInt32 pending = 0, cs = 0, put = 0, get = 0, assyUsage = 0, armedUsage = 0;
+        UInt32 assy[7] = {}, armed[7] = {};
+        bool ok = bar0.read(0x611854, &pending) && bar0.read(0x610630, &cs) &&
+            bar0.read(0x680000, &put) && bar0.read(0x680004, &get) &&
+            bar0.read(0x682030, &assyUsage) && bar0.read(0x68a030, &armedUsage);
+        for (UInt32 i = 0; ok && i < 7; ++i)
+            ok = bar0.read(0x682088 + i*4, &assy[i]) && bar0.read(0x68a088 + i*4, &armed[i]);
+        if (!ok) { result = kIOReturnIOError; break; }
+        if (pending & 1U) { coreException(); result = kIOReturnIOError; break; }
+        if (((cs >> 16) & 0x1f) == 0x0b && put == get &&
+            assyUsage == usage && armedUsage == usage &&
+            !__builtin_memcmp(assy, state, sizeof(assy)) &&
+            !__builtin_memcmp(armed, state, sizeof(armed))) {
+            result = kIOReturnSuccess;
+            break;
+        }
+        IOSleep(1);
+    }
+    map->release();
+    setProperty("NVGspControl-cursor-arm-result", static_cast<UInt32>(result), 32);
+    return result;
+}
+
+// 0.84.0: hardware cursor (head 0), nvkms EvoSetCursorImageC3 + MoveCursorC3
 // with nouveau r535_curs_init ordering. 64x64 A8R8G8B8, two 16 KiB buffers
 // at the tail of the scratch VRAM (scratch + 0xFF00000); the VRAM ctxdma the
 // window uses (RAMIN+0x2000) gets a core-channel (chid 0) RAMHT entry.
 static constexpr UInt32 kCursorCtxdma = 0xc0d0d002;
-static constexpr UInt32 kOlutCtxdma = 0xc0d0d006;
+// Dual legacy/client hash slots must not alias the cursor's 56/60 slots.
+// The old OLUT handle D006 used 52/56; D00A uses 48/52 instead.
+static constexpr UInt32 kOlutCtxdma = 0xc0d0d00a;
 static constexpr UInt32 kIlutCtxdma = 0xc0d0d007;
-// see the call site. Returns the number of PD0 tables installed.
+// 0.101.0: see the call site. Returns the number of PD0 tables installed.
 UInt32 NVGspControl::installVramWindow() {
     constexpr UInt64 kVramVa = 0x2000000000ULL;
     constexpr UInt64 kTablesOff = 0xF800000ULL;
@@ -2189,7 +2320,7 @@ UInt32 NVGspControl::installVramWindow() {
     setProperty("NVGspControl-vram-va-pd1", pd1, 64);
     for (UInt32 t = 0; t < tables; ++t) {
         if (!praminPteAccess(pci_, pd1 + (first + t) * 8ULL, &e, false, false, &r) || e)
-            return 0;   // slot already taken, leave RM's tables alone
+            return 0;   // slot taken: leave RM's tables alone
     }
     if (!praminZeroRange(pci_, tabBase, tables * 4096ULL)) return 0;
     for (UInt32 t = 0; t < tables; ++t) {
@@ -2209,10 +2340,10 @@ UInt32 NVGspControl::installVramWindow() {
     return tables;
 }
 
-// see the call site; PTE aperture SYSTEM_COHERENT (2) + VOL -> |0xD
+// 0.102.0: see the call site. PTE aperture SYSTEM_COHERENT (2) + VOL -> |0xD.
 UInt32 NVGspControl::installSharedWindow() {
     constexpr UInt64 kShmVa = 0x3000000000ULL;
-    constexpr UInt64 kTableOff = 0xF820000ULL;   // after the 32 VRAM window tables
+    constexpr UInt64 kTableOff = 0xF820000ULL;   // after the 32 VRAM-window tables
     const UInt32 first = static_cast<UInt32>(kShmVa >> 29) & 0x1ff;
     const UInt64 table = scratchOffset_ + kTableOff;
     PraminPteResult r{};
@@ -2225,7 +2356,7 @@ UInt32 NVGspControl::installSharedWindow() {
     if (!praminZeroRange(pci_, table, 4096)) return 0;
     UInt32 n = 0;
     for (; n < kShmChunks; ++n) {
-        IOBufferMemoryDescriptor *b = shmChunk_[n];   // reused after a reset
+        IOBufferMemoryDescriptor *b = shmChunk_[n];   // 0.104.0: reuse after reset
         const bool fresh = !b;
         if (fresh) {
             b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
@@ -2241,9 +2372,9 @@ UInt32 NVGspControl::installSharedWindow() {
             break;
         }
         if (fresh) bzero(b->getBytesNoCopy(), 0x200000);
-        // VOL (bit 3) = uncached in GPU L2. Without it the GPU didn't see the
-        // CPU rewriting reused QMD/cbuf slots (stale L2 lines; with 20k async
-        // launches outputs went missing from the 3rd trip round the ring).
+        // 0.103.1: VOL (bit 3) = uncached in GPU L2. Without it, CPU rewrites
+        // of reused QMD/cbuf slots were not seen (stale L2 lines, 20k async
+        // launches: missing outputs from the 3rd ring round on).
         UInt64 pte = ((phys >> 12) << 8) | 0xD;
         if (!praminPteAccess(pci_, table + n * 16ULL, &pte, true, true, &r)) {
             if (fresh) { b->complete(); b->release(); }
@@ -2262,10 +2393,9 @@ UInt32 NVGspControl::installSharedWindow() {
     return n;
 }
 
-// GPU TLB + PDE cache invalidate for our VAS, done from the CPU through the
-// Turing+ virtual-function MMU registers (nouveau tu102_vmm_flush). This
-// works with GSP-RM, unlike the privileged host MEM_OP from our channel
-// which gives Xid 32.
+// 0.105.0: GPU TLB + PDE-cache invalidate for our VAS from the CPU through
+// the Turing+ virtual-function MMU registers (nouveau tu102_vmm_flush; works
+// with GSP-RM, unlike the privileged host MEM_OP from our channel = Xid 32).
 IOReturn NVGspControl::tlbInvalidate() {
     if (!pci_ || !pdbAddress_) return kIOReturnNotReady;
     IOMemoryMap *map = sharedBar0Map(pci_);
@@ -2274,7 +2404,11 @@ IOReturn NVGspControl::tlbInvalidate() {
         Bar0Io bar0{map};
         bar0.write(0xb830a0, static_cast<UInt32>(pdbAddress_ >> 8));
         bar0.write(0xb830a4, 0);
-        bar0.write(0xb830b0, 0x80000001);          // trigger | PAGE_ALL
+        // 0.178.3: with per-client channels (own VAS/PDB) live, ALL_PDB too:
+        // a client's arena changes and a reused PDB must reach their TLBs
+        bool own = false;
+        for (UInt32 i = 0; i < kMaxClientChannels; ++i) own |= cchan_[i].state != 0;
+        bar0.write(0xb830b0, own ? 0x80000003 : 0x80000001);   // trigger | ALL_VA (| ALL_PDB)
         ret = kIOReturnTimeout;
         for (UInt32 i = 0; i < 20000; ++i) {
             UInt32 v = 0;
@@ -2289,19 +2423,18 @@ IOReturn NVGspControl::tlbInvalidate() {
     return ret;
 }
 
-// per-client arenas ---------------------------------------------
-// Every user client gets its own page tables for the user VA arena
+// 0.111.0 per-client arenas ---------------------------------------------
+// Every user client gets private page tables for the user VA arena
 // (PD1[320..383], GPU VA 0x28_0000_0000..0x30_0000_0000): 64 PD0 tables =
-// 256 KiB carved out of a 4 MiB kext-owned VRAM pool (16 clients). So
-// clients can use the same VAs (every NVK process starts its VA heap at
-// the same place) and can't see each other's arena mappings. Before a
+// 256 KiB carved from a 4 MiB kext-owned VRAM pool (16 clients). Clients
+// can therefore use the same VAs (NVK processes all start their VA heap at
+// the same place) and cannot see each other's arena mappings. Before a
 // client's work is submitted, arenaSwitchLocked() drains the GR/CE rings,
-// points PD1[320..383] at that client's tables and flushes the TLB; as
-// long as one client keeps submitting there's no switching cost.
-// The tables are managed by nvgsp::ArenaMap (NVGspArenaMap.hpp): 2 MiB
-// PTEs where a whole aligned region maps contiguous memory, 64 KiB
-// big-page tables (LPTs, from per-client 2 MiB VRAM chunks) everywhere
-// else.
+// points PD1[320..383] at that client's tables and flushes the TLB; while
+// one client keeps submitting there is no switch cost.
+// 0.114.0: the tables are managed by nvgsp::ArenaMap (NVGspArenaMap.hpp):
+// 2 MiB PTEs where a whole aligned region maps contiguous memory, 64 KiB
+// big-page tables (LPTs, from per-client 2 MiB VRAM chunks) otherwise.
 
 bool NVGspControl::ArenaBackend::read64(UInt64 vram, UInt64 *v) {
     PraminPteResult r{};
@@ -2318,8 +2451,22 @@ bool NVGspControl::ArenaBackend::zero(UInt64 vram, UInt64 bytes) {
     return praminZeroRange(d->pci_, vram, bytes);
 }
 
+// 0.165.0: sparse tables in bulk, 4 KiB per PRAMIN write
+bool NVGspControl::ArenaBackend::fill16(UInt64 vram, UInt64 bytes, UInt64 q0, UInt64 q1) {
+    static UInt32 page[1024];
+    for (UInt32 i = 0; i < 1024; i += 4) {
+        page[i] = static_cast<UInt32>(q0); page[i + 1] = static_cast<UInt32>(q0 >> 32);
+        page[i + 2] = static_cast<UInt32>(q1); page[i + 3] = static_cast<UInt32>(q1 >> 32);
+    }
+    for (UInt64 o = 0; o < bytes; o += 4096) {
+        const UInt32 n = bytes - o >= 4096 ? 1024 : static_cast<UInt32>((bytes - o) / 4);
+        if (!praminWriteWords(d->pci_, vram + o, page, n)) return false;
+    }
+    return true;
+}
+
 // LPT chunk: a 2 MiB VRAM object owned by the arena context (tag `ctx`),
-// released along with it.
+// released with it.
 bool NVGspControl::ArenaBackend::allocChunk(UInt64 *phys) {
     UInt32 h = 0;
     return d->memAllocLocked(ctx, 0x200000, 0, &h, phys) == kIOReturnSuccess;
@@ -2328,22 +2475,86 @@ bool NVGspControl::ArenaBackend::allocChunk(UInt64 *phys) {
 void *NVGspControl::ArenaBackend::allocOwners(UInt32 bytes) { return IOMalloc(bytes); }
 void NVGspControl::ArenaBackend::freeOwners(void *p, UInt32 bytes) { IOFree(p, bytes); }
 
-// free the LPT chunks of `c` (VRAM objects tagged with the context)
+// Free the LPT chunks of `c` (VRAM objects tagged with the context).
 void NVGspControl::arenaFreeChunksLocked(ArenaCtx *c) {
     for (UInt32 i = 0; i < kMaxMem; ++i)
         if (mem_[i].owner == c) releaseGpuMemLocked(i);
 }
 
-// caller holds lock_. `create` makes the context (and the pool) when
-// needed.
+// Caller holds lock_. `create` makes the context (and the pool) on demand.
+// 0.165.0: unmapped user VA is sparse (reads 0, writes dropped) instead of an
+// MMU fault that kills the channel, like the M1 with wild accesses. NVRAM
+// nvgsp-sparse=0 brings the faults back (driver debugging).
+static bool arenaSparseByNvram() {
+    IORegistryEntry *options = IORegistryEntry::fromPath("/options", gIODTPlane);
+    bool on = true;
+    if (options) {
+        OSObject *o = options->copyProperty("nvgsp-sparse");
+        if (OSData *d = OSDynamicCast(OSData, o))
+            on = !(d->getLength() >= 1 && static_cast<const char *>(d->getBytesNoCopy())[0] == '0');
+        else if (OSString *str = OSDynamicCast(OSString, o))
+            on = !str->isEqualTo("0");
+        OSSafeReleaseNULL(o);
+        options->release();
+    }
+    return on;
+}
+
+// .178.24: bounded diagnosis of private recovery after the newer native stamp
+// fixes. Read only at the first global reset. A second reset or S3 disables
+// this exception even if NVRAM remains set; normal fallback stays the default.
+static bool postResetPrivateDiagnosticByNvram() {
+    IORegistryEntry *options = IORegistryEntry::fromPath("/options", gIODTPlane);
+    bool on = false;
+    if (options) {
+        OSObject *o = options->copyProperty("nvgsp-postreset-private");
+        if (OSData *d = OSDynamicCast(OSData, o))
+            on = d->getLength() >= 1 && static_cast<const char *>(d->getBytesNoCopy())[0] == '1';
+        else if (OSString *str = OSDynamicCast(OSString, o)) on = str->isEqualTo("1");
+        OSSafeReleaseNULL(o);
+        options->release();
+    }
+    return on;
+}
+
+bool NVGspControl::privateChannelGenerationAllowed() const {
+    return gpuResets_ == 0 || (resetPrivateDiagnostic_ && gpuResets_ == 1);
+}
+
+// 0.178.6: per-client GR channels for every client (NVRAM nvgsp-ownchannel=1)
+bool NVGspControl::ownChannelAuto() {
+    static int on = -1;
+    if (on < 0) {
+        IORegistryEntry *options = IORegistryEntry::fromPath("/options", gIODTPlane);
+        on = 0;
+        if (options) {
+            OSObject *o = options->copyProperty("nvgsp-ownchannel");
+            if (OSData *d = OSDynamicCast(OSData, o))
+                on = d->getLength() >= 1 && static_cast<const char *>(d->getBytesNoCopy())[0] == '1';
+            else if (OSString *str = OSDynamicCast(OSString, o))
+                on = str->isEqualTo("1");
+            OSSafeReleaseNULL(o);
+            options->release();
+        }
+        setProperty("NVGspControl-ownchannel-auto", on != 0);
+    }
+    // .178.22: fresh-boot private-channel soaks pass, but after a global
+    // fault/reset mixed work repeatedly hits RC109, even with WFI/quiesce.
+    // Shared fallback stays the default; .24 can opt in for the first reset
+    // only to retest recovery with .5.17 native stamp correctness fixes.
+    return on != 0 && privateChannelGenerationAllowed();
+}
+
 NVGspControl::ArenaCtx *NVGspControl::arenaForLocked(const void *owner, bool create) {
     if (!owner) return nullptr;
     for (UInt32 i = 0; i < kMaxArenaCtx; ++i)
         if (arenaCtx_[i] && arenaCtx_[i]->owner == owner) {
             ArenaCtx *c = arenaCtx_[i];
             if (!c->ready && create) {                    // after a GPU reset
+                IOLog("NVGspControl: arena slot %u (pid %d) rebuilt empty for owner %p\n", i, c->pid, owner);
                 ArenaBackend b{this, c};
                 arenaFreeChunksLocked(c);
+                c->map.sparse = arenaSparseByNvram();
                 c->ready = c->map.init(b, arenaPoolPhys_ + i * kArenaCtxBytes);
             }
             return c->ready || !create ? c : nullptr;
@@ -2359,13 +2570,32 @@ NVGspControl::ArenaCtx *NVGspControl::arenaForLocked(const void *owner, bool cre
     }
     UInt32 slot = 0;
     while (slot < kMaxArenaCtx && arenaCtx_[slot]) ++slot;
-    if (slot == kMaxArenaCtx) return nullptr;
+    if (slot == kMaxArenaCtx) {
+        // 0.172.0: reclaim a context left stale by a GPU reset. Its owner is
+        // from before the reset and only ever gets Offline now (it reopens
+        // with a new client), so its tables are dead weight.
+        for (UInt32 i = 0; i < kMaxArenaCtx; ++i)
+            if (arenaCtx_[i] && !arenaCtx_[i]->ready && arenaCtx_[i] != arenaActive_) {
+                arenaFreeCtxLocked(i);
+                ++arenaReclaims_;
+                setProperty("NVGspControl-arena-reclaims", arenaReclaims_, 32);
+                slot = i;
+                break;
+            }
+        if (slot == kMaxArenaCtx) {
+            ++arenaFull_;
+            setProperty("NVGspControl-arena-full", arenaFull_, 32);
+            return nullptr;
+        }
+    }
     ArenaCtx *c = static_cast<ArenaCtx *>(IOMalloc(sizeof(ArenaCtx)));
     if (!c) return nullptr;
-    bzero(c, sizeof(*c));                                // ArenaMap wants zeroed state
+    bzero(c, sizeof(*c));                                // ArenaMap needs zeroed state
     c->owner = owner;
-    c->pid = proc_selfpid();
+    c->pid = proc_selfpid();                             // 0.158.0
     ArenaBackend b{this, c};
+    c->map.sparse = arenaSparseByNvram();
+    setProperty("NVGspControl-arena-sparse", c->map.sparse);
     c->ready = c->map.init(b, arenaPoolPhys_ + slot * kArenaCtxBytes);
     if (!c->ready) { IOFree(c, sizeof(ArenaCtx)); return nullptr; }
     arenaCtx_[slot] = c;
@@ -2373,8 +2603,7 @@ NVGspControl::ArenaCtx *NVGspControl::arenaForLocked(const void *owner, bool cre
     return c;
 }
 
-// point PD1[320..383] at `c`'s tables (nullptr means no arena); caller holds
-// lock_
+// Point PD1[320..383] at `c`'s tables (nullptr: no arena). Caller holds lock_.
 bool NVGspControl::arenaWritePd1Locked(const ArenaCtx *c) {
     if (!pdbAddress_) return false;
     PraminPteResult r{};
@@ -2390,7 +2619,7 @@ bool NVGspControl::arenaWritePd1Locked(const ArenaCtx *c) {
     return ok;
 }
 
-// wait till the GR, CE and video rings are idle (every submitted fence reached)
+// Wait until the GR, CE and video rings are idle (all submitted fences reached).
 bool NVGspControl::drainEnginesLocked() {
     Ring ring{};
     if (grRing(&ring) && !waitRingSem(ring, subSeq_, 2000000)) return false;
@@ -2400,11 +2629,11 @@ bool NVGspControl::drainEnginesLocked() {
         if (ceRing(&ce) && !waitRingSem(ce, ceSeq_, 2000000)) return false;
         ceOutstanding_ = 0;
     }
-    for (UInt32 i = 0; i < nvgsp::kVideoEngineCount; ++i) {
+    for (UInt32 i = 0; i < nvgsp::kVideoEngineCount; ++i) {   // 0.116.0
         Ring vr{};
         if (!videoRing(i, &vr) || !video_[i].seq || video_[i].dead) continue;
-        // a video ring that isn't moving must not drag GR/CE (NVK) down
-        // with it: mark it dead instead of failing the drain
+        // 0.122.0: a video ring that does not progress must not take GR/CE
+        // (NVK) down with it: mark it dead instead of failing the drain.
         if (!waitRingSem(vr, video_[i].seq, 200000)) {
             videoMarkDeadLocked(i);
             continue;
@@ -2415,16 +2644,27 @@ bool NVGspControl::drainEnginesLocked() {
 }
 
 // Make `owner`'s arena the live one before its work reaches the GPU. A
-// client without an arena runs with none, so it can't reach the previous
+// client without an arena runs with none, so it cannot reach the previous
 // client's mappings either. Caller holds lock_.
 IOReturn NVGspControl::arenaSwitchLocked(const void *owner) {
-    if (vramFrozen_) {                               // sleep is in progress
+    if (vramFrozen_) {                               // 0.127.0: sleep in progress
         const UInt32 gen = gpuResets_;
         waitThawLocked();
-        if (gen != gpuResets_) return kIOReturnNotReady;   // GPU state got lost in the meantime
+        if (gen != gpuResets_) return kIOReturnNotReady;   // GPU state lost meanwhile
     }
     ArenaCtx *target = arenaForLocked(owner, false);
     if (target && !target->ready) target = nullptr;
+    // 0.168.0: never run a client's work without its tables. A submit from a
+    // client whose arena is missing or not ready (after a reset, or while it
+    // is set up) used to install no arena and run: its native slabs faulted
+    // (1 Oct 04:57, va 0x2800a00000 "active -1 ... mapped by no client") and
+    // the resets that followed did not bring GR back. NotReady sends the
+    // client through its recovery, which rebinds into fresh tables.
+    if (!target) {
+        ++nullArenaRefusals_;
+        setProperty("NVGspControl-null-arena-refusals", nullArenaRefusals_, 32);
+        return kIOReturnNotReady;
+    }
     if (arenaInstalled_ && arenaActive_ == target) return kIOReturnSuccess;
     if (!drainEnginesLocked()) return kIOReturnTimeout;
     if (!arenaWritePd1Locked(target)) return kIOReturnIOError;
@@ -2435,7 +2675,25 @@ IOReturn NVGspControl::arenaSwitchLocked(const void *owner) {
     return tlbInvalidate();                          // no lock_ inside
 }
 
-// name the owner of a faulting user-arena VA: which client's
+// 0.170.0: the last 16 GPU events (RCs, ring hangs, resets) with their
+// uptime, as NVGspControl-gpu-events; kept across resets. Caller holds lock_.
+void NVGspControl::noteGpuEventLocked(const char *what) {
+    UInt64 now = 0, ns = 0;
+    clock_get_uptime(&now);
+    absolutetime_to_nanoseconds(now, &ns);
+    snprintf(gpuEvents_[gpuEventCount_ % 16], sizeof(gpuEvents_[0]), "%llu.%03llu %s",
+             ns / 1000000000ULL, (ns / 1000000ULL) % 1000, what);
+    ++gpuEventCount_;
+    OSArray *a = OSArray::withCapacity(16);
+    if (!a) return;
+    const UInt32 n = gpuEventCount_ < 16 ? gpuEventCount_ : 16;
+    for (UInt32 k = gpuEventCount_ - n; k < gpuEventCount_; ++k)
+        if (OSString *str = OSString::withCString(gpuEvents_[k % 16])) { a->setObject(str); str->release(); }
+    setProperty("NVGspControl-gpu-events", a);
+    a->release();
+}
+
+// 0.158.0: name the owner of a faulting user-arena VA: which client's
 // tables map it (pid, object slot, page size) and whose arena the GPU was
 // walking. A VA mapped only by another client's arena means work ran under
 // the wrong tables; mapped by nobody means it outlived its memory. Caller
@@ -2461,7 +2719,17 @@ void NVGspControl::explainFaultLocked(UInt64 va) {
                       dom, bytes, how == 3 ? "4K" : how == 2 ? "64K" : "2M");
         any = true;
     }
-    if (!any) snprintf(s + n, sizeof(s) - n, " mapped by no client");
+    if (!any) n += snprintf(s + n, sizeof(s) - n, " mapped by no client");
+    // 0.164.0: every arena as it stands (after a reset a client can hold a
+    // context that is not ready, or one without its staging page)
+    for (UInt32 i = 0; i < kMaxArenaCtx && n > 0 && n < static_cast<int>(sizeof(s)) - 40; ++i) {
+        ArenaCtx *c = arenaCtx_[i];
+        if (!c) continue;
+        UInt32 how = 0;
+        const bool stg = c->ready && c->map.ownerAt(0x2800000000ULL, &how) != 0;
+        n += snprintf(s + n, sizeof(s) - n, " {%u pid %d %s%s}", i, c->pid, c->ready ? "ready" : "stale",
+                      stg ? " stg" : "");
+    }
     setProperty("NVGspControl-fault-owner", s);
     IOLog("NVGspControl: MMU fault %s\n", s);
 }
@@ -2477,14 +2745,15 @@ void NVGspControl::arenaFreeCtxLocked(UInt32 slot) {
     arenaCtx_[slot] = nullptr;
 }
 
-// drop `owner`'s arena (the client closed); caller holds lock_ and has
-// already unbound the client's objects
+// Drop `owner`'s arena (client closed). Caller holds lock_ and has already
+// unbound the client's objects.
 void NVGspControl::arenaReleaseLocked(const void *owner) {
     for (UInt32 i = 0; i < kMaxArenaCtx; ++i) {
         ArenaCtx *c = arenaCtx_[i];
         if (!c || c->owner != owner) continue;
+        IOLog("NVGspControl: arena slot %u (pid %d) released, owner %p\n", i, c->pid, owner);
         if (arenaActive_ == c) {
-            // memFreeAll waited for this client's work before
+            // 0.155.0: memFreeAll waited for this client's work before
             // taking the lock (no drain with lock_ held here any more)
             // its in-flight work (if any) loses the arena, never the reverse
             if (arenaWritePd1Locked(nullptr)) tlbInvalidate();
@@ -2495,8 +2764,9 @@ void NVGspControl::arenaReleaseLocked(const void *owner) {
 }
 
 // VAS torn down (stop: free everything; reset: keep the per-client
-// contexts but mark their tables to be set up again on next use)
+// contexts but mark their tables for re-initialisation on next use).
 void NVGspControl::arenaDropAllLocked(bool keepContexts) {
+    IOLog("NVGspControl: arenas dropped (keep %d) gen %u\n", keepContexts ? 1 : 0, resetGeneration());
     for (UInt32 i = 0; i < kMaxArenaCtx; ++i) {
         ArenaCtx *c = arenaCtx_[i];
         if (!c) continue;
@@ -2507,27 +2777,34 @@ void NVGspControl::arenaDropAllLocked(bool keepContexts) {
     arenaInstalled_ = false;
 }
 
-// flush the TLB if `c` is the arena the GPU is currently walking
+// Flush the TLB when `c` is the arena the GPU currently walks.
 bool NVGspControl::arenaFlushIfLiveLocked(const ArenaCtx *c) {
-    if (!c || c != arenaActive_) return true;
+    // 0.178.4: an owner with its own GR channel has these tables live in its
+    // private VAS at all times
+    const bool own = c && clientChannelLocked(c->owner) &&
+                     clientChannelLocked(c->owner)->arenaTables == c->map.tables;
+    if (!c || (c != arenaActive_ && !own)) return true;
     return tlbInvalidate() == kIOReturnSuccess;
 }
 
-// PTE flag bits from the user client flags: bits 7:0 kind, bit 8 system
-// memory (coherent aperture + VOL)
+// PTE flag bits from the user-client flags: bits 7:0 kind, bit 8 system
+// memory (coherent aperture + VOL). 0.163.0: bit 9 with bit 8 = system
+// memory the GPU L2 may cache (coherent aperture, no VOL), for Metal Shared
+// buffers: VOL made every GPU read a PCIe round trip (2 GB/s against 227 for
+// VRAM, 2.5 s per Vision convolution). submitSegments keeps it coherent.
 static UInt64 arenaPteFlags(UInt32 flags) {
-    return (UInt64(flags & 0xff) << 56) | ((flags & 0x100) ? 0xC : 0);
+    const UInt64 sys = (flags & 0x100) ? ((flags & 0x200) ? 0x4 : 0xC) : 0;
+    return (UInt64(flags & 0xff) << 56) | sys;
 }
 
-// Bind (bytes > 0) or unbind (bytes == 0: one 2 MiB page at va) in the
-// caller's arena. flags: bits 7:0 PTE kind, bit 8 = sysmem-coherent
-// aperture (+VOL) instead of VRAM. va, phys and bytes must be 64 KiB
-// aligned.
+// 0.105.0: bind (bytes > 0) or unbind (bytes == 0: one 2 MiB page at va) in
+// the caller's arena. flags: bits 7:0 PTE kind, bit 8 = sysmem-coherent
+// aperture (+VOL) instead of VRAM. 0.114.0: va, phys, bytes 64 KiB aligned.
 IOReturn NVGspControl::vaBind(const void *owner, UInt64 va, UInt64 phys, UInt64 bytes,
                               UInt32 flags) {
     if (!lock_ || !pci_ || !pdbAddress_ || !scratchOffset_) return kIOReturnNotReady;
     lk(__LINE__);
-    waitThawLocked();
+    waitThawLocked();                                // 0.127.0
     ArenaCtx *c = arenaForLocked(owner, true);
     bool ok = false;
     if (c) {
@@ -2541,10 +2818,10 @@ IOReturn NVGspControl::vaBind(const void *owner, UInt64 va, UInt64 phys, UInt64 
     return c ? (ok ? kIOReturnSuccess : kIOReturnBadArgument) : kIOReturnNoResources;
 }
 
-// Invalidate every arena PTE still pointing at object `handle`, then flush
-// the GPU TLB, all of it before the caller releases the pages, so no cached
-// translation can reach memory the kernel may already have reused. Caller
-// holds lock_.
+// 0.109.0: invalidate every arena PTE that still points at object `handle`,
+// then flush the GPU TLB — all before the caller releases the pages, so no
+// cached translation can reach memory the kernel may already have reused.
+// Caller holds lock_.
 bool NVGspControl::unbindObjectLocked(UInt32 handle) {
     if (!handle || handle > kMaxMem) return false;
     ArenaCtx *c = arenaForLocked(mem_[handle - 1].owner, false);
@@ -2556,11 +2833,11 @@ bool NVGspControl::unbindObjectLocked(UInt32 handle) {
     return ok;
 }
 
-// unbind a range of the caller's arena (64 KiB aligned)
+// 0.109.0: unbind a range of the caller's arena (0.114.0: 64 KiB aligned).
 IOReturn NVGspControl::vaUnbind(const void *owner, UInt64 va, UInt64 bytes) {
     if (!lock_ || !pci_ || !pdbAddress_ || !scratchOffset_) return kIOReturnNotReady;
     lk(__LINE__);
-    waitThawLocked();
+    waitThawLocked();                                // 0.127.0
     ArenaCtx *c = arenaForLocked(owner, false);
     bool ok = true;
     if (c && c->ready) {
@@ -2588,16 +2865,16 @@ IOReturn NVGspControl::memInfo(UInt64 *heapBytesOut, UInt64 *vramUsedOut, UInt64
     return kIOReturnSuccess;
 }
 
-// memory objects -------------------------------------------------
+// 0.107.0 memory objects -------------------------------------------------
 IOReturn NVGspControl::memAlloc(const void *owner, UInt64 bytes, UInt32 domain,
                                 UInt32 *handleOut, UInt64 *physOut) {
     if (!lock_ || !owner || !bytes || domain > 2 || !handleOut || !physOut)
         return kIOReturnBadArgument;
-    // system memory chunks (physically contiguous 2 MiB each, then
+    // 0.147.0: system memory chunks (physically contiguous 2 MiB each, then
     // zeroed) are allocated before taking lock_: done inside it, one
     // allocation held the lock for up to 46 ms and delayed vblank and fence
     // interrupts (desktop hitches under load).
-    if (!kce_.ready) kceEnsure();
+    if (!kce_.ready) kceEnsure();                    // 0.149.0
     IOBufferMemoryDescriptor **pre = nullptr;
     if (domain == 1) {
         const UInt64 aligned = (bytes + 0x1fffff) & ~0x1fffffULL;
@@ -2620,9 +2897,9 @@ IOReturn NVGspControl::memAlloc(const void *owner, UInt64 bytes, UInt32 domain,
         }
     }
     lk(__LINE__);
-    waitThawLocked();
+    waitThawLocked();                                // 0.127.0
     IOReturn ret = memAllocLocked(owner, bytes, domain, handleOut, physOut, pre);
-    // heap full -> move idle client objects to system memory until
+    // 0.149.0: heap full -> move idle client objects to system memory until
     // this one fits (or nothing is left to move)
     for (UInt32 tries = 0; ret == kIOReturnNoMemory && domain == 0 && tries < 64; ++tries) {
         if (!evictOneLocked(owner)) break;
@@ -2632,7 +2909,7 @@ IOReturn NVGspControl::memAlloc(const void *owner, UInt64 bytes, UInt32 domain,
         mem_[*handleOut - 1].client = true;
         mem_[*handleOut - 1].stamp = ++useClock_;
     }
-    // VRAM objects are zeroed before the owner sees the handle; a
+    // 0.147.1: VRAM objects are zeroed before the owner sees the handle; a
     // new object used to show whatever the previous owner (any process)
     // left there. SYS chunks are zeroed when they are allocated.
     if (ret == kIOReturnSuccess && (domain == 0 || domain == 2)) {
@@ -2641,8 +2918,15 @@ IOReturn NVGspControl::memAlloc(const void *owner, UInt64 bytes, UInt32 domain,
         ulk();
         bool zeroed = zeroVram(phys, objBytes);
         lk(__LINE__);
-        // no BAR1 view (ReBAR off) -> CE fill on the kernel channel
-        if (!zeroed) {
+        // 0.149.0: no BAR1 view (ReBAR off) -> CE fill on the kernel channel.
+        // Tahoe (29 Sep) runs without ReBAR for now, and that kernel CE fill
+        // is exactly what 0.147.3 warned about: it lands on the ring the
+        // clients' execSegments use, CE0 raises RC 39 on chid 8 and lock_
+        // stays held up to 6.6 s (vblank and fence interrupts wait behind
+        // it). So it is opt-in now (boot-arg nvgsp-cezero=1); without ReBAR
+        // a new VRAM object is simply not zeroed.
+        UInt32 ceZero = 0;
+        if (!zeroed && PE_parse_boot_argn("nvgsp-cezero", &ceZero, sizeof(ceZero)) && ceZero) {
             Ring ring{};
             UInt32 words[64];
             const UInt32 n = nvgsp::buildPhysFill(phys, objBytes, 0, words, 64);
@@ -2659,7 +2943,7 @@ IOReturn NVGspControl::memAlloc(const void *owner, UInt64 bytes, UInt32 domain,
 }
 
 bool NVGspControl::zeroVram(UInt64 phys, UInt64 bytes) {
-    // through BAR1 by the CPU. With ReBAR, BAR1 maps all of VRAM
+    // 0.147.3: through BAR1 by the CPU. With ReBAR, BAR1 maps all of VRAM
     // 1:1 (the cpu-visible objects rely on the same thing), so no GPU channel
     // is involved. 0.147.1/0.147.2 used the CE ring from the kernel, and that
     // pushbuffer collides with the clients' execSegments on the same ring
@@ -2677,7 +2961,7 @@ bool NVGspControl::zeroVram(UInt64 phys, UInt64 bytes) {
     return true;
 }
 
-// body of memAlloc for callers that already hold lock_.
+// 0.111.0: body of memAlloc for callers that already hold lock_.
 IOReturn NVGspControl::memAllocLocked(const void *owner, UInt64 bytes, UInt32 domain,
                                       UInt32 *handleOut, UInt64 *physOut,
                                       IOBufferMemoryDescriptor **pre) {
@@ -2695,7 +2979,7 @@ IOReturn NVGspControl::memAllocLocked(const void *owner, UInt64 bytes, UInt32 do
     while (h < kMaxMem && mem_[h].owner) ++h;
     if (h == kMaxMem) { dropPre(); return kIOReturnNoResources; }
     GpuMem m{};
-    // domain 2 = VRAM inside the BAR1 window (the CPU can map it)
+    // 0.123.0: domain 2 = VRAM inside the BAR1 window (CPU-mappable)
     const bool cpu = domain == 2;
     if (cpu) {
         if (!vramCpuWindowEnd()) { dropPre(); return kIOReturnUnsupported; }
@@ -2704,8 +2988,8 @@ IOReturn NVGspControl::memAllocLocked(const void *owner, UInt64 bytes, UInt32 do
     m.owner = owner; m.bytes = bytes; m.domain = domain; m.cpu = cpu;
     IOReturn ret = kIOReturnNoMemory;
     if (domain == 0) {
-        // first fit over [start, end) using the sorted range index
-        // (instead of rescanning every memory object, which was O(n^2))
+        // 0.126.0: first fit over [start, end) from the sorted range index
+        // (was an O(n^2) rescan of every memory object)
         auto fit = [&](UInt64 start, UInt64 end) -> bool {
             return vramHeap_.fit(start, end, bytes, &m.phys);
         };
@@ -2715,8 +2999,8 @@ IOReturn NVGspControl::memAllocLocked(const void *owner, UInt64 bytes, UInt32 do
         if (cpu) {
             placed = fit(kHeapBase, window);
         } else {
-            // plain VRAM goes above the CPU-visible window first, so the window
-            // stays free for objects that need CPU access
+            // 0.123.0: plain VRAM goes above the CPU-visible window first so the
+            // window stays free for objects that need CPU access
             placed = (window && fit(window, heapEnd)) || fit(kHeapBase, heapEnd);
         }
         if (placed && cpu) {
@@ -2768,7 +3052,7 @@ IOReturn NVGspControl::memAllocLocked(const void *owner, UInt64 bytes, UInt32 do
     return ret;
 }
 
-// the S3 copy of a VRAM object (see saveVramLocked)
+// 0.127.0: the S3 copy of a VRAM object (see saveVramLocked).
 static void freeSavedChunks(NVGspControl::GpuMem &m) {
     if (!m.saved) return;
     for (UInt32 k = 0; k < m.savedChunks; ++k) { m.saved[k]->complete(); m.saved[k]->release(); }
@@ -2779,23 +3063,22 @@ static void freeSavedChunks(NVGspControl::GpuMem &m) {
 
 static void releaseGpuMem(NVGspControl::GpuMem &m) {
     freeSavedChunks(m);
-    if (m.user && m.domain == 3) m.user->complete();   // unwire user pages
+    if (m.user && m.domain == 3) m.user->complete();   // 0.134.0: unwire user pages
     if (m.user) m.user->release();
     for (UInt32 k = 0; k < m.chunks; ++k) { m.chunk[k]->complete(); m.chunk[k]->release(); }
     if (m.chunk) IOFree(m.chunk, (m.bytes >> 21) * sizeof(void *));
     bzero(&m, sizeof(m));
 }
 
-// S3 save/restore of the kext-heap VRAM objects ----------------
-// GSP-RM's FBSR only restores RM's own VRAM. So before srSuspend, the CE
-// channel copies every live VRAM object (user heap, arena tables, video
-// chunks) into 2 MiB contiguous sysmem chunks (physical addressing, no VA),
-// and copies them back after a successful srResume. Memory and submit calls
-// wait in between (vramFrozen_), so nothing changes between the two copies.
-// Also here: GPU VAs of the GR / CE fence semaphores (32-bit sequence), for
-// NVK's GPU-side waits across engines (host SEM_EXECUTE ACQ_CIRC_GEQ). Both
-// rings live in the one kext VAS that every client's arena gets switched
-// into.
+// 0.127.0: S3 save/restore of the kext-heap VRAM objects ----------------
+// GSP-RM's FBSR restores only RM's own VRAM. Before srSuspend every live
+// VRAM object (user heap, arena tables, video chunks) is copied by the CE
+// channel into 2 MiB contiguous sysmem chunks (physical addressing, no VA),
+// and copied back after a successful srResume. Meanwhile memory and submit
+// calls wait (vramFrozen_), so nothing changes between the two copies.
+// 0.128.0: GPU VAs of the GR / CE fence semaphores (32-bit sequence), for
+// NVK's GPU-side cross-engine waits (host SEM_EXECUTE ACQ_CIRC_GEQ). Both
+// rings live in the one kext VAS every client's arena is switched into.
 void NVGspControl::publishSemVa() {
     Ring r{};
     setProperty("NVGspControl-gr-sem-va", grRing(&r) ? r.semVa : 0, 64);
@@ -2811,7 +3094,7 @@ void NVGspControl::thawLocked() {
     IOLockWakeup(lock_, &vramFrozen_, false);
 }
 
-// the display pipe's flip as physical copy-engine
+// 0.154.0 (native N4): the display pipe's flip as physical copy-engine
 // lines (surface pages in system RAM -> scan-out in VRAM) on the privileged
 // kernel copy channel, instead of a CPU memcpy of the whole frame. GR work
 // queued so far (the composite that drew the surface) finishes first.
@@ -2876,11 +3159,11 @@ bool NVGspControl::ceCopyLinesLocked(const nvgsp::EvictCopy *c, UInt32 n) {
 }
 
 bool NVGspControl::ceCopyBatchLocked(const nvgsp::EvictCopy *c, UInt32 n) {
-    // physical copies only on the privileged kernel channel
+    // 0.149.0: physical copies only on the privileged kernel channel
     Ring ring{};
     if (!kceRing(&ring)) return false;
     constexpr UInt32 kMax = 2 + nvgsp::kEvictBatchCopies * nvgsp::kCeCopyWords;
-    UInt32 *words = static_cast<UInt32 *>(IOMalloc(kMax * 4));   // keep it off the kernel stack
+    UInt32 *words = static_cast<UInt32 *>(IOMalloc(kMax * 4));   // off the kernel stack
     if (!words) return false;
     const UInt32 count = nvgsp::buildEvictBatch(c, n, words, kMax);
     UInt64 ns = 0;
@@ -2894,22 +3177,35 @@ void NVGspControl::freeSavedVramLocked() {
     vramSaved_ = false;
 }
 
-bool NVGspControl::saveVramLocked() {
-    constexpr UInt64 kSaveCap = 4ULL << 30;   // wired sysmem we took at sleep
+bool NVGspControl::saveVramLocked(bool needGr, bool clientOnly) {
+    constexpr UInt64 kSaveCap = 4ULL << 30;   // wired sysmem taken at sleep
     freeSavedVramLocked();
+    // 0.177.1: a reset keeps client objects only. The kext's own (arena page
+    // tables, the GR context pool, channel chunks) are rebuilt by the reset;
+    // putting the old ones back reloaded the faulted GR context after an RC
+    // reset and every following reset faulted again (type 13, 1 Oct 21:16).
+    auto take = [&](const GpuMem &m) { return m.owner && m.domain == 0 && (!clientOnly || m.client); };
     UInt64 total = 0;
     for (UInt32 i = 0; i < kMaxMem; ++i)
-        if (mem_[i].owner && mem_[i].domain == 0) total += mem_[i].bytes;
+        if (take(mem_[i])) total += mem_[i].bytes;
     vramSavedBytes_ = total;
     if (!total) return vramSaved_ = true;
-    if (total > kSaveCap || !drainEnginesLocked()) return false;
+    if (total > kSaveCap) return false;
+    // 0.176.0: before a reset GR may be the engine that died (RC); its unfinished
+    // writes are lost either way, so only the copy engine has to be idle
+    if (!drainEnginesLocked() && needGr) return false;
+    if (!needGr && cePersistent_ && ceChunk_ && ceSeq_) {
+        Ring ce{};
+        if (!ceRing(&ce) || !waitRingSem(ce, ceSeq_, 2000000)) return false;
+        ceOutstanding_ = 0;
+    }
     auto *batch = static_cast<nvgsp::EvictCopy *>(
         IOMalloc(nvgsp::kEvictBatchCopies * sizeof(nvgsp::EvictCopy)));
     bool ok = batch != nullptr;
     UInt32 n = 0;
     for (UInt32 i = 0; ok && i < kMaxMem; ++i) {
         GpuMem &m = mem_[i];
-        if (!m.owner || m.domain != 0) continue;
+        if (!take(m)) continue;
         const UInt32 chunks = nvgsp::evictChunks(m.bytes);
         m.saved = static_cast<IOBufferMemoryDescriptor **>(IOMalloc(chunks * sizeof(void *)));
         if (!m.saved) { ok = false; break; }
@@ -2943,7 +3239,7 @@ bool NVGspControl::saveVramLocked() {
     return ok;
 }
 
-bool NVGspControl::restoreVramLocked() {
+bool NVGspControl::restoreVramLocked(UInt32 *skipped) {
     if (!vramSaved_) return false;
     auto *batch = static_cast<nvgsp::EvictCopy *>(
         IOMalloc(nvgsp::kEvictBatchCopies * sizeof(nvgsp::EvictCopy)));
@@ -2953,7 +3249,13 @@ bool NVGspControl::restoreVramLocked() {
         const GpuMem &m = mem_[i];
         if (!m.owner || m.domain != 0) continue;
         const UInt32 chunks = nvgsp::evictChunks(m.bytes);
-        if (!m.saved || m.savedChunks != chunks) { ok = false; break; }   // no copy
+        if (!m.saved || m.savedChunks != chunks) {   // no copy
+            // 0.176.2: after a reset, objects allocated while the GPU came back have
+            // none and need none; S3 (skipped == nullptr) stays all-or-nothing
+            if (skipped) { ++*skipped; continue; }
+            ok = false;
+            break;
+        }
         for (UInt32 k = 0; ok && k < chunks; ++k) {
             IOByteCount len = 0;
             const UInt64 phys = m.saved[k]->getPhysicalSegment(0, &len, kIOMemoryMapperNone);
@@ -2971,7 +3273,7 @@ bool NVGspControl::restoreVramLocked() {
     return ok;
 }
 
-// VRAM oversubscription ------------------------------------------
+// 0.149.0: VRAM oversubscription ------------------------------------------
 // There is no per-submit buffer list, so "recently used" is tracked per
 // client (its last submission) and per object (its last alloc/bind). The
 // victim is the plain VRAM object of the least recently active other client;
@@ -3099,24 +3401,61 @@ bool NVGspControl::evictObjectLocked(UInt32 index) {
 
 void NVGspControl::releaseGpuMemLocked(UInt32 index) {
     if (index >= kMaxMem || !mem_[index].owner) return;
-    if (mem_[index].domain == 0) vramHeap_.remove(mem_[index].phys);
+    if (mem_[index].domain == 0) vramHeap_.remove(mem_[index].phys);   // 0.126.0
     releaseGpuMem(mem_[index]);
+}
+
+// 0.177.0: live clients by task, for memAdopt
+void NVGspControl::clientLive(const void *owner, task_t task, bool live) {
+    if (!lock_ || !owner) return;
+    lk(__LINE__);
+    for (UInt32 i = 0; i < 256; ++i) {
+        if (live && !liveClients_[i].owner) { liveClients_[i] = LiveClient{owner, task}; break; }
+        if (!live && liveClients_[i].owner == owner) { liveClients_[i] = LiveClient{}; break; }
+    }
+    ulk();
+}
+
+// 0.177.0: after a reset NVMTLDriver reopens and used to allocate new VRAM for
+// every object, then closed the old client, which freed the objects gpuReset
+// had just restored (WindowServer's layers came back black). The new client
+// takes the object over instead: same pages, contents kept. Only from a live
+// client of the same task, VRAM objects only.
+IOReturn NVGspControl::memAdopt(const void *owner, task_t task, UInt32 handle, UInt64 *physOut) {
+    if (!lock_ || !owner || !task || !handle || handle > kMaxMem || !physOut) return kIOReturnBadArgument;
+    lk(__LINE__);
+    waitThawLocked();
+    GpuMem &m = mem_[handle - 1];
+    bool ok = m.owner && m.owner != owner && m.domain == 0;
+    bool sameTask = false;
+    for (UInt32 i = 0; ok && i < 256 && !sameTask; ++i)
+        sameTask = liveClients_[i].owner == m.owner && liveClients_[i].task == task;
+    ok = ok && sameTask;
+    if (ok) {
+        m.owner = owner;
+        m.stamp = ++useClock_;
+        *physOut = m.phys;
+        ++adopted_;
+    }
+    ulk();
+    if (ok) setProperty("NVGspControl-mem-adopted", adopted_, 32);
+    return ok ? kIOReturnSuccess : kIOReturnNotPermitted;
 }
 
 IOReturn NVGspControl::memFree(const void *owner, UInt32 handle) {
     if (!lock_ || !handle || handle > kMaxMem) return kIOReturnBadArgument;
     lk(__LINE__);
-    waitThawLocked();
+    waitThawLocked();                                // 0.127.0
     GpuMem &m = mem_[handle - 1];
     const bool mine = m.owner && m.owner == owner;
     bool unbound = true;
     GpuMem dead{};
     if (mine) {
-        // never scan out memory that's about to be released
+        // 0.110.0: never scan out memory that is about to be released.
         if (presentOwner_ == owner && presentHandle_ == handle) presentStopLocked(owner);
-        // no GPU PTE may outlive the pages it points at
+        // 0.109.0: no GPU PTE may outlive the pages it points at.
         unbound = unbindObjectLocked(handle);
-        // the pages are unmapped and the TLB flushed; hand them back
+        // 0.147.0: the pages are unmapped and the TLB flushed; hand them back
         // to the kernel after dropping lock_ (freeing contiguous chunks and
         // descriptors under it was the other half of the long holds).
         if (m.domain == 0) vramHeap_.remove(m.phys);
@@ -3129,7 +3468,7 @@ IOReturn NVGspControl::memFree(const void *owner, UInt32 handle) {
     return unbound ? kIOReturnSuccess : kIOReturnIOError;
 }
 
-// host memory straight into the GPU VA (Metal/Vulkan zero-copy).
+// 0.134.0: host memory straight into the GPU VA (Metal/Vulkan zero-copy).
 // The pages stay wired until memFree / client close, and the PTEs go through
 // the arena's small page tables (SYS coherent aperture).
 IOReturn NVGspControl::userMemBind(const void *owner, task_t task, UInt64 uaddr, UInt64 bytes,
@@ -3166,11 +3505,15 @@ IOReturn NVGspControl::userMemBind(const void *owner, task_t task, UInt64 uaddr,
         md = nullptr;                                   // owned by the slot now
         ArenaBackend b{this, c};
         const UInt16 tag = static_cast<UInt16>(h + 1);
-        const bool bound = c->map.bindPages(b, va, n, phys, arenaPteFlags((flags & 0xff) | 0x100), tag);
+        const bool bound = c->map.bindPages(b, va, n, phys, arenaPteFlags((flags & 0x2ff) | 0x100), tag);
         const bool flushed = arenaFlushIfLiveLocked(c);
         if (bound && flushed) {
             *handleOut = h + 1;
             ret = kIOReturnSuccess;
+            if ((flags & 0x200) && !sysCachedUsed_) {             // 0.163.0
+                sysCachedUsed_ = true;
+                setProperty("NVGspControl-sysmem-cached", true);
+            }
         } else {
             unbindObjectLocked(h + 1);
             releaseGpuMemLocked(h);
@@ -3183,7 +3526,7 @@ IOReturn NVGspControl::userMemBind(const void *owner, task_t task, UInt64 uaddr,
     return ret;
 }
 
-// wait until the GR and CE rings reach what was submitted up to
+// 0.155.0: wait until the GR and CE rings reach what was submitted up to
 // now, WITHOUT holding lock_. 0.153.0 drained with lock_ held while a
 // client closed: every other process's submit and fence wait stalled behind
 // it for seconds, WindowServer froze at login and the GPU was reset.
@@ -3195,12 +3538,28 @@ void NVGspControl::waitSubmittedUnlocked(UInt32 timeoutUs) {
     if (grRing(&r)) { gr = true; grTarget = *r.seq; }
     if (ceRing(&r)) { ce = true; ceTarget = *r.seq; }
     ulk();
-    for (UInt32 waited = 0; (gr || ce) && waited < timeoutUs; waited += 100) {
+    // 0.166.0: the targets are the shared rings' ends, everyone's work, which
+    // under load (WindowServer + Safari's MPS CNN at login, 1 Oct 00:15) ran
+    // past the old flat 2 s: the arena went while the closing client's batch
+    // still ran, GR MMU fault at its staging, GPU reset. Now the wait goes on
+    // while the rings move and gives up after timeoutUs without progress
+    // (a real hang is the stall detector's job), at most kCloseWaitMaxUs.
+    constexpr UInt32 kCloseWaitMaxUs = 20000000;
+    UInt32 lastGr = 0, lastCe = 0, still = 0;
+    for (UInt32 waited = 0; (gr || ce) && still < timeoutUs && waited < kCloseWaitMaxUs; waited += 100) {
         lk(__LINE__);
         UInt32 v = 0;
-        if (gr && grRing(&r) && readRingSem(r, &v) && static_cast<SInt32>(v - grTarget) >= 0) gr = false;
-        if (ce && ceRing(&r) && readRingSem(r, &v) && static_cast<SInt32>(v - ceTarget) >= 0) ce = false;
+        bool moved = false;
+        if (gr && grRing(&r) && readRingSem(r, &v)) {
+            if (static_cast<SInt32>(v - grTarget) >= 0) gr = false;
+            moved |= v != lastGr; lastGr = v;
+        }
+        if (ce && ceRing(&r) && readRingSem(r, &v)) {
+            if (static_cast<SInt32>(v - ceTarget) >= 0) ce = false;
+            moved |= v != lastCe; lastCe = v;
+        }
         ulk();
+        still = moved ? 0 : still + 100;
         if (gr || ce) IODelay(100);
     }
     if (gr || ce) {
@@ -3214,17 +3573,17 @@ void NVGspControl::waitSubmittedUnlocked(UInt32 timeoutUs) {
 
 void NVGspControl::memFreeAll(const void *owner) {
     if (!lock_ || !owner) return;
-    waitSubmittedUnlocked(2000000);                  // before taking lock_ for the teardown
+    waitSubmittedUnlocked(3000000);                  // 0.155.0: before taking lock_; 0.166.0: 3 s without progress
     lk(__LINE__);
-    waitThawLocked();
-    presentStopLocked(owner);
+    waitThawLocked();                                // 0.127.0
+    presentStopLocked(owner);                        // 0.110.0
     for (UInt32 i = 0; i < kMaxMem; ++i)
         if (mem_[i].owner == owner) {
-            unbindObjectLocked(i + 1);               // (+ TLB flush)
+            unbindObjectLocked(i + 1);               // 0.109.0 (+ TLB flush)
             releaseGpuMemLocked(i);
         }
-    arenaReleaseLocked(owner);
-    // its state stays on the channel; a new client at the same
+    arenaReleaseLocked(owner);                       // 0.111.0
+    // 0.145.0: its state stays on the channel; a new client at the same
     // address must still see "someone else"
     if (lastGrOwner_ == owner) lastGrOwner_ = reinterpret_cast<const void *>(1);
     ulk();
@@ -3234,15 +3593,15 @@ IOReturn NVGspControl::vaBindObject(const void *owner, UInt32 handle, UInt64 va,
                                     UInt64 memOffset, UInt64 range) {
     if (!lock_ || !handle || handle > kMaxMem) return kIOReturnBadArgument;
     lk(__LINE__);
-    waitThawLocked();
+    waitThawLocked();                                // 0.127.0
     GpuMem &m = mem_[handle - 1];
-    bool ok = m.owner && m.owner == owner && m.domain != 3;  // user memory binds itself
-    if (ok) m.stamp = ++useClock_;
-    if (ok && !range) range = m.bytes - memOffset;           // partial binds
-    // 64 KiB granularity (was 2 MiB)
+    bool ok = m.owner && m.owner == owner && m.domain != 3;  // 0.134.0: user memory binds itself
+    if (ok) m.stamp = ++useClock_;                           // 0.149.0
+    if (ok && !range) range = m.bytes - memOffset;           // 0.108.0: partial binds
+    // 0.114.0: 64 KiB granularity (was 2 MiB)
     ok = ok && range && !((memOffset | range) & 0xffff) && memOffset < m.bytes &&
          range <= m.bytes - memOffset;
-    ArenaCtx *c = ok ? arenaForLocked(owner, true) : nullptr;   // its own arena
+    ArenaCtx *c = ok ? arenaForLocked(owner, true) : nullptr;   // 0.111.0: own arena
     if (ok && !c) {
         ulk();
         return kIOReturnNoResources;
@@ -3264,9 +3623,15 @@ IOReturn NVGspControl::vaBindObject(const void *owner, UInt32 handle, UInt64 va,
             o += len;
         }
     }
-    // pages written before a failure stay owned by the object, so memFree
-    // still clears them
+    // Pages written before a failure stay owned by the object, so memFree
+    // still clears them.
     const bool flushed = arenaFlushIfLiveLocked(c);
+    if (va == 0x2800000000ULL) {                     // 0.164.0: staging binds, for reset forensics
+        int slot = -1;
+        for (UInt32 i = 0; i < kMaxArenaCtx; ++i) if (arenaCtx_[i] == c) slot = static_cast<int>(i);
+        IOLog("NVGspControl: staging bind owner %p slot %d pid %d gen %u ok %d\n", owner, slot,
+              proc_selfpid(), resetGeneration(), ok ? 1 : 0);
+    }
     ulk();
     if (!ok) return kIOReturnBadArgument;
     return flushed ? kIOReturnSuccess : kIOReturnIOError;
@@ -3279,16 +3644,16 @@ IOMemoryDescriptor *NVGspControl::memUserDescriptor(const void *owner, UInt32 ha
     const GpuMem &m = mem_[handle - 1];
     IOMemoryDescriptor *d = (m.owner == owner && m.user) ? m.user : nullptr;
     if (d) d->retain();
-    if (isVram) *isVram = d && m.cpu;   // BAR1 range
+    if (isVram) *isVram = d && m.cpu;   // 0.123.0: BAR1 range
     ulk();
     return d;
 }
 
-// exec user pushbuffer segments by GPU VA (NVK nvkmd exec / IOAccel
+// 0.106.0: exec user pushbuffer segments by GPU VA (NVK nvkmd exec / IOAccel
 // command-queue submit): one GP entry per {va, dwords} segment, then the
 // kernel fence tail from our PB ring (semaphore release + non-stall intr).
 // Asynchronous; returns the fence sequence. engine 0 = GR, 1 = CE.
-// at most one boost request per second while clients submit; the
+// 0.135.0: at most one boost request per second while clients submit; the
 // 3 s duration lets GSP drop back to P8 shortly after the last submission.
 void NVGspControl::noteGpuBusy() {
     if (!boostCall_) return;
@@ -3331,34 +3696,64 @@ IOReturn NVGspControl::submitSegments(const void *owner, UInt32 engine, const UI
     for (UInt32 i = 0; i < n; ++i)
         if (!nvgsp::execSegmentValid(segVa[i], segDwords[i], segFlags[i]))
             return kIOReturnBadArgument;
-    // engine bit 8 = tail semaphore without RELEASE_WFI (diagnostic: shows
-    // whether the PBDMA fetched the GP entries even if the engine hangs).
-    // Video engines only, for a ring that never gets fetched: bit 9 = also
-    // ring the runlist INTERNAL_DOORBELL (runlist + 0x90 = chid, nouveau
-    // ga100_chan_start); bit 10 = set the channel's CHRAM ENABLE (write 0x2,
-    // ga100_chan_start) before the doorbell.
-    // The internal doorbell is what made NVDEC0/NVENC0/OFA0 actually run, so
-    // video rings always get it now.
+    // 0.122.0: engine bit 8 = tail semaphore without RELEASE_WFI (diagnostic:
+    // shows whether the PBDMA fetched the GP entries even if the engine hangs)
+    // 0.125.0, video engines only (experiments for a ring that is never
+    // fetched): bit 9 = also ring the runlist INTERNAL_DOORBELL (runlist +
+    // 0x90 = chid, nouveau ga100_chan_start); bit 10 = set the channel's
+    // CHRAM ENABLE (write 0x2, ga100_chan_start) before the doorbell.
+    // 0.129.0: the internal doorbell made NVDEC0/NVENC0/OFA0 execute live
+    // (0.128.0, flag 0x200), so video rings always get it now.
     const bool noWfi = engine & 0x100;
     const bool internalDoorbell = (engine & 0xff) >= 2 || (engine & 0x200);
     const bool chramEnable = engine & 0x400;
     engine &= 0xff;
     lk(__LINE__);
+    if (stampVa) {  // 0.174.0: native submissions bypass externalMethod's generation gate
+        auto *uc = OSDynamicCast(IOAccelNVGspUserClient,
+                                static_cast<OSObject *>(const_cast<void *>(owner)));
+        const IOReturn status = uc ? uc->generationStatus() : kIOReturnBadArgument;
+        if (status != kIOReturnSuccess) { ulk(); return status; }
+    }
+    if (!waitChannelMutationLocked()) { ulk(); return kIOReturnNotReady; }
     Ring ring{};
     bool have = false;
-    if (engine == 0) {
+    ClientChannel *own = engine == 0 ? clientChannelLocked(owner) : nullptr;   // 0.178.0
+    if (own) {
+        have = clientRingLocked(own, &ring);
+    } else if (engine == 0) {
         have = grRing(&ring);
     } else if (engine == 1) {
         have = ceRing(&ring);
     } else if (engine < 2 + nvgsp::kVideoEngineCount) {
-        have = videoRing(engine - 2, &ring);
+        have = videoRing(engine - 2, &ring);                 // 0.116.0
     }
-    // per-engine count of GP entries in flight
-    UInt32 &outstanding = engine == 0 ? asyncOutstanding_ : engine == 1 ? ceOutstanding_
-        : video_[have ? engine - 2 : 0].outstanding;
-    IOReturn ret = have ? arenaSwitchLocked(owner) : kIOReturnNotReady;
-    if (ret == kIOReturnSuccess && engine == 0) noteGrOwnerLocked(owner);
-    if (ret == kIOReturnSuccess) noteUseLocked(owner);
+    // 0.112.0: per-engine count of GP entries in flight
+    UInt32 &outstanding = own ? own->outstanding : engine == 0 ? asyncOutstanding_
+        : engine == 1 ? ceOutstanding_ : video_[have ? engine - 2 : 0].outstanding;
+    IOReturn ret = !have ? kIOReturnNotReady
+                         : own ? clientArenaLocked(own) : arenaSwitchLocked(owner);   // 0.111.0
+    if (own && ret == kIOReturnSuccess && !clientRingLocked(own, &ring)) ret = kIOReturnNotReady;
+    if (stampVa) {
+        // arenaSwitchLocked may wait for thaw with lock_ dropped. A reset
+        // during that wait invalidates both the client and the ring snapshot.
+        auto *uc = OSDynamicCast(IOAccelNVGspUserClient,
+                                static_cast<OSObject *>(const_cast<void *>(owner)));
+        const IOReturn status = uc ? uc->generationStatus() : kIOReturnBadArgument;
+        if (status != kIOReturnSuccess) ret = status;
+    }
+    if (ret == kIOReturnSuccess && engine == 0 && !own) noteGrOwnerLocked(owner);
+    if (ret == kIOReturnSuccess && own) {
+        ++cchanSubmits_;
+        setProperty("NVGspControl-cchan-submits", cchanSubmits_, 32);
+    }
+    // Never fall back to unordered GPU stamp releases when the CPU queue is
+    // full: a later channel could complete earlier work that is still running.
+    if (ret == kIOReturnSuccess && stampVa && engine == 0 && anyClientChannelLocked()) {
+        stampAdvanceLocked();
+        if (stampQTail_ - stampQHead_ >= kStampQ) ret = kIOReturnNoResources;
+    }
+    if (ret == kIOReturnSuccess) noteUseLocked(owner);   // 0.149.0
     if (ret == kIOReturnSuccess) {
         ret = kIOReturnIOError;
         if (*ring.pbOff + 64 > ring.pbBytes || outstanding + n > 384) {
@@ -3367,10 +3762,22 @@ IOReturn NVGspControl::submitSegments(const void *owner, UInt32 engine, const UI
         }
         if (*ring.pbOff + 64 > ring.pbBytes) *ring.pbOff = 0;
         const UInt32 seq = ++*ring.seq;
-        // optional IOAccel stamp release first, then
+        // 0.163.0: with GPU-cacheable system memory bound anywhere, a prologue
+        // (wait idle, invalidate the L2's clean sysmem lines: the CPU may have
+        // written them since) and SET_REFERENCE before the releases (makes the
+        // GPU's sysmem writes visible before the fence), the pre-Hopper
+        // sequence NVK uses for host access barriers. GR and CE rings only.
+        const bool coh = sysCachedUsed_ && engine <= 1;
+        const UInt32 pro[3] = {0x80000014U, 0x2001000dU, 0x70000000U};   // IMMD SET_REFERENCE; MEM_OP_D L2_SYSMEM_INVALIDATE
+        // 0.152.0: optional IOAccel stamp release first (native N1), then
         // the ring's own fence, then the non-stall interrupt
-        UInt32 tail[14], tw = 0;
-        if (stampVa) {
+        UInt32 tail[26], tw = 0;
+        if (coh) tail[tw++] = 0x80000014U;                                // IMMD SET_REFERENCE 0
+        // 0.178.12: with client channels the GR stamp is written by the CPU
+        // in submission order (stampAdvanceLocked), not by this channel's GPU
+        const bool cpuStamp = stampVa && engine == 0 && anyClientChannelLocked() &&
+                              stampQTail_ - stampQHead_ < kStampQ;
+        if (stampVa && !cpuStamp) {
             tail[tw++] = 0x20050017;
             tail[tw++] = static_cast<UInt32>(stampVa & 0xfffffffcULL);
             tail[tw++] = static_cast<UInt32>((stampVa >> 32) & 0xff);
@@ -3382,9 +3789,17 @@ IOReturn NVGspControl::submitSegments(const void *owner, UInt32 engine, const UI
             noWfi ? 0x00000001U : 0x00100001U, 0x20010008, 0};
         for (UInt32 i = 0; i < 8; ++i) tail[tw++] = fence[i];
         const UInt64 tailPhys = ring.pbPhys + *ring.pbOff, tailVa = ring.pbVa + *ring.pbOff;
+        // the prologue sits right after the tail in the same 256-byte slot
+        const UInt64 proPhys = tailPhys + UInt64(tw) * 4, proVa = tailVa + UInt64(tw) * 4;
         UInt32 put = 0, flush = 0;
-        bool ok = ringWrite(tailPhys, tail, tw) && ringRead(ring.userdPhys + 0x8c, &put);
+        bool ok = ringWrite(tailPhys, tail, tw) && (!coh || ringWrite(proPhys, pro, 3)) &&
+            ringRead(ring.userdPhys + 0x8c, &put);
         put &= 0x1ff;
+        if (ok && coh) {
+            const UInt32 entry[2] = {static_cast<UInt32>(proVa & 0xfffffffcULL), nvgsp::execEntryHigh(proVa, 3, 0)};
+            ok = ringWrite(ring.gpfifoPhys + put * 8, entry, 2);
+            put = (put + 1) & 0x1ff;
+        }
         for (UInt32 i = 0; ok && i <= n; ++i) {
             const UInt64 va = i < n ? segVa[i] : tailVa;
             const UInt32 len = i < n ? segDwords[i] : tw;
@@ -3393,7 +3808,7 @@ IOReturn NVGspControl::submitSegments(const void *owner, UInt32 engine, const UI
             ok = ringWrite(ring.gpfifoPhys + put * 8, entry, 2);
             put = (put + 1) & 0x1ff;
         }
-        // read PUT back before the doorbell, so every posted BAR1
+        // 0.151.0: read PUT back before the doorbell, so every posted BAR1
         // write (tail, entries, PUT) has reached VRAM when the host looks
         ok = ok && ringWrite(ring.userdPhys + 0x8c, &put, 1) &&
             ringRead(ring.userdPhys + 0x8c, &flush) && flush == put;
@@ -3411,33 +3826,31 @@ IOReturn NVGspControl::submitSegments(const void *owner, UInt32 engine, const UI
         }
         if (map) map->release();
         *ring.pbOff += 256;
-        outstanding += n + 1;
+        outstanding += n + (coh ? 2 : 1);
         *seqOut = seq;
+        if (cpuStamp && ret == kIOReturnSuccess) {
+            PendingStamp &q = stampQ_[stampQTail_++ % kStampQ];
+            q.value = stampValue;
+            q.seq = seq;
+            q.offset = static_cast<UInt32>(stampVa - (0x104000000ULL + kStampCtxOff));
+            q.slot = own ? static_cast<UInt16>(own - cchan_) : 0xffff;
+            q.serial = own ? own->serial : 0;
+            stampQueued_ = stampValue;
+        }
     }
     ulk();
     return ret;
 }
 
-// identity output LUT at scratch + 0xFF10000 (after the two
+// 0.140.0 (D3): identity output LUT at scratch + 0xFF10000 (after the two
 // cursor buffers), own ctxdma at RAMIN+0x20C0, RAMHT at both hash slots.
 IOReturn NVGspControl::olutSetup() {
     if (!dispInstOffset_ || !scratchOffset_) return kIOReturnNotReady;
-    const UInt64 surf = scratchOffset_ + 0xFF10000;
-    constexpr UInt32 kWords = (4 + 1025) * 2;
+    const UInt64 surf = scratchOffset_ + nvgsp::kOlutScratchDelta;
+    constexpr UInt32 kWords = nvgsp::kIdentityLutWords;
     UInt32 *lut = static_cast<UInt32 *>(IOMalloc(kWords * 4));
     if (!lut) return kIOReturnNoMemory;
-    bzero(lut, kWords * 4);
-    for (UInt32 i = 0; i < 1025; ++i) {
-        // FP16 of i/1024: exact for this range (10-bit mantissa).
-        UInt16 h = 0;
-        if (i) {
-            UInt32 e = 31 - __builtin_clz(i);          // i = 2^e * (1 + f)
-            const UInt32 mant = ((i << 10) >> e) & 0x3ff;
-            h = static_cast<UInt16>(((e + 15 - 10) << 10) | mant);
-        }
-        lut[(4 + i) * 2] = h | (UInt32(h) << 16);   // R | G << 16
-        lut[(4 + i) * 2 + 1] = h;                   // B, unused
-    }
+    nvgsp::buildIdentityDisplayLut(lut, kWords, false);
     IOReturn r = kIOReturnSuccess;
     for (UInt32 o = 0; o < kWords && r == kIOReturnSuccess; o += 1024) {
         const UInt32 n = kWords - o < 1024 ? kWords - o : 1024;
@@ -3458,12 +3871,22 @@ IOReturn NVGspControl::olutSetup() {
     return ok ? kIOReturnSuccess : kIOReturnIOError;
 }
 
-// the identity LUT from olutSetup for window 0 (chid 1): own
-// ctxdma object at RAMIN+0x20E0, RAMHT entries for chid 1 at the nouveau
-// slot (window ISO lives there) and at the hClient-hashed one.
+// Window input identity is FP16, while the head output identity is fixed-point.
+// Use a separate surface so programming one cannot overwrite the other.
 IOReturn NVGspControl::ilutSetup() {
     if (!dispInstOffset_ || !scratchOffset_) return kIOReturnNotReady;
-    const UInt64 surf = scratchOffset_ + 0xFF10000;
+    const UInt64 surf = scratchOffset_ + nvgsp::kIlutScratchDelta;
+    constexpr UInt32 kWords = nvgsp::kIdentityLutWords;
+    UInt32 *lut = static_cast<UInt32 *>(IOMalloc(kWords * 4));
+    if (!lut) return kIOReturnNoMemory;
+    nvgsp::buildIdentityDisplayLut(lut, kWords, true);
+    IOReturn r = kIOReturnSuccess;
+    for (UInt32 o = 0; o < kWords && r == kIOReturnSuccess; o += 1024) {
+        const UInt32 n = kWords - o < 1024 ? kWords - o : 1024;
+        r = vramAccess(surf + o * 4, lut + o, n, true);
+    }
+    IOFree(lut, kWords * 4);
+    if (r != kIOReturnSuccess) return r;
     constexpr UInt32 kChid = 1;
     UInt32 h = kIlutCtxdma, hash = 0;
     while (h) { hash ^= h & 0x3ff; h >>= 10; }
@@ -3485,7 +3908,7 @@ IOReturn NVGspControl::cursorSetup() {
         return kIOReturnNotReady;
     UInt8 reply[256];
     UInt32 replyBytes = sizeof(reply), result = ~0U;
-    // set_pushbuf(C67A, head 0, valid 0), then the PIO channel alloc
+    // set_pushbuf(C67A, head 0, valid 0) then the PIO channel alloc.
     nvgsp::NvDispChannelPushbufferParams pb{};
     pb.hclass = 0xc67a;
     pb.channelInstance = 0;
@@ -3510,7 +3933,7 @@ IOReturn NVGspControl::cursorSetup() {
     if (r == kIOReturnSuccess && replyBytes >= 100) __builtin_memcpy(&st, reply + 96, 4);
     setProperty("NVGspControl-cursor-alloc-status", st, 32);
     if (st != 0 && st != 0x56) return kIOReturnIOError;  // 0x56: already ours
-    // own tight ctxdma (RAMIN+0x20A0) over the two 16 KiB cursor
+    // 0.138.0: own tight ctxdma (RAMIN+0x20A0) over the two 16 KiB cursor
     // buffers, like NVIDIA's per-surface ctxdmas, instead of the window's
     // [0, 16 GiB) one; RAMHT entry at both the nouveau slot and NVIDIA's
     // (disp_inst_mem_0300.c also hashes hClient[7:0] << 2).
@@ -3544,73 +3967,82 @@ IOReturn NVGspControl::cursorImage(const UInt32 *argb64x64, UInt32 hotX, UInt32 
     if (r != kIOReturnSuccess) return r;
     const UInt32 control = 0x80000000U | ((hotY & 0xff) << 20) | ((hotX & 0xff) << 12) |
         (1U << 8) | 0xCF;   // ENABLE | hotspot | W64_H64 | A8R8G8B8
-    // The VBIOS leaves HEAD_SET_HEAD_USAGE_BOUNDS(0).CURSOR = NONE (ARMED
-    // 0x68A030 = 0x1110), and then the hardware rejects any cursor enable.
-    // Keep its other bits and allow W64_H64 (nvEvoSetUsageBoundsC5).
+    // Reserve at least64px while preserving any larger initialized capacity.
+    // Enabled cursor also requires the normal composition/ILUT/OLUT path;
+    // bounds alone did not resolve the bypass-path UPDATE rejection.
     UInt32 usage = 0x1110;
     {
         IOMemoryMap *m = sharedBar0Map(pci_);
-        if (m && m->getLength() >= 0x68A034) { Bar0Io b{m}; b.read(0x68A030, &usage); }
+        const bool ok = m && m->getLength() >= 0x68A034 && Bar0Io{m}.read(0x68A030, &usage);
         if (m) m->release();
+        if (!ok || (usage & 7U) > 4U) return kIOReturnIOError;
     }
+    const UInt32 capacity = (usage & 7U) < 2U ? 2U : usage & 7U;
+    usage = (usage & ~7U) | capacity;
+    const UInt32 relative = static_cast<UInt32>((surf - cursorBase_) >> 8);
+    UInt32 expected[] = {kCursorCtxdma,kCursorCtxdma,relative,relative,0,
+        cursorVisible_ ? control : (control & 0x7fffffffU),0x75ff};
     const UInt32 words[] = {
-        (1U << 18) | 0x2030, (usage & ~7U) | 2,          // HEAD_USAGE_BOUNDS cursor W64
+        (1U << 18) | 0x2030, usage,
         (1U << 18) | 0x2098, 0,                          // PRESENT_CONTROL_CURSOR mono
-        (1U << 18) | 0x2088, kCursorCtxdma,              // CONTEXT_DMA_CURSOR(0,0)
-        (1U << 18) | 0x2090, static_cast<UInt32>(surf >> 8), // OFFSET_CURSOR(0,0)
+        (2U << 18) | 0x2088, kCursorCtxdma, kCursorCtxdma, // both cursor DMA slots
+        // The cursor DMA object starts at cursorBase_; OFFSET is relative
+        // to that object, not an absolute VRAM address (NVIDIA SetCursorSurfaceAddress).
+        (2U << 18) | 0x2090, static_cast<UInt32>((surf - cursorBase_) >> 8),
+        static_cast<UInt32>((surf - cursorBase_) >> 8),   // both cursor offsets
         (1U << 18) | 0x209C, cursorVisible_ ? control : (control & 0x7fffffffU),
         (1U << 18) | 0x20A0, 0x75FF,                     // non-premultiplied alpha
         (2U << 18) | 0x218, 0, 0,                        // no interlocks
         (1U << 18) | 0x200, 1,                           // UPDATE, RELEASE_ELV
     };
-    cursorControl_ = control;
     r = submitCore(words, sizeof(words) / 4);
-    if (r == kIOReturnSuccess) cursorBuf_ = next;
-    // a rejected UPDATE leaves an FE exception pending; ack it and
-    // report failure so NVDisplay falls back to the software cursor.
+    if (r == kIOReturnSuccess) r = waitCursorArmed(usage, expected);
     if (r == kIOReturnSuccess) {
-        IODelay(2000);
-        if (coreException()) {
-            // The rejected enable stays in ASSY and every later core UPDATE
-            // re-validates it (27 Sep: plain UPDATEs kept faulting), so put
-            // the cursor back to disabled before giving up.
-            const UInt32 off[] = {(1U << 18) | 0x209C, control & 0x7fffffffU,
-                                  (2U << 18) | 0x218, 0, 0, (1U << 18) | 0x200, 1};
-            submitCore(off, sizeof(off) / 4);
-            IODelay(2000);
-            coreException();
-            cursorVisible_ = false;
-            r = kIOReturnIOError;
-        }
+        cursorControl_ = control;
+        cursorBuf_ = next;
+    } else {
+        // Restore a disabled image at the same capacity; never shrink live
+        // cursor resources on this failure path. Report cleanup separately.
+        expected[5] = control & 0x7fffffffU;
+        const UInt32 off[] = {(1U << 18) | 0x209C, expected[5],
+                              (2U << 18) | 0x218, 0, 0, (1U << 18) | 0x200, 1};
+        IOReturn cleanup = submitCore(off, sizeof(off) / 4);
+        if (cleanup == kIOReturnSuccess) cleanup = waitCursorArmed(usage, expected);
+        setProperty("NVGspControl-cursor-failure-disable-result", static_cast<UInt32>(cleanup), 32);
+        cursorVisible_ = false;
+        cursorControl_ = 0; // another image must ARM before show is usable
     }
     return r;
 }
 
 IOReturn NVGspControl::cursorShow(bool visible) {
-    if (!cursorReady_) return kIOReturnNotReady;
-    cursorVisible_ = visible;
+    if (!cursorReady_ || !cursorControl_) return kIOReturnNotReady;
+    UInt32 usage = 0, expected[7] = {};
+    if (peekBar0(0x68a030, 1, &usage) != kIOReturnSuccess ||
+        peekBar0(0x68a088, 7, expected) != kIOReturnSuccess) return kIOReturnIOError;
+    expected[5] = visible ? cursorControl_ : (cursorControl_ & 0x7fffffffU);
     const UInt32 words[] = {
         (1U << 18) | 0x209C, visible ? cursorControl_ : (cursorControl_ & 0x7fffffffU),
         (2U << 18) | 0x218, 0, 0,
         (1U << 18) | 0x200, 1,
     };
     IOReturn r = submitCore(words, sizeof(words) / 4);
-    if (r == kIOReturnSuccess) {
-        IODelay(2000);
-        if (coreException()) {
-            const UInt32 off[] = {(1U << 18) | 0x209C, cursorControl_ & 0x7fffffffU,
-                                  (2U << 18) | 0x218, 0, 0, (1U << 18) | 0x200, 1};
-            submitCore(off, sizeof(off) / 4);
-            IODelay(2000);
-            coreException();
-            cursorVisible_ = false;
-            r = kIOReturnIOError;
-        }
+    if (r == kIOReturnSuccess) r = waitCursorArmed(usage, expected);
+    if (r == kIOReturnSuccess) cursorVisible_ = visible;
+    else {
+        expected[5] = cursorControl_ & 0x7fffffffU;
+        const UInt32 off[] = {(1U << 18) | 0x209C, expected[5],
+                              (2U << 18) | 0x218, 0, 0, (1U << 18) | 0x200, 1};
+        IOReturn cleanup = submitCore(off, sizeof(off) / 4);
+        if (cleanup == kIOReturnSuccess) cleanup = waitCursorArmed(usage, expected);
+        setProperty("NVGspControl-cursor-failure-disable-result", static_cast<UInt32>(cleanup), 32);
+        cursorVisible_ = false;
+        cursorControl_ = 0; // require another verified image after a failed transition
     }
     return r;
 }
 
-// Cursor bring-up without NVDisplay. op 0 = setup only, 1 = 64x64
+// 0.138.0: D2 bring-up without NVDisplay. op 0 = setup only, 1 = 64x64
 // test image (red frame, translucent blue inside) + show at 64,64, 2 = hide.
 IOReturn NVGspControl::cursorTest(UInt32 op) {
     if (op == 2) return cursorShow(false);
@@ -3631,7 +4063,7 @@ IOReturn NVGspControl::cursorTest(UInt32 op) {
 
 IOReturn NVGspControl::cursorMove(SInt32 x, SInt32 y) {
     // Cursor PIO (user area 0x6D8000 + head*0x1000): hot-spot point out, then
-    // UPDATE (nvkms MoveCursorC3). Free (0x008) has to be non-zero.
+    // UPDATE (nvkms MoveCursorC3). Free (0x008) must be non-zero.
     if (!cursorReady_ || !pci_) return kIOReturnNotReady;
     IOMemoryMap *map = sharedBar0Map(pci_);
     if (!map || map->getLength() < 0x6D9000) { if (map) map->release(); return kIOReturnNoMemory; }
@@ -3644,10 +4076,10 @@ IOReturn NVGspControl::cursorMove(SInt32 x, SInt32 y) {
     return kIOReturnSuccess;
 }
 
-// reads out the GSP LibOS log buffers (LOGINIT 0, LOGINTR 1, LOGRM 2,
-// LOGMNOC 3, LOGKRNL 4; 64 KiB each) so the host can decode them
+// 0.87.0: GSP LibOS log buffer read-out (LOGINIT 0, LOGINTR 1, LOGRM 2,
+// LOGMNOC 3, LOGKRNL 4; 64 KiB each) for host-side decoding.
 IOReturn NVGspControl::readGspLog(UInt32 index, UInt32 offset, UInt8 *out, UInt32 bytes) {
-    // index 8 = shared queue memory (516 KiB: PTEs, cmd, status)
+    // 0.99.2: index 8 = shared queue memory (516 KiB: PTEs, cmd, status).
     if (index == 8) {
         if (!lock_ || !out || !bytes || bytes > 4096 || offset + bytes > nvgsp::kGspSharedBytes)
             return kIOReturnBadArgument;
@@ -3668,8 +4100,8 @@ IOReturn NVGspControl::readGspLog(UInt32 index, UInt32 offset, UInt8 *out, UInt3
     return ok ? kIOReturnSuccess : kIOReturnNotReady;
 }
 
-// DPMS for the DP sink, the way nvkms does it through DPLib
-// (nvDPDeviceSetPowerState): DPCD 0x600 SET_POWER = 1 / 2, one
+// 0.88.0: DPMS for the DP sink the way nvkms does it through DPLib
+// (nvDPDeviceSetPowerState): DPCD 0x600 SET_POWER = 1 (D0) / 2 (D3), one
 // native AUX write via NV0073_CTRL_CMD_DP_AUXCH_CTRL on display 0x200.
 IOReturn NVGspControl::dpSetPower(bool on) {
     UInt8 ctrl[24 + 48]{};
@@ -3685,9 +4117,8 @@ IOReturn NVGspControl::dpSetPower(bool on) {
     UInt8 reply[256];
     UInt32 replyBytes = sizeof(reply), result = ~0U;
     IOReturn r = kIOReturnError;
-    // A sink coming out of D3 can DEFER/NACK the first AUX transactions (DP
-    // allows up to 1 ms wake plus retries), so 10 attempts, 10 ms apart,
-    // with diagnostics.
+    // 0.100.10: a sink leaving D3 may DEFER/NACK the first AUX transactions
+    // (DP: up to 1 ms wake + retries); 10 attempts, 10 ms apart, with diag.
     UInt32 lastKr = 0, lastSt = ~0U, lastRep = ~0U, attempts = 0;
     for (UInt32 attempt = 0; attempt < 10; ++attempt) {
         ++attempts;
@@ -3714,9 +4145,9 @@ IOReturn NVGspControl::dpSetPower(bool on) {
     return r;
 }
 
-// NV04_DISPLAY_COMMON control helper: same header as the modeset3.py ctl()
-// ({client, display-common, cmd, 0, paramBytes, 0} + params), same status
-// pickup (reply+92) and optional params echo (reply+104).
+// 0.93.0: NV04_DISPLAY_COMMON control helper — the modeset3.py ctl() header
+// ({client, display-common, cmd, 0, paramBytes, 0} + params) with the same
+// status extraction (reply+92) and optional params echo (reply+104).
 UInt32 NVGspControl::displayCtrl(UInt32 cmd, const UInt8 *params, UInt32 paramBytes,
                                  UInt8 *echoOut, UInt32 echoBytes) {
     if (!params || !paramBytes || paramBytes > 256) return ~0U;
@@ -3741,9 +4172,9 @@ UInt32 NVGspControl::displayCtrl(UInt32 cmd, const UInt8 *params, UInt32 paramBy
 }
 
 namespace {
-// head-0 method offsets we snapshot for a modeset: clc77d.h idx/idx2
-// methods in 0x2000-0x2400, filtered on live hardware (the key set from a
-// good modeset3 run, 133 entries)
+// 0.93.0: valid head-0 method offsets for the modeset snapshot — clc77d.h
+// idx/idx2 methods in 0x2000-0x2400, live-filtered (the good_head.json key
+// set from the passing 17:18 modeset3 run; 133 entries).
 constexpr UInt32 kHeadAddrs[] = {
     0x2000, 0x2004, 0x2008, 0x200c, 0x2010, 0x2014, 0x2018, 0x201c,
     0x2020, 0x2024, 0x2028, 0x202c, 0x2030, 0x2034, 0x2044, 0x2048,
@@ -3765,13 +4196,13 @@ constexpr UInt32 kHeadAddrs[] = {
 };
 }  // namespace
 
-// Full modeset on head 0, driven by the driver, in nouveau order
+// 0.93.0: full driver-driven modeset cycle on head 0 in nouveau order
 // (SET_MANUAL_DP, detach, DP release, ASSIGN_SOR, sink D0, train,
-// CONFIG_STREAM, attach). Byte for byte what the working modeset3.py run sends.
-// It reads the live ARMED head state (BAR0 0x688000 window) rather than a baked
-// snapshot, and never holds lock_ itself, every step locks on its own.
-// Also here: NVC372_CTRL_CMD_IS_MODE_POSSIBLE for head 0 (4000x2222 raster,
-// 533.25 MHz, window 0 fmt 0x197, no cursor), values taken from the live IMP
+// CONFIG_STREAM, attach), byte-identical to the passing modeset3.py run.
+// Reads the live ARMED head state (BAR0 0x688000 window) instead of a baked
+// snapshot. Never holds lock_ itself; every step locks internally.
+// 0.99.5: NVC372_CTRL_CMD_IS_MODE_POSSIBLE for head 0 (4000x2222 raster,
+// 533.25 MHz, window 0 fmt 0x197, cursor none) — values from the live IMP
 // generator (NVIDIA ctrlc372chnc.h layout, 2048 B). Returns status<<8|possible.
 UInt32 NVGspControl::impCheckHead0() {
     static const UInt32 kImp[][2] = {
@@ -3794,7 +4225,7 @@ UInt32 NVGspControl::impCheckHead0() {
         const UInt32 hdr[6] = {0xc0d00001, 0xc0d0c372, 0xc3720101, 0, kParams, 0};
         __builtin_memcpy(buf, hdr, sizeof(hdr));
         for (const auto &kv : kImp) __builtin_memcpy(buf + 24 + kv[0], &kv[1], 4);
-        // the chosen mode's raster, not the firmware 4K60 one.
+        // 0.137.1 (D4): the chosen mode's raster, not the firmware 4K60 one.
         if (mode_.valid) {
             const UInt32 hv[7] = {mode_.pclkHz / 1000, mode_.rasterSize & 0xffff,
                                   mode_.rasterSize >> 16, mode_.blankStart & 0xffff,
@@ -3819,7 +4250,7 @@ UInt32 NVGspControl::impCheckHead0() {
     return ret;
 }
 
-// EDID timing -> C77D head methods, the same way nvkms builds
+// 0.137.0 (D4): EDID timing -> C77D head methods, the same way nvkms builds
 // them (nvkms-evo3.c EvoSetRasterParams3, nvComputeMinFrameIdle) plus the
 // SST blank symbols from dp_watermark.cpp for 4 lanes HBR2 at 30 bpp.
 IOReturn NVGspControl::setMode(const UInt32 t[10], UInt32 *statusOut) {
@@ -3899,7 +4330,7 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
     UInt32 *vals = static_cast<UInt32 *>(IOMalloc(kHeads * 4));
     if (!vals) return kIOReturnNoMemory;
     UInt32 code = 0;
-    // 1. snapshot the live ARMED head state and SOR0
+    // 1. snapshot live ARMED head state + SOR0.
     UInt32 sor = 0, head0 = 0, attachSor = 0x901;
     bool usedCache = false;
     {
@@ -3916,12 +4347,10 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
     }
     setProperty("NVGspControl-modeset-sor", sor, 32);
     setProperty("NVGspControl-modeset-head0", head0, 32);
-    // Attach target: the snapshot's SOR if head 0 was lit, otherwise
-    // 0x901 (same restore rule as modeset3, never attach again to a
-    // detached 0x900).
+    // Attach target: the snapshot SOR when head 0 was lit, else 0x901
+    // (modeset3 restore rule — never re-attach to a detached 0x900).
     if (sor == 0x901 && head0 == 0x200) attachSor = sor;
-    // cache the lit state so we can reuse it after S3 (engine comes back at reset
-    // defaults)
+    // 0.99.4: cache the lit state; after S3 (engine at reset defaults) re-use it.
     if (sor == 0x901 && head0 == 0x200) {
         UInt32 v[8] = {};
         if (peekBar0(0x00ef00, 8, v) == kIOReturnSuccess && v[1] != 0x00412001) {
@@ -3938,8 +4367,8 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
         __builtin_memcpy(vals, headCache_, kHeads * 4);
         usedCache = true;
         setProperty("NVGspControl-modeset-used-cache", true);
-        // VPLL0 at reset? program it again from the VBIOS values (nouveau
-        // ga100_devinit_pll_set order: config, fN, P/N/M, update)
+        // 0.100.2: re-program VPLL0 from the VBIOS values if it is at reset
+        // (nouveau ga100_devinit_pll_set order: config, fN, P/N/M, update).
         UInt32 cur = 0;
         if (vpllCacheValid_ && peekBar0(0x00ef04, 1, &cur) == kIOReturnSuccess &&
             cur != vpllCache_[1]) {
@@ -3965,10 +4394,10 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
         }
     }
     setProperty("NVGspControl-modeset-vpll-cache-valid", vpllCacheValid_);
-    // At boot the VBIOS/GOP is already scanning out this exact mode, the
-    // caches got filled above, so no detach and no retrain (no flash). Lit =
-    // head0 AWAKE + SOR owned. DP lanes can be down while the framebuffer's
-    // early doze keeps the sink in D3, that alone is no reason to modeset.
+    // 0.100.7/0.100.9: boot: the VBIOS/GOP already scans out this exact mode —
+    // the caches are captured above; never detach/retrain (no flash). Lit =
+    // head0 AWAKE + SOR owned (DP lanes may be down while the framebuffer's
+    // early doze has the sink in D3 — that is not a reason to modeset).
     if (lightIfLit) {
         const bool lit = sor == 0x901 && head0 == 0x200;
         setProperty("NVGspControl-modeset-light", lit);
@@ -3976,7 +4405,7 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
         goto done;
     }
     setProperty("NVGspControl-modeset-cache-valid", headCacheValid_);
-    // a chosen mode replaces the snapshot's timing methods.
+    // 0.137.0 (D4): a chosen mode replaces the snapshot's timing methods.
     if (mode_.valid) {
         for (UInt32 i = 0; i < kHeads; ++i) {
             switch (kHeadAddrs[i]) {
@@ -3988,23 +4417,36 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
             case 0x206c: vals[i] = mode_.blankEnd; break;
             case 0x2070: vals[i] = mode_.blankStart; break;
             case 0x2218: vals[i] = mode_.minFrameIdle; break;
-            // OLUT the nvkms way (EvoSetOutputLutC5): DIRECT10 +
-            // interpolate, 4 VSS header + 1025 FP16 entries, norm 1.0,
+            // 0.140.0: OLUT the nvkms way (EvoSetOutputLutC5): DIRECT10 +
+            // interpolate, 4 VSS header + 1025 fixed-point entries, norm 1.0,
             // OCSC0 identity enabled after the LUT.
-            case 0x2280: if (mode_.olut) vals[i] = 0x40509; break;
+            // 0.165.0: interpolation off, as Linux's head 0 (0x40508)
+            case 0x2280: if (mode_.olut) vals[i] = 0x40508; break;
             case 0x2284: if (mode_.olut) vals[i] = 0xffffffff; break;
             case 0x2288: if (mode_.olut) vals[i] = kOlutCtxdma; break;
             case 0x228c: if (mode_.olut) vals[i] = 0; break;
             case 0x2240: if (mode_.olut) vals[i] = 1; break;
+            // nvCscCoefConvertS514 encodes 1.0 as 0x10000 (S5.14
+            // shifted by two register bits). Replace the entire 3x4
+            // matrix: snapshot coefficients may include gamut/offset terms.
             case 0x2244: case 0x2258: case 0x226c: if (mode_.olut) vals[i] = 0x10000; break;
+            case 0x2248: case 0x224c: case 0x2250: case 0x2254:
+            case 0x225c: case 0x2260: case 0x2264: case 0x2268:
+            case 0x2270: if (mode_.olut) vals[i] = 0; break;
             case 0x2030:   // HEAD_USAGE_BOUNDS.CURSOR
                 if (mode_.cursor64) vals[i] = (vals[i] & ~7U) | 2;
+                // 0.165.0: OLUT_ALLOWED (bit 4, clc67d.h). The OLUT test in
+                // 0.141.1 never set it and the head refused the LUT (Xid 56,
+                // check 0x2e); the head's usage bounds must allow what its
+                // state uses.
+                // Linux head 0: 0x1110 = OLUT_ALLOWED, UPSCALING_ALLOWED, TAPS_2
+                if (mode_.olut) vals[i] |= (1U << 4) | (1U << 8) | (1U << 12);
                 break;
             default: break;
             }
         }
     }
-    // never start tearing the head down on a busy core. A pending
+    // 0.138.2: never start tearing the head down on a busy core. A pending
     // core UPDATE (state 0x0c at 0x610630; idle is 0x0b, nouveau
     // gv100_disp_core_idle) made the detach land and the SOR assign fail,
     // which left the screen black (27 Sep). Try to release it first.
@@ -4031,7 +4473,7 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
         setProperty("NVGspControl-modeset-manual", st, 32);
         if (st) { code = 0x02000000 | st; goto done; }
     }
-    // 3. detach the SOR (owner none), then UPDATE
+    // 3. detach the SOR (owner none) + UPDATE.
     {
         const UInt32 w[] = {(1U << 18) | 0x300, sor & ~0xfU,
                             (2U << 18) | 0x218, 0, 0,
@@ -4041,7 +4483,7 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
         if (r != kIOReturnSuccess) { code = 0x03000000 | static_cast<UInt32>(r); goto done; }
     }
     IOSleep(500);
-    // 4. release the DP link (cmd 0x2003, data 0x0600 = RBR, 0 lanes)
+    // 4. DP link release (cmd 0x2003, data 0x0600 = RBR, lanes 0).
     {
         UInt8 p[28] = {};
         const UInt32 d = 0x200, c = 0x2003, dt = 0x0600;
@@ -4052,7 +4494,7 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
         setProperty("NVGspControl-modeset-release", st, 32);
         if (st) { code = 0x04000000 | st; goto done; }
     }
-    // 5. give display 0x200 to SOR0
+    // 5. assign display 0x200 to SOR0.
     {
         UInt8 p[80] = {};
         const UInt32 d = 0x200;
@@ -4061,13 +4503,12 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
         setProperty("NVGspControl-modeset-assign", st, 32);
         if (st) { code = 0x05000000 | st; goto done; }
     }
-    // 6. sink to D0 (DPCD 0x600 = 1, same AUX write as DPMS on)
+    // 6. sink D0 (DPCD 0x600 = 1, same AUX write as DPMS-on).
     {
         const IOReturn r = dpSetPower(true);
         if (r != kIOReturnSuccess) { code = 0x06000000 | static_cast<UInt32>(r); goto done; }
     }
-    // 7. link training (cmd 0x2083, data 0x1404 = 4 lanes HBR2), max 3
-    // tries
+    // 7. train (cmd 0x2083, data 0x1404 = 4 lanes HBR2), up to 3 tries.
     {
         UInt32 st = ~0U;
         for (UInt32 t = 0; t < 3; ++t) {
@@ -4088,11 +4529,10 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
         }
     }
     // 8. SST stream config (dpLink 1, override 1, hblank 134, vblank 3835,
-    // enhanced framing 1, TU 64, watermark 20, watermark values same as
-    // nouveau)
+    // enhanced framing 1, TU 64, watermark 20 — nouveau watermark values).
     {
         UInt8 p[84] = {};
-        // hblank/vblank symbols follow the mode (dp_watermark.cpp
+        // 0.137.0: hblank/vblank symbols follow the mode (dp_watermark.cpp
         // SST, HBR2); TU 64 / watermark 20 hold for every mode up to 4K60.
         const UInt32 one = 1, tu = 64, wm = 20;
         const UInt32 hb = mode_.valid ? mode_.hBlankSym : 134;
@@ -4108,7 +4548,7 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
         setProperty("NVGspControl-modeset-stream", st, 32);
         if (st) { code = 0x08000000 | st; goto done; }
     }
-    // GSP-RM here does not retune the head's VPLL during the
+    // 0.137.2 (D4): GSP-RM here does not retune the head's VPLL during the
     // supervisor (216 Hz at 1080p on the 4K clock), so program VPLL0 like
     // the VBIOS does. Decoded from the VBIOS state and the Linux captures:
     // VCO = 27 MHz * (N + (fN + 4096) / 8192) / M, pclk = VCO / P, with
@@ -4142,17 +4582,20 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
         }
         if (vmap) vmap->release();
     }
-    // post-S3 (cached state): IMP first - cold boot inherits the
+    // 0.99.5: post-S3 (cached state): IMP first — cold boot inherits the
     // VBIOS-validated config, a fresh engine does not.
-    // a new mode goes through IMP as well (nvkms validates every
+    // 0.137.1: a new mode goes through IMP as well (nvkms validates every
     // modeset with IS_MODE_POSSIBLE before the core UPDATE).
     if (usedCache || mode_.valid) setProperty("NVGspControl-modeset-imp", impCheckHead0(), 32);
     // 9. attach: SOR + all head methods + no interlocks + UPDATE, chunked
     // (submitCore takes <= 256 words per call; the PB stream continues).
-    // post-S3 also window 0 owner head 0 + VBIOS usage bounds
+    // 0.99.5: post-S3 also window 0 owner head 0 + VBIOS usage bounds
     // (WINDOW_SET_CONTROL(0) is 0xF/NONE on a reset engine ⇒ head SNOOZE).
     {
-        const UInt32 extra = usedCache ? 4 : 0;
+        // 0.165.0: a LUT mode also writes window 0's usage bounds (Linux:
+        // ILUT_ALLOWED, TAPS_2, TMO_LUT_ALLOWED; captures disp-4k60.json)
+        const bool lutBounds = !usedCache && mode_.valid && (mode_.olut || mode_.composite);
+        const UInt32 extra = usedCache || lutBounds ? 4 : 0;
         const UInt32 total = 2 + kHeads * 2 + extra + 5;
         UInt32 *w = static_cast<UInt32 *>(IOMalloc(total * 4));
         if (!w) { code = 0x09000001; goto done; }
@@ -4162,15 +4605,15 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
             w[2 + i * 2] = (1U << 18) | (kHeadAddrs[i] & 0x3ffc);
             w[3 + i * 2] = vals[i];
         }
-        if (usedCache) {
+        if (usedCache || lutBounds) {
             w[2 + kHeads * 2] = (1U << 18) | 0x1000;   // WINDOW_SET_CONTROL(0)
             w[3 + kHeads * 2] = 0;                     // OWNER HEAD0
             w[4 + kHeads * 2] = (1U << 18) | 0x1010;   // WINDOW_SET_WINDOW_USAGE_BOUNDS(0)
-            w[5 + kHeads * 2] = 0x110f00;              // VBIOS value
+            w[5 + kHeads * 2] = lutBounds ? 0x10110f00 : 0x110f00;   // VBIOS value (+ TMO_LUT_ALLOWED)
         }
         w[total - 5] = (2U << 18) | 0x218;
         w[total - 4] = 0;
-        w[total - 3] = mode_.valid ? 1 : 0;   // interlock window 0
+        w[total - 3] = mode_.valid ? 1 : 0;   // 0.137.0: interlock window 0
         if (mode_.valid) {
             lk(__LINE__);
             presentOwner_ = nullptr;
@@ -4192,7 +4635,7 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
         if (r != kIOReturnSuccess) { code = 0x09000000 | static_cast<UInt32>(r); goto done; }
     }
     IOSleep(1000);
-    // don't leave window 0 interlocked with the core once the
+    // 0.138.0: don't leave window 0 interlocked with the core once the
     // mode's paired update has landed (later core UPDATEs would stall).
     if (mode_.valid) setProperty("NVGspControl-modeset-unlock", static_cast<UInt32>(coreUnstick()), 32);
     // 10. verify arming.
@@ -4205,7 +4648,7 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
         peekBar0(0x61c168, 1, &dpcfg);
         setProperty("NVGspControl-modeset-sor-dpcfg", dpcfg, 32);
     }
-    // after S3, present window 0 again (GOP/desktop surface at VRAM 0)
+    // 0.99.5: post-S3, re-present window 0 (GOP/desktop surface at VRAM 0).
     if (usedCache) setProperty("NVGspControl-modeset-flip",
                                static_cast<UInt32>(flipWindow(0, true)), 32);
     if (head0 != 0x200 || sor != attachSor) code = 0x0A000000 | (head0 & 0xffffff);
@@ -4216,12 +4659,12 @@ done:
     return code == 0 ? kIOReturnSuccess : kIOReturnIOError;
 }
 
-// S3 sleep/wake interest. WillSleep does the quiesce and gets acked (XNU
-// sends it through tellClientsWithResponse). CanSystemSleep is acked
-// without doing anything, we never veto. HasPoweredOn is one-way
-// (tellClients) so do NOT ack it, its messageArgument isn't a refcon. On
-// wake we restore PCI bus master and clear sleeping_, so the daemon's 5 s
-// drain sees phase 0 and boots the chain again.
+// 0.96.0: S3 sleep/wake interest. WillSleep quiesces and is acked (XNU
+// delivers it via tellClientsWithResponse); CanSystemSleep is acked with no
+// work (always sleepable, never veto); HasPoweredOn is one-way
+// (tellClients) so it must NOT be acked — its messageArgument is not a
+// refcon. Wake restores PCI bus master and clears sleeping_ so the
+// daemon's 5 s drain sees phase 0 and re-boots the chain.
 IOReturn NVGspControl::sleepWakeHandler(void *target, void *, UInt32 messageType,
                                         IOService *, void *messageArgument, vm_size_t) {
     auto *self = static_cast<NVGspControl *>(target);
@@ -4234,7 +4677,7 @@ IOReturn NVGspControl::sleepWakeHandler(void *target, void *, UInt32 messageType
     } else if (messageType == kIOMessageSystemHasPoweredOn) {
         if (self->pci_ && (self->pci_->configRead16(kIOPCIConfigCommand) & 4) == 0)
             self->pci_->setBusMasterEnable(true);
-        // on wake IOPCIFamily puts back its own 256 MiB BAR setup
+        // 0.130.0: IOPCIFamily restored its own (256 MiB) BAR setup on wake
         if (self->rebar_.active) {
             IOService *p = self->pci_ ? self->pci_->getProvider() : nullptr;
             IOPCIDevice *br = OSDynamicCast(IOPCIDevice, p ? p->getProvider() : nullptr);
@@ -4252,15 +4695,15 @@ IOReturn NVGspControl::sleepWakeHandler(void *target, void *, UInt32 messageType
     return kIOReturnSuccess;
 }
 
-// Pre-sleep quiesce, kept small: staging, queues and MSI stay resident so
-// the fast wake path can light the screen again in seconds (S3 keeps DRAM).
-// Sink off first (that's NVIDIA's suspend order), then the sleeping_ fence
-// so userRpc/ping fail fast till resume is done. The old full teardown now
-// only lives in resumeFromSleep's slow path (GSP dead).
-// SR is the default S3 path; NVRAM nvgsp-sr=0 (or "off") turns it off and
-// falls back to a cold boot of the chain.
-// Also: NVRAM nvgsp-registry -> packed SET_REGISTRY table. Returns false
-// (send the empty table) when it's unset, empty or too broken to fix.
+// 0.98.0: pre-sleep quiesce (minimal — staging/queues/MSI stay resident so
+// the wake fast path can re-light in seconds; S3 preserves DRAM). Sink off
+// first (NVIDIA suspend order), then the sleeping_ fence (userRpc/ping fail
+// fast until resume completes). The 0.96 full teardown survives only as the
+// slow path inside resumeFromSleep (dead GSP).
+// 0.100.8: SR is the default S3 path (proven 23:23); NVRAM nvgsp-sr=0 (or
+// "off") disables it and falls back to the cold re-boot path.
+// 0.113.0: NVRAM nvgsp-registry -> packed SET_REGISTRY table. False (send
+// the empty table) when unset, empty or malformed beyond repair.
 static bool registryFromNvram(UInt8 *out, UInt32 cap, UInt32 *bytes, UInt32 *entries) {
     IORegistryEntry *options = IORegistryEntry::fromPath("/options", gIODTPlane);
     if (!options) return false;
@@ -4302,7 +4745,7 @@ static bool srEnabledByNvram() {
 void NVGspControl::quiesceForSleep() {
     if (!lock_ || !pci_) return;
     const bool sr = srEnabledByNvram();
-    // clients wait from here until wake; with SR, save the kext-heap
+    // 0.127.0: clients wait from here until wake; with SR, save the kext-heap
     // VRAM (FBSR does not cover it) while the CE channel still runs.
     lk(__LINE__);
     vramFrozen_ = true;
@@ -4311,7 +4754,7 @@ void NVGspControl::quiesceForSleep() {
     setProperty("NVGspControl-sleep-vram-bytes", vramSavedBytes_, 64);
     setProperty("NVGspControl-sleep-vram-saved", saved);
     dpSetPower(false);
-    // GSP suspend, NVIDIA style (gated by NVRAM nvgsp-sr)
+    // 0.100.0: NVIDIA-style GSP suspend (NVRAM nvgsp-sr gate until proven).
     if (sr) {
         const IOReturn r = srSuspend();
         setProperty("NVGspControl-sr-suspend-kr", static_cast<UInt32>(r), 32);
@@ -4324,14 +4767,20 @@ void NVGspControl::quiesceForSleep() {
     setProperty("NVGspControl-sleeping", true);
 }
 
-// Wake. Arm MSI again on the stored vectors, drop the fence, then check
-// GSP with a self-driven RPC. If it's alive (usually the case on this
-// board, short sleeps keep the firmware resident) we modeset and that's
-// it: display back in seconds, WindowServer doesn't wedge. If it's dead:
-// full reset and the daemon boots the chain again (phase 0 + trigger).
+// 0.98.0: wake resume. Re-arm MSI on the stored vectors, unfence, then
+// probe GSP with a self-driving RPC. Alive (the common case on this
+// board — short sleeps keep firmware resident): modeset and done, display
+// back in seconds, no WindowServer wedge. Dead: full reset and the daemon
+// re-boots the chain (phase 0 + 0.97 trigger).
 void NVGspControl::resumeFromSleep() {
     if (!lock_ || !pci_) return;
     lk(__LINE__);
+    resetPrivateDiagnostic_ = false; // diagnostic applies only to the first global reset, never S3
+    setProperty("NVGspControl-ownchannel-reset-diagnostic", false);
+    if (gpuResets_) {
+        setProperty("NVGspControl-ownchannel-reset-fallback", true);
+        setProperty("NVGspControl-ownchannel-auto", false);
+    }
     if (wl_ && irq_) wl_->removeEventSource(irq_);
     OSSafeReleaseNULL(irq_);
     OSSafeReleaseNULL(wl_);
@@ -4339,16 +4788,16 @@ void NVGspControl::resumeFromSleep() {
     const bool rearmed = armInterrupts(vec_);
     setProperty("NVGspControl-resume-rearmed", rearmed);
     ulk();
-    // SR resume (GSP-RM restores its state); cold re-boot as fallback.
+    // 0.100.0: SR resume (GSP-RM restores its state); cold re-boot as fallback.
     if (srSuspended_) {
         const IOReturn r = srResume();
         setProperty("NVGspControl-sr-resume-kr", static_cast<UInt32>(r), 32);
         if (r == kIOReturnSuccess) {
-            // GSP-RM restored its own VRAM (FBSR), not the user heap
+            // 0.124.0: GSP-RM restored its own VRAM (FBSR), not the user heap
             // objects or the per-client arena tables: clients from before the
             // sleep get kIOReturnOffline (Vulkan: DEVICE_LOST) instead of
             // running on lost memory; their arenas are rebuilt on next use.
-            // unless the copy saved at sleep goes back first; then
+            // 0.127.0: unless the copy saved at sleep goes back first; then
             // the clients just continue (PD1 is rewritten on the next switch).
             lk(__LINE__);
             const bool restored = restoreVramLocked();
@@ -4356,6 +4805,7 @@ void NVGspControl::resumeFromSleep() {
                 arenaActive_ = nullptr;
                 arenaInstalled_ = false;
             } else {
+                resetPrivateDiagnostic_ = false;
                 ++gpuResets_;
                 arenaDropAllLocked(true);
             }
@@ -4364,6 +4814,11 @@ void NVGspControl::resumeFromSleep() {
             ulk();
             setProperty("NVGspControl-resume-vram-restored", restored);
             setProperty("NVGspControl-gpu-reset-count", gpuResets_, 32);
+            if (!restored) {
+                setProperty("NVGspControl-ownchannel-reset-diagnostic", false);
+                setProperty("NVGspControl-ownchannel-reset-fallback", true);
+                setProperty("NVGspControl-ownchannel-auto", false);
+            }
             UInt32 code = ~0U;
             modesetHead0(&code);
             setProperty("NVGspControl-resume-fast", code == 0);
@@ -4402,38 +4857,40 @@ void NVGspControl::resumeFromSleep() {
         return;
     }
     setProperty("NVGspControl-resume-fast", false);
-    // cold boot after sleep means everything on the GPU is new, same as
-    // gpuReset(): bump the reset generation for clients from before the
-    // sleep
+    // 0.124.0: cold re-boot after sleep = everything on the GPU is new, like
+    // gpuReset(): bump the reset generation for pre-sleep clients.
+    resetPrivateDiagnostic_ = false; // S3 never enables the global-reset diagnostic
     ++gpuResets_;
     setProperty("NVGspControl-gpu-reset-count", gpuResets_, 32);
-    lk(__LINE__);                               // waiters see the new generation
+    setProperty("NVGspControl-ownchannel-reset-diagnostic", false);
+    setProperty("NVGspControl-ownchannel-reset-fallback", true);
+    setProperty("NVGspControl-ownchannel-auto", false);
+    lk(__LINE__);                               // 0.127.0: waiters see the new generation
     freeSavedVramLocked();
     thawLocked();
     ulk();
     resetForResume();
-    // drive the boot ourselves (async, the PM thread has to return). The
-    // daemon trigger stays as a backup; the stage/execute guards make a
-    // daemon --boot running at the same time fail cleanly without messing
-    // up state.
+    // 0.99.0: self-drive the re-boot (async — the PM thread must return).
+    // The daemon trigger stays as backup; stage/execute guards make a
+    // concurrent daemon --boot fail gracefully without corrupting state.
     if (resumeCall_) thread_call_enter(resumeCall_);
 }
 
-// Slow-path chain driver: executeBoot on the retained staging plus the
-// daemon's poll loop, all in the kernel. No file, no daemon, no trigger
-// race. Staging objects survive the quiesce (S3 keeps DRAM), so booting
-// again after resume is the same as a cold boot.
+// 0.99.0: slow-path chain driver — executeBoot on the RETAINED staging
+// plus the daemon's poll loop, in-kernel. No file, no daemon, no trigger
+// race: staging objects survive quiesce (S3 preserves DRAM), so the resume
+// re-boot is identical to a cold boot's.
 void NVGspControl::resumeDriveCallout(thread_call_param_t param, thread_call_param_t) {
     NVGspControl *self = static_cast<NVGspControl *>(param);
     if (!self || self->resumeAbort_) return;
     self->resumeActive_ = true;
     self->setProperty("NVGspControl-resume-drive", true);
     UInt32 polls = 0;
-    // Stage init_ again from scratch (fresh queues, rmargs, LibOS args and log
-    // buffers, exactly the cold-boot state). Just restoring a snapshot left the
-    // previous session's LibOS logs in place, and the resumed GSP answered
-    // UNLOADING_GUEST_DRIVER (47) and halted. Snapshot restore is still there
-    // as a fallback if staging fails.
+    // 0.99.2: re-stage init_ from scratch (fresh queues, rmargs, LibOS args and
+    // log buffers — exactly the cold-boot state). The 0.99.0 snapshot restore
+    // left the LibOS logs of the previous session in place and the resumed
+    // GSP answered with UNLOADING_GUEST_DRIVER (47) and halted. Snapshot
+    // restore stays as the fallback if re-staging fails.
     bool restaged = false;
     if (self->lock_ && self->systemInfoValid_) {
         self->lk(__LINE__);
@@ -4470,7 +4927,7 @@ void NVGspControl::resumeDriveCallout(thread_call_param_t param, thread_call_par
         self->setProperty("NVGspControl-resume-code", code, 32);
     }
     self->setProperty("NVGspControl-resume-drive", false);
-    // once in a CTS night a reset came back at phase 33 with the
+    // 0.145.0: once in a CTS night a reset came back at phase 33 with the
     // GR bring-up not done (gr-persistent No), and the GPU sat there until
     // someone ran nvrun --reset. Such a reset gets up to two more tries.
     bool retry = false;
@@ -4484,6 +4941,51 @@ void NVGspControl::resumeDriveCallout(thread_call_param_t param, thread_call_par
         }
         self->setProperty("NVGspControl-reset-retries", self->resetRetries_, 32);
     }
+    // 0.164.0: clients that reopened while the GPU was still coming back
+    // (NVMTLDriver recovers on the first kIOReturnOffline) bound their pages
+    // into tables resetForResume then dropped; WindowServer's next CE push ran
+    // from a VA no client mapped (Xid 31 right after the reset, then the
+    // reset after it failed). One more generation step now sends them
+    // through the recovery again, into the new tables.
+    // 0.176.0 (T3): the client objects back from the copy gpuReset took, before
+    // resetBusy_ lets the clients in again; their tables are rebuilt as before
+    if (self->lock_ && self->resetVramSaved_ && !retry) {
+        self->kceEnsure();   // the copies run on the kernel CE channel, dropped by resetForResume
+        self->lk(__LINE__);
+        const bool kce = self->kce_.ready && !self->kce_.dead;
+        UInt32 skipped = 0;
+        const bool had = self->vramSaved_;
+        const bool restored = self->grPersistent_ && kce && self->restoreVramLocked(&skipped);
+        self->setProperty("NVGspControl-reset-vram-skipped", skipped, 32);
+        self->setProperty("NVGspControl-reset-vram-had-copy", had);
+        self->freeSavedVramLocked();
+        self->resetVramSaved_ = false;
+        self->ulk();
+        self->setProperty("NVGspControl-reset-vram-restored", restored);
+        self->setProperty("NVGspControl-reset-vram-kce", kce);
+    }
+    if (self->lock_) {
+        self->lk(__LINE__);
+        if (self->gpuResets_ != self->genSeenAtEnd_) {
+            self->genSeenAtEnd_ = self->gpuResets_;
+            ++self->genEnd_;
+        }
+        self->ulk();
+        self->setProperty("NVGspControl-client-generation", self->resetGeneration(), 32);
+    }
+    if (self->lock_) {                                   // 0.170.0
+        char e[160];
+        snprintf(e, sizeof(e), "resume end phase %u gr-persistent %d retry %d", phase, self->grPersistent_ ? 1 : 0,
+                 retry ? 1 : 0);
+        self->lk(__LINE__);
+        self->noteGpuEventLocked(e);
+        self->ulk();
+    }
+    if (!retry) self->resetBusy_ = false;                // 0.164.0: clients may come back now
+    if (!retry && self->grPersistent_)                   // 0.173.0
+        for (UInt32 c = 0; c < 4; ++c)
+            if (ResetDoneFn fn = self->resetDoneFn_[c]) fn(self->resetDoneRef_[c]);
+    self->setProperty("NVGspControl-reset-busy", static_cast<bool>(self->resetBusy_));
     self->resumeActive_ = false;
     if (retry) {
         UInt64 deadline = 0;
@@ -4492,11 +4994,11 @@ void NVGspControl::resumeDriveCallout(thread_call_param_t param, thread_call_par
     }
 }
 
-// Chain state reset for S3 resume. Same member list as stop() (keep the
-// two in sync!) but pci_/lock_/service stay attached and the NVDisplay
-// hotplug callback is kept so phase 33 can arm it again. Only used on the
-// slow path (GSP dead); MSI gets torn down too so the new chain arms it
-// fresh, the wake re-arm was pointing at dead firmware.
+// 0.96.0: chain-state reset for S3 resume. Mirrors stop()'s member list
+// (keep the two in sync) but leaves pci_/lock_/service attached and keeps
+// the NVDisplay hotplug callback for re-arm at the next phase 33.
+// 0.98.0: slow path only (dead GSP); MSI torn down too so the re-boot
+// chain re-arms fresh (the wake re-arm targeted dead firmware).
 void NVGspControl::resetForResume() {
     if (!lock_) return;
     lk(__LINE__);
@@ -4508,8 +5010,8 @@ void NVGspControl::resetForResume() {
     hotplugDeliver_ = false;
     hotplugPlug_ = hotplugUnplug_ = 0;
     vblanks_ = 0;
-    // staging stays (gsp_/booter_/init_ hold the parsed firmware and S3
-    // keeps DRAM), so the self-driven boot doesn't need any file
+    // 0.99.0: staging SURVIVES (gsp_/booter_/init_ hold the parsed firmware;
+    // S3 preserves DRAM) so the self-drive re-boots without any file.
     executed_ = false;
     statusSequence_ = 0;
     initDone_ = false;
@@ -4538,27 +5040,28 @@ void NVGspControl::resetForResume() {
     pd0Address_ = 0;
     ctxHugeInstalled_ = 0;
     gr3dOk_ = false;
-    lastGrOwner_ = nullptr;
+    lastGrOwner_ = nullptr;                  // 0.145.0
     rcEvents_ = mmuFaultEvents_ = otherEvents_ = 0;
     bar1Finished_ = false;
-    bar1Live_ = false;
+    bar1Live_ = false;                       // 0.123.0
     grPersistent_ = false;
     subPbOff_ = subSeq_ = 0;
     scratchOffset_ = 0;
     scratchHuge_ = 0;
     pdbAddress_ = 0;
     vramVaTables_ = 0;
-    arenaDropAllLocked(true);                // tables go away with the VAS
+    arenaDropAllLocked(true);                // 0.111.0: tables die with the VAS
     scratchTry_ = 0;
     scratchRetry_ = false;
     fbFreeBase_ = fbFreeLimit_ = 0;
     ceChunk_ = 0;
     ceMapped_ = ceStarted_ = cePersistent_ = false;
     ceToken_ = cePbOff_ = ceSeq_ = 0;
-    ceOutstanding_ = 0;
+    ceOutstanding_ = 0;                      // 0.112.0
     ceUserdOffset_ = ceInstOffset_ = ceMthdOffset_ = 0;
-    videoDropLocked();
-    freeSavedVramLocked();
+    videoDropLocked();                       // 0.116.0
+    clientChannelsDropLocked();              // 0.178.0
+    if (!resetVramSaved_) freeSavedVramLocked();   // 0.127.0; 0.176.4: gpuReset's copy stays
     thawLocked();
     wndOwnsScreen_ = false;
     wndPut_ = 0;
@@ -4600,11 +5103,12 @@ IOReturn NVGspControl::pollStatus() {
     lk(__LINE__);
     const uint64_t t1 = mach_absolute_time();
     const UInt32 phaseIn = postInitPhase_;
+    if (phaseIn == 33) stampAdvanceLocked();   // 0.178.12: a missed fence interrupt cannot hold stamps
     profT0_ = t1; profFirst_ = profDrainEnd_ = 0; profRecords_ = profIdle_ = 0;
-    // Run the chain back to back inside one call. With the GSP doorbell
-    // replies come in within ms, and a step that queued no RPC (local phase)
-    // lets the next drain skip the 4 s empty wait. Stops when nothing moves,
-    // at phase 32/33, or after a 3 s budget (lock_ is held all along).
+    // 0.100.6: run the chain back-to-back inside one call. With the GSP
+    // doorbell, replies land in ~ms; a step that queued no RPC (local phase)
+    // lets the next drain skip the 4 s empty wait. Stops on no progress, on
+    // phase 32/33, or after a 3 s budget (lock_ is held).
     IOReturn ret = kIOReturnSuccess;
     uint64_t budget = 0;
     nanoseconds_to_absolutetime(3000ULL * 1000 * 1000, &budget);
@@ -4612,7 +5116,7 @@ IOReturn NVGspControl::pollStatus() {
         const UInt32 before = postInitPhase_;
         const uint32_t txBefore = init_.txSequence();
         ret = pollStatusLocked();
-        if (postInitPhase_ != before && bootTlLen_ + 60 < sizeof(bootTl_)) {
+        if (postInitPhase_ != before && bootTlLen_ + 60 < sizeof(bootTl_)) {   // 0.146.7
             const UInt32 p = postInitPhase_;
             if (p == 1 || p == 34 || p == 100 || p == 120 || p == 200 || p == 207 || p == 208) {
                 char t[12];
@@ -4625,13 +5129,13 @@ IOReturn NVGspControl::pollStatus() {
         if (postInitPhase_ == 33 || postInitPhase_ == 32 || before == 33) break;
         if (postInitPhase_ == before && !queued) break;   // waiting on something
         if (mach_absolute_time() - t1 > budget) break;
-        if (bar1EarlyPending_) {   // console visible again ASAP
+        if (bar1EarlyPending_) {   // 0.146.6: console visible again ASAP
             bar1EarlyPending_ = false;
             finishBar1();
             bar1Early_ = true;
             markBoot("bar1-early");
         }
-        // let the interrupt handler (vblank, fences) in between
+        // 0.146.2: let the interrupt handler (vblank, fences) in between
         // steps. Holding lock_ for the whole chain (up to 3 s at boot, phase
         // 1xx) froze the boot logo animation and delayed vblanks by seconds.
         // IOLock is not fair: re-taking it at once starves a waiting
@@ -4640,14 +5144,14 @@ IOReturn NVGspControl::pollStatus() {
         IODelay(50);
         lk(__LINE__);
     }
-    if (bar1EarlyPending_) {   // (the loop may have stopped first)
+    if (bar1EarlyPending_) {   // 0.146.6 (the loop may have stopped first)
         bar1EarlyPending_ = false;
         finishBar1();
         bar1Early_ = true;
         markBoot("bar1-early");
     }
     const uint64_t t2 = mach_absolute_time();
-    // count chain polls (not the parked phase-33 drain)
+    // 0.100.4: record chain polls (not the parked phase-33 drain).
     if (phaseIn != 33 || postInitPhase_ != 33) {
         auto us = [](uint64_t a, uint64_t b) -> UInt32 {
             if (!a || b < a) return 0;
@@ -4676,10 +5180,10 @@ IOReturn NVGspControl::pollStatus() {
     return ret;
 }
 
-// Hotplug. armHotplug() subscribes to NV2080_NOTIFIERS_HOTPLUG like nouveau's
-// r535_gsp_device_event_ctor (NV01_EVENT_KERNEL_CALLBACK_EX 0x7E under the
-// subdevice, notifyIndex NV01_EVENT_CLIENT_RM|1, then EVENT_SET_NOTIFICATION
-// REPEAT). Events are delivered outside lock_.
+// 0.89.0: hotplug. armHotplug() subscribes NV2080_NOTIFIERS_HOTPLUG the way
+// nouveau r535_gsp_device_event_ctor does (NV01_EVENT_KERNEL_CALLBACK_EX 0x7E
+// under the subdevice, notifyIndex NV01_EVENT_CLIENT_RM|1, then
+// EVENT_SET_NOTIFICATION REPEAT). Events are delivered outside lock_.
 IOReturn NVGspControl::armHotplug() {
     if (hotplugArmed_) return kIOReturnSuccess;
     UInt8 reply[256];
@@ -4718,16 +5222,15 @@ void NVGspControl::deliverHotplug() {
     HotplugFn fn = hotplugFn_;
     void *ref = hotplugRef_;
     ulk();
-    // re-arm hotplug after an S3 resume (quiesce cleared it;
+    // 0.96.0: re-arm hotplug after an S3 resume (quiesce cleared it;
     // NVDisplay's one-shot register already ran at first boot). Runs on
     // every drain, not just on delivery, so a quiet resume still re-arms.
     if (postInitPhase_ == 33 && fn && !hotplugArmed_) armHotplug();
     if (!deliver) return;
-    if (plug) dpReadEdid();           // refresh NVGspControl-edid before we tell the clients
-    // After a replug head0 stays armed but the DP link is down (no picture
-    // till we retrain). If lane status isn't locked, do the modeset. The
-    // DPCD check doubles up as debounce: link up means nothing to do, no
-    // pointless blink.
+    if (plug) dpReadEdid();           // refresh NVGspControl-edid before telling clients
+    // 0.94.0: a replug leaves head0 armed but the DP link down (no picture
+    // until retrain). If the lane status is not locked, run the modeset —
+    // the DPCD gate doubles as debounce (link up => no-op, no blind blink).
     if (plug) {
         UInt8 lanes[2] = {};
         const bool locked = dpAuxRead(0x202, lanes, sizeof(lanes)) == kIOReturnSuccess &&
@@ -4742,7 +5245,7 @@ void NVGspControl::deliverHotplug() {
     if (fn) fn(ref, plug, unplug);
 }
 
-// native DPCD read (one AUX transaction, cmd 0x9, same as the dpcd.py
+// 0.94.0: native DPCD read (single AUX transaction, cmd 0x9 — the dpcd.py
 // read path). Reply: status@92, bytes-done@140, reply-code@144, data@124.
 IOReturn NVGspControl::dpAuxRead(UInt32 addr, UInt8 *out, UInt32 bytes) {
     if (!out || !bytes || bytes > 16) return kIOReturnBadArgument;
@@ -4774,8 +5277,8 @@ IOReturn NVGspControl::dpAuxRead(UInt32 addr, UInt8 *out, UInt32 bytes) {
     return kIOReturnIOError;
 }
 
-// EDID read again at runtime over DP AUX (same transaction list as chain
-// phase 224: I2C-over-AUX @0x50, offset write + 16 x 16 B reads)
+// 0.89.0: runtime EDID re-read over DP AUX (same transaction list as chain
+// phase 224: I2C-over-AUX @0x50, offset write + 16 x 16 B reads).
 IOReturn NVGspControl::dpReadEdid() {
     UInt8 edid[256]{};
     UInt32 got = 0;
@@ -4821,7 +5324,7 @@ IOReturn NVGspControl::flipWindow(UInt64 offsetBytes, bool fullInit) {
     if (offsetBytes & 0xff) return kIOReturnBadArgument;
     lk(__LINE__);
     const IOReturn ret = flipWindowLocked(offsetBytes, fullInit, desktopSurface_);
-    // the window no longer shows a Vulkan presenter's surface (and
+    // 0.110.0: the window no longer shows a Vulkan presenter's surface (and
     // may carry desktop state), so the next present programs everything.
     presentOwner_ = nullptr;
     presentHandle_ = 0;
@@ -4830,28 +5333,28 @@ IOReturn NVGspControl::flipWindow(UInt64 offsetBytes, bool fullInit) {
     return ret;
 }
 
-// C++14: it's odr-used (bound to const refs), so it needs a definition
+// C++14: odr-used (bound to const references), so it needs a definition.
 constexpr NVGspControl::WindowSurface NVGspControl::kDesktopSurface;
 
-// Flip window 0 with explicit surface state (NVK/Vulkan present). Full
-// init programs SIZE/STORAGE/PARAMS/PLANAR_STORAGE/SIZE_IN/SIZE_OUT from
-// `surf` (clc67e.h); the ISO ctxdma is pitch-kind VRAM [0, 16 GiB). Caller
-// holds lock_.
+// 0.110.0: window 0 flip with explicit surface state (NVK/Vulkan present).
+// Full init programs SIZE/STORAGE/PARAMS/PLANAR_STORAGE/SIZE_IN/SIZE_OUT
+// from `surf` (clc67e.h); the ISO ctxdma is pitch-kind VRAM [0, 16 GiB).
+// Caller holds lock_.
 IOReturn NVGspControl::flipWindowLocked(UInt64 offsetBytes, bool fullInit,
                                         const WindowSurface &surf, bool interlockCore) {
     if (offsetBytes & 0xff) return kIOReturnBadArgument;
     IOReturn ret = kIOReturnNotReady;
     // OFFSET(0), interlock flags (none), UPDATE(1): 6 dwords, 24 bytes.
-    // PRESENT_CONTROL MIN_PRESENT_INTERVAL = 1 so no tearing and max one
-    // flip per vblank (with 0 we had 292 flips/s queued up).
+    // 0.102.0: PRESENT_CONTROL MIN_PRESENT_INTERVAL 1 (non-tearing, at most
+    // one flip per vblank; was 0 -> 292 flips/s queued).
     const UInt32 pbFlip[] = {
         (1U << 18) | 0x308, 0x1,
         (1U << 18) | 0x260, static_cast<UInt32>(offsetBytes >> 8),
         (2U << 18) | 0x370, 0x0, 0x0,
         (1U << 18) | 0x200 };
-    // full window state, same as the chain's init. After GSP SR the window's
-    // surface state is back at defaults and an OFFSET-only flip scans an
-    // empty surface (signal but black screen).
+    // 0.100.1: full window state (the chain's 0.55.0 init) — after GSP SR the
+    // window's surface state is back at defaults and an OFFSET-only flip
+    // scans an empty surface (signal, black screen).
     const UInt32 wh = surf.width | (surf.height << 16);
     const UInt32 pbFull[] = {
         (1U << 18) | 0x308, 0x1,
@@ -4861,31 +5364,30 @@ IOReturn NVGspControl::flipWindowLocked(UInt64 offsetBytes, bool fullInit,
         (1U << 18) | 0x290, 0x0,
         (1U << 18) | 0x298, wh,
         (1U << 18) | 0x2A4, wh,
-        // composition stays BYPASS (the reset default, 0x10000).
+        // 0.141.1: composition stays BYPASS (the reset default, 0x10000).
         // Normal composition (depth 8, src*1 + dst*0, the Linux window) is
         // experiment bit 0x100 only: on its own the window UPDATE is refused
         // (Xid 56 chid 1 check 0x2d) and the head goes dark. Bypass is the
         // suspect for the cursor (0x0e) and OLUT (0x41) refusals.
         (1U << 18) | 0x2EC, wndComposite_ ? 0x80U : 0x10000U,
         (1U << 18) | 0x2F4, wndComposite_ ? 0x11U : 0U,
-        // the Linux window pairs composition with an input LUT
+        // 0.142.0: the Linux window pairs composition with an input LUT
         // (DIRECT10, 1029 entries, same identity table as the OLUT).
         (1U << 18) | 0x440, wndComposite_ ? 0x40508U : 0U,
         (1U << 18) | 0x444, wndComposite_ ? kIlutCtxdma : 0U,
         (1U << 18) | 0x448, 0,
         (2U << 18) | 0x370, interlockCore ? 1U : 0U, 0x0,
         (1U << 18) | 0x200 };
-    // with interlockCore the window UPDATE waits for the next core
+    // 0.137.0: with interlockCore the window UPDATE waits for the next core
     // UPDATE, so a new SIZE and a new raster land in the same frame.
     const UInt32 *pb = fullInit ? pbFull : pbFlip;
     const UInt32 pbWords = fullInit ? sizeof(pbFull) / 4 : sizeof(pbFlip) / 4;
     const UInt32 tail[] = {0x1};
     const UInt32 kBytes = (pbWords + 1) * 4;
     if (wndOwnsScreen_ && dispInstOffset_) {
-        // wrap the 4 KiB window PB with a DMA JUMP (opcode 1, clc67e.h)
-        // instead of failing after ~146 flips: JUMP 0 at the current
-        // PUT (engine is idle there, GET == PUT), methods start again
-        // at 0
+        // 0.79.0: wrap the 4 KiB window PB with a DMA JUMP (opcode 1,
+        // clc67e.h) instead of failing after ~146 flips: JUMP 0 at the
+        // current PUT (engine is idle there: GET == PUT), methods at 0.
         UInt32 base = wndPut_;
         bool wrapped = false;
         if (base + kBytes + 4 > 4096) {
@@ -4926,11 +5428,11 @@ IOReturn NVGspControl::flipWindowLocked(UInt64 offsetBytes, bool fullInit,
     return ret;
 }
 
-// Scan out a client's VRAM memory object on window 0 (zero-copy Vulkan
-// present). First flip of a presentation (or any surface change) programs
-// the full window state, later flips only move OFFSET. The window channel
-// allows one flip per vblank, so by the time this returns the previously
-// presented surface has been latched.
+// 0.110.0: scan out a client's VRAM memory object on window 0 (zero-copy
+// Vulkan present). The first flip of a presentation (or any surface change)
+// programs the full window state; later flips only move OFFSET. The window
+// channel throttles to one flip per vblank, so when this returns the
+// previous presented surface has been latched.
 IOReturn NVGspControl::presentObject(const void *owner, UInt32 handle, UInt64 offset,
                                      UInt32 pitch, UInt32 width, UInt32 height,
                                      UInt32 format) {
@@ -4941,7 +5443,7 @@ IOReturn NVGspControl::presentObject(const void *owner, UInt32 handle, UInt64 of
     lk(__LINE__);
     GpuMem &m = mem_[handle - 1];
     IOReturn ret = kIOReturnBadArgument;
-    if (m.owner == owner) m.presented = true;   // scanout stays in VRAM
+    if (m.owner == owner) m.presented = true;   // 0.149.0: scanout stays in VRAM
     if (m.owner == owner && m.domain == 0 && !(offset & 0xff) && offset < m.bytes &&
         UInt64(pitch) * (height - 1) + UInt64(width) * 4 <= m.bytes - offset) {
         const WindowSurface surf{pitch, width, height, format};
@@ -4960,8 +5462,8 @@ IOReturn NVGspControl::presentObject(const void *owner, UInt32 handle, UInt64 of
     return ret;
 }
 
-// hand the screen back to the desktop (GOP/WindowServer surface at VRAM 0)
-// if `owner` (nullptr = anyone) is presenting. Caller holds lock_.
+// 0.110.0: give the screen back to the desktop (GOP/WindowServer surface at
+// VRAM 0) if `owner` (nullptr = anyone) is presenting. Caller holds lock_.
 IOReturn NVGspControl::presentStopLocked(const void *owner) {
     if (!presentOwner_ || (owner && presentOwner_ != owner)) return kIOReturnSuccess;
     presentOwner_ = nullptr;
@@ -4978,9 +5480,9 @@ IOReturn NVGspControl::presentStop(const void *owner) {
     return ret;
 }
 
-// read a fence semaphore (PRAMIN window is saved and restored). Caller holds lock_.
+// 0.103.0: fence semaphore read (PRAMIN window saved/restored). Caller holds lock_.
 bool NVGspControl::readRingSem(const Ring &ring, UInt32 *value) {
-    if (volatile UInt32 *p = bar1Ptr(ring.semPhys, 4)) { *value = *p; return true; }
+    if (volatile UInt32 *p = bar1Ptr(ring.semPhys, 4)) { *value = *p; return true; }   // 0.151.0
     IOMemoryMap *map = sharedBar0Map(pci_);
     bool ok = false;
     if (map && map->getLength() >= 0x00710000) {
@@ -4996,20 +5498,21 @@ bool NVGspControl::readRingSem(const Ring &ring, UInt32 *value) {
     return ok;
 }
 
-// Fence wait that sleeps on the engine's non-stall interrupt (every
-// submission tail ends in NON_STALL_INTERRUPT) rather than spinning for the
-// whole timeout. Short spin for small jobs, then 1 ms sleep slices, so a
-// lost or misrouted interrupt only costs some latency. lock_ is dropped
-// while sleeping, so we look the ring up again every round. Works for GR
-// (0) and CE (1). Caller holds lock_.
-bool NVGspControl::waitFenceSleep(UInt32 engine, UInt32 seq, UInt32 timeoutUs) {
+// 0.118.0 (B7): fence wait that sleeps on the engine's non-stall interrupt
+// (every submission tail ends in NON_STALL_INTERRUPT) instead of spinning
+// for up to the whole timeout. A short spin covers small jobs; then 1 ms
+// sleep slices (a lost or misrouted interrupt only costs latency). lock_ is
+// dropped while asleep, so the ring is looked up again every round.
+// 0.119.0: GR (0) and CE (1). Caller holds lock_.
+bool NVGspControl::waitFenceSleep(UInt32 engine, UInt32 seq, UInt32 timeoutUs,
+                                  const void *owner) {
     const UInt32 k = engine ? kVecCeNs : kVecGrNs;
     Ring ring{};
-    if (!(engine ? ceRing(&ring) : grRing(&ring))) return false;
+    if (!(engine ? ceRing(&ring) : grRingFor(owner, &ring))) return false;
     if (waitRingSem(ring, seq, timeoutUs < 50 ? timeoutUs : 50)) return true;
     UInt64 start = 0;
     clock_get_uptime(&start);
-    // most kernels finish within a few hundred us, but the GR
+    // 0.146.0: most kernels finish within a few hundred us, but the GR
     // non-stall interrupt only woke ~13 % of the sleeps (the rest ran into
     // the 1 ms deadline, ~3.4 ms with timer coalescing), so every small
     // Metal dispatch cost 3.4 ms. Poll a little longer first, dropping
@@ -5018,12 +5521,12 @@ bool NVGspControl::waitFenceSleep(UInt32 engine, UInt32 seq, UInt32 timeoutUs) {
         ulk();
         IODelay(5);
         lk(__LINE__);
-        if (!(engine ? ceRing(&ring) : grRing(&ring))) return false;
+        if (!(engine ? ceRing(&ring) : grRingFor(owner, &ring))) return false;
         UInt32 v = 0;
         if (readRingSem(ring, &v) && static_cast<SInt32>(v - seq) >= 0) return true;
     }
     for (;;) {
-        if (!(engine ? ceRing(&ring) : grRing(&ring))) return false;
+        if (!(engine ? ceRing(&ring) : grRingFor(owner, &ring))) return false;
         UInt32 v = 0;
         if (readRingSem(ring, &v) && static_cast<SInt32>(v - seq) >= 0) return true;
         UInt64 now = 0, ns = 0;
@@ -5031,7 +5534,7 @@ bool NVGspControl::waitFenceSleep(UInt32 engine, UInt32 seq, UInt32 timeoutUs) {
         absolutetime_to_nanoseconds(now - start, &ns);
         if (ns >= UInt64(timeoutUs) * 1000) return false;
         UInt64 deadline = 0;
-        clock_interval_to_deadline(200, kMicrosecondScale, &deadline);   // was 1 ms
+        clock_interval_to_deadline(200, kMicrosecondScale, &deadline);   // 0.146.0: was 1 ms
         const UInt32 before = vecCount_[k];
         ++fenceSleeps_;
         sleepLk(&vecCount_[k], deadline, THREAD_UNINT);
@@ -5039,19 +5542,86 @@ bool NVGspControl::waitFenceSleep(UInt32 engine, UInt32 seq, UInt32 timeoutUs) {
     }
 }
 
-// Caller holds lock_. True once the fence has reached seq (compare is
-// wrap-safe).
+// Caller holds lock_. True once the fence reached seq (wrap-safe compare).
 bool NVGspControl::waitRingSem(const Ring &ring, UInt32 seq, UInt32 timeoutUs) {
+    const UInt32 asked = timeoutUs;
+    timeoutUs = stallCapUs(ring, timeoutUs);                    // 0.164.0
     for (UInt32 i = 0; i <= timeoutUs; ++i) {
         UInt32 v = 0;
-        if (readRingSem(ring, &v) && static_cast<SInt32>(v - seq) >= 0) return true;
+        if (readRingSem(ring, &v) && static_cast<SInt32>(v - seq) >= 0) {
+            if (asked >= 20000) noteRingWaitLocked(ring, true);
+            return true;
+        }
         if (i > 64) IODelay(1);
     }
-    if (timeoutUs >= 100000) captureStallLocked(ring, seq, 1);
+    if (timeoutUs >= 100000) captureStallLocked(ring, seq, 1);   // 0.156.0
+    if (asked >= 20000) noteRingWaitLocked(ring, false);
     return false;
 }
 
-// a ring that stops moving without any GR exception (native path,
+// 0.164.0: a reset brings VRAM back from the suspend copy, the fence
+// semaphores included, while subSeq_/ceSeq_ start again at 0: every wait then
+// passed at once (wrap-safe compare) and the first kernels after a reset
+// "finished" before they ran (metal_fault_test good: 4096 wrong, wait 3 us).
+// The counters go on from what the semaphores hold. Caller holds lock_.
+void NVGspControl::syncRingSeqLocked(bool gr, bool ce) {
+    Ring r{};
+    UInt32 v = 0;
+    if (gr && grRing(&r) && readRingSem(r, &v)) { subSeq_ = v; setProperty("NVGspControl-gr-seq-start", v, 32); }
+    if (ce && ceRing(&r) && readRingSem(r, &v)) { ceSeq_ = v; setProperty("NVGspControl-ce-seq-start", v, 32); }
+}
+
+NVGspControl::RingStall *NVGspControl::stallFor(const Ring &ring) {
+    return ring.seq == &subSeq_ ? &grStall_ : ring.seq == &ceSeq_ ? &ceStall_ : nullptr;
+}
+
+// Caller holds lock_. The wait a caller may spend on this ring.
+UInt32 NVGspControl::stallCapUs(const Ring &ring, UInt32 timeoutUs) {
+    RingStall *st = stallFor(ring);
+    if (!st || !st->stalled || timeoutUs <= 20000) return timeoutUs;
+    UInt32 v = 0;
+    if (st->hung || (readRingSem(ring, &v) && v == st->sem)) return 20000;
+    return timeoutUs;
+}
+
+// Caller holds lock_. After a wait of 20 ms or more on the ring.
+void NVGspControl::noteRingWaitLocked(const Ring &ring, bool reached) {
+    RingStall *st = stallFor(ring);
+    if (!st) return;
+    UInt32 v = 0;
+    readRingSem(ring, &v);
+    if (reached) {
+        if (!st->stalled || v != st->sem) st->stalled = false;   // moved: healthy again
+        return;
+    }
+    UInt64 now = 0, ns = 0;
+    clock_get_uptime(&now);
+    if (!st->stalled || v != st->sem) { st->stalled = true; st->sem = v; st->since = now; return; }
+    absolutetime_to_nanoseconds(now - st->since, &ns);
+    if (!st->hung && ns >= 5000000000ULL) ringHungLocked(st);
+}
+
+// Caller holds lock_. GR: the channel is given up like after an RC; CE:
+// ceRing() stops handing the ring out. Both come back with the reset.
+void NVGspControl::ringHungLocked(RingStall *st) {
+    st->stalled = st->hung = true;
+    {   // 0.170.0
+        char e[160];
+        snprintf(e, sizeof(e), "%s ring hung, sem %u, arena pid %d", st == &grStall_ ? "GR" : "CE", st->sem,
+                 arenaActive_ ? arenaActive_->pid : -1);
+        noteGpuEventLocked(e);
+    }
+    if (st == &grStall_) {
+        grPersistent_ = false;
+        setProperty("NVGspControl-gr-persistent", false);
+        setProperty("NVGspControl-gr-hung", true);
+    } else {
+        setProperty("NVGspControl-ce-hung", true);
+    }
+    scheduleAutoResetLocked();
+}
+
+// 0.156.0: a ring that stops moving without any GR exception (native path,
 // user session, 28 Sep 20:02 and 20:08). Snapshot everything we can read
 // about it once per 5 s: ring semaphore vs the wanted value, USERD GP_GET /
 // GP_PUT and the GPFIFO entry at GET, PGRAPH/FECS/MMU-fault registers,
@@ -5072,7 +5642,7 @@ void NVGspControl::captureStallLocked(const Ring &ring, UInt32 want, UInt32 wher
     ringRead(ring.userdPhys + 0x88, &get);
     ringRead(ring.userdPhys + 0x8c, &put);
     d[n++] = want; d[n++] = sem; d[n++] = *ring.seq; d[n++] = get; d[n++] = put;
-    // the two entries before GET, the ones the host fetched last
+    // 0.157.0: the two entries before GET, the ones the host fetched last
     // (the stuck one is among them), not the stale slot at GET
     UInt32 e[4] = {};
     ringRead(ring.gpfifoPhys + ((get - 1) & 0x1ff) * 8, &e[0]);
@@ -5087,7 +5657,7 @@ void NVGspControl::captureStallLocked(const Ring &ring, UInt32 want, UInt32 wher
     d[n++] = static_cast<UInt32>(reinterpret_cast<uintptr_t>(lastGrOwner_));
     d[n++] = arenaSwitches_;
     d[n++] = asyncOutstanding_;
-    d[n++] = mmuFaultEvents_;
+    d[n++] = mmuFaultEvents_;                                       // 0.158.0
     ++stalls_;
     setProperty("NVGspControl-stall", d, n * 4);
     setProperty("NVGspControl-stall-count", stalls_, 32);
@@ -5098,15 +5668,15 @@ void NVGspControl::captureStallLocked(const Ring &ring, UInt32 want, UInt32 wher
 IOReturn NVGspControl::submitRing(const Ring &ring, const UInt32 *words,
                                   UInt32 count, UInt64 *nsOut, bool async) {
     // Caller holds lock_. Appends a host SEM_EXECUTE release (WFI) of the
-    // next sequence number, writes the GP entry at USERD PUT, publishes PUT
-    // (just the dword, never GET), rings the doorbell and polls the
-    // semaphore. A NON_STALL_INTERRUPT (0x20) follows the release, so the
-    // engine's non-stall vector fires when the fence lands.
+    // next sequence number, writes the GP entry at USERD PUT, publishes
+    // PUT (dword only, never GET), rings the doorbell, polls the semaphore.
+    // 0.74.0: + NON_STALL_INTERRUPT (0x20) after the release -> engine
+    // non-stall vector fires when the fence lands.
     const UInt32 bytes = (count + 8) * 4;
     if (bytes > ring.pbBytes) return kIOReturnNoSpace;
-    // async submissions may still be in flight. Before reusing PB
+    // 0.103.0: async submissions may still be in flight. Before reusing PB
     // space (wrap) or when many GP entries are outstanding, drain the ring.
-    // the outstanding count is the GR ring's; other rings only wrap
+    // 0.149.0: the outstanding count is the GR ring's; other rings only wrap
     const bool gr = ring.pbOff == &subPbOff_;
     if (*ring.pbOff + bytes > ring.pbBytes || (gr && asyncOutstanding_ > 384)) {
         if (!waitRingSem(ring, *ring.seq, 2000000)) return kIOReturnTimeout;
@@ -5149,7 +5719,7 @@ IOReturn NVGspControl::submitRing(const Ring &ring, const UInt32 *words,
         clock_get_uptime(&t0);
         bar0.write(0x00BB0090, ring.token);
         ret = kIOReturnTimeout;
-        if (async) {
+        if (async) {                                    // 0.103.0
             bar0.write(0x1700, before);
             map->release();
             *ring.pbOff += (bytes + 255) & ~255U;
@@ -5157,11 +5727,10 @@ IOReturn NVGspControl::submitRing(const Ring &ring, const UInt32 *words,
             *nsOut = 0;
             return kIOReturnSuccess;
         }
-        // With the GR non-stall vector armed we sleep till the fence
+        // 0.75.0: with the GR non-stall vector armed, sleep until the fence
         // interrupt (NON_STALL_INTERRUPT after the release) instead of
-        // spinning. IOLockSleepDeadline drops lock_ so the MSI handler can
-        // run. The spin below is still there as the completion check /
-        // fallback.
+        // spinning; IOLockSleepDeadline drops lock_ so the MSI handler runs.
+        // The spin below stays as the completion check / fallback.
         if (intrArmed_ && vec_[kVecGrNs] != ~0U && !inIntr_ &&
             ring.pbOff == &subPbOff_) {  // GR ring only
             UInt64 deadline = 0;
@@ -5175,7 +5744,8 @@ IOReturn NVGspControl::submitRing(const Ring &ring, const UInt32 *words,
                 if (vecCount_[kVecGrNs] != before) ++fenceWakes_;
             }
         }
-        for (UInt32 i = 0; i < 4000000; ++i) {
+        const UInt32 spins = stallCapUs(ring, 4000000);         // 0.164.0
+        for (UInt32 i = 0; i < spins; ++i) {
             if (bar0.read(at, &v) && v == seq) {
                 clock_get_uptime(&t1);
                 ret = kIOReturnSuccess;
@@ -5184,6 +5754,7 @@ IOReturn NVGspControl::submitRing(const Ring &ring, const UInt32 *words,
             if (i > 2000) IODelay(1);
         }
         bar0.write(0x1700, before);
+        noteRingWaitLocked(ring, ret == kIOReturnSuccess);
         if (ret == kIOReturnSuccess) {
             UInt64 ns = 0;
             absolutetime_to_nanoseconds(t1 - t0, &ns);
@@ -5197,15 +5768,22 @@ IOReturn NVGspControl::submitRing(const Ring &ring, const UInt32 *words,
 
 IOReturn NVGspControl::submitGr(const void *owner, const UInt32 *words, UInt32 count,
                                 UInt64 *nsOut) {
-    if (nvramBoostPinned_ == 0) noteGpuBusy();
+    if (nvramBoostPinned_ == 0) noteGpuBusy();          // 0.135.0
     if (!lock_ || !pci_ || !words || !count || !nsOut)
         return kIOReturnBadArgument;
     lk(__LINE__);
+    if (!waitChannelMutationLocked()) { ulk(); return kIOReturnNotReady; }
     IOReturn ret = kIOReturnNotReady;
-    // GR PB ring: ctx block spare +0x2990000 (384 KiB), semaphore
-    // +0x29FF000
-    if (grPersistent_ && ctxBackingOffset_ &&
-        (ret = arenaSwitchLocked(owner)) == kIOReturnSuccess) {
+    // GR PB ring: ctx block spare +0x2990000 (384 KiB), sem +0x29FF000.
+    ClientChannel *own = clientChannelLocked(owner);   // 0.178.0
+    Ring ownRing{};
+    if (own && clientRingLocked(own, &ownRing) &&
+        (ret = clientArenaLocked(own)) == kIOReturnSuccess && clientRingLocked(own, &ownRing)) {
+        ret = submitRing(ownRing, words, count, nsOut);
+    } else if (own) {
+        if (ret == kIOReturnSuccess) ret = kIOReturnNotReady;
+    } else if (grPersistent_ && ctxBackingOffset_ &&
+        (ret = arenaSwitchLocked(owner)) == kIOReturnSuccess) {   // 0.111.0
         noteGrOwnerLocked(owner);
         const Ring ring{ctxBackingOffset_ + 0x2990000,
                         0x104000000ULL + 0x2990000, 0x60000,
@@ -5233,9 +5811,9 @@ bool NVGspControl::grRing(Ring *out) {
     return true;
 }
 
-// ring of the persistent copy-engine channel (PB, semaphore, GPFIFO)
+// 0.112.0: the persistent copy-engine channel's ring (PB, semaphore, GPFIFO).
 bool NVGspControl::ceRing(Ring *out) {
-    if (!cePersistent_ || !ceChunk_) return false;
+    if (!cePersistent_ || !ceChunk_ || ceStall_.hung) return false;   // 0.164.0: hung until the reset
     constexpr UInt64 kCeVa = 0x108E00000ULL;
     *out = Ring{ceChunk_ + 0x10000, kCeVa + 0x10000, 0x1E0000,
                 ceChunk_ + 0x1F0000, kCeVa + 0x1F0000, ceChunk_,
@@ -5252,56 +5830,67 @@ void NVGspControl::noteGrOwnerLocked(const void *owner) {
 bool NVGspControl::grLastOwnerIsOther(const void *owner) {
     if (!lock_) return false;
     lk(__LINE__);
-    const bool other = lastGrOwner_ && lastGrOwner_ != owner;
+    const bool other = !clientChannelLocked(owner) && lastGrOwner_ && lastGrOwner_ != owner;
     ulk();
     return other;
 }
 
 IOReturn NVGspControl::submitGrAsync(const void *owner, const UInt32 *words, UInt32 count,
                                      UInt32 *seqOut) {
-    if (nvramBoostPinned_ == 0) noteGpuBusy();
+    if (nvramBoostPinned_ == 0) noteGpuBusy();          // 0.135.0
     if (!lock_ || !pci_ || !words || !count || !seqOut) return kIOReturnBadArgument;
     lk(__LINE__);
     Ring ring{};
     UInt64 ns = 0;
-    IOReturn ret = !grRing(&ring) ? kIOReturnNotReady : arenaSwitchLocked(owner);
-    if (ret == kIOReturnSuccess) noteGrOwnerLocked(owner);
+    ClientChannel *own = clientChannelLocked(owner);   // 0.178.0
+    IOReturn ret = own ? (clientRingLocked(own, &ring) ? clientArenaLocked(own) : kIOReturnNotReady)
+                       : !grRing(&ring) ? kIOReturnNotReady : arenaSwitchLocked(owner);   // 0.111.0
+    if (ret == kIOReturnSuccess && own && !clientRingLocked(own, &ring)) ret = kIOReturnNotReady;
+    if (ret == kIOReturnSuccess && !own) noteGrOwnerLocked(owner);
     if (ret == kIOReturnSuccess) ret = submitRing(ring, words, count, &ns, true);
-    *seqOut = subSeq_;
+    *seqOut = ring.seq ? *ring.seq : subSeq_;
     ulk();
     return ret;
 }
 
-IOReturn NVGspControl::waitGrFence(UInt32 seq, UInt32 timeoutUs, UInt32 *completedOut) {
-    return waitFence(0, seq, timeoutUs, completedOut);
+IOReturn NVGspControl::waitGrFence(UInt32 seq, UInt32 timeoutUs, UInt32 *completedOut,
+                                   const void *owner) {
+    return waitFence(0, seq, timeoutUs, completedOut, owner);
 }
 
-// fence wait on the GR (0) or CE (1) ring; 2 and up = video engine
+// 0.112.0: fence wait on the GR (0) or CE (1) ring; 0.116.0: 2+ = video engine.
 IOReturn NVGspControl::waitFence(UInt32 engine, UInt32 seq, UInt32 timeoutUs,
-                                 UInt32 *completedOut) {
+                                 UInt32 *completedOut, const void *owner) {
     if (!lock_ || !pci_ || !completedOut || engine >= 2 + nvgsp::kVideoEngineCount)
         return kIOReturnBadArgument;
     lk(__LINE__);
     Ring ring{};
     IOReturn ret = kIOReturnNotReady;
-    const bool have = engine == 0 ? grRing(&ring) : engine == 1 ? ceRing(&ring)
-                                                                : videoRing(engine - 2, &ring);
+    const bool have = engine == 0 ? grRingFor(owner, &ring) : engine == 1 ? ceRing(&ring)
+                                                                         : videoRing(engine - 2, &ring);
+    const bool own = engine == 0 && have && ring.seq != &subSeq_;   // 0.178.0
     if (have) {
         const bool sleepy = engine < 2 && intrArmed_ && !inIntr_ &&
                             vec_[engine ? kVecCeNs : kVecGrNs] != ~0U;
-        ret = (sleepy ? waitFenceSleep(engine, seq, timeoutUs) : waitRingSem(ring, seq, timeoutUs))
+        const UInt32 t = engine < 2 ? stallCapUs(ring, timeoutUs) : timeoutUs;   // 0.164.0
+        ret = (sleepy ? waitFenceSleep(engine, seq, t, owner) : waitRingSem(ring, seq, t))
             ? kIOReturnSuccess : kIOReturnTimeout;
-        if (sleepy && !(engine ? ceRing(&ring) : grRing(&ring))) {   // reset while asleep
+        if (sleepy && !(engine ? ceRing(&ring) : grRingFor(owner, &ring))) {   // reset while asleep
             ulk();
             return kIOReturnNotReady;
         }
+        if (sleepy && t >= 20000) noteRingWaitLocked(ring, ret == kIOReturnSuccess);
         UInt32 v = 0;
         readRingSem(ring, &v);
         *completedOut = v;
-        if (ret == kIOReturnTimeout && engine >= 2) videoMarkDeadLocked(engine - 2);
-        if (ret == kIOReturnSuccess && v == *ring.seq)
-            (engine == 0 ? asyncOutstanding_ : engine == 1 ? ceOutstanding_
-                                                           : video_[engine - 2].outstanding) = 0;
+        if (ret == kIOReturnTimeout && engine >= 2) videoMarkDeadLocked(engine - 2);   // 0.122.0
+        if (engine == 0) stampAdvanceLocked();   // 0.178.12
+        // 0.178.5: the owner's channel may have closed while we slept
+        // (another thread of the process exiting): never dereference it blind
+        ClientChannel *oc = own ? clientChannelLocked(owner) : nullptr;
+        if (ret == kIOReturnSuccess && v == *ring.seq && (!own || oc))
+            (oc ? oc->outstanding : engine == 0 ? asyncOutstanding_
+                : engine == 1 ? ceOutstanding_ : video_[engine - 2].outstanding) = 0;
     }
     ulk();
     return ret;
@@ -5314,7 +5903,7 @@ IOReturn NVGspControl::submitCe(const void *owner, const UInt32 *words, UInt32 c
     lk(__LINE__);
     IOReturn ret = kIOReturnNotReady;
     if (cePersistent_ && ceChunk_ &&
-        (ret = arenaSwitchLocked(owner)) == kIOReturnSuccess) {
+        (ret = arenaSwitchLocked(owner)) == kIOReturnSuccess) {   // 0.111.0
         constexpr UInt64 kCeVa = 0x108E00000ULL;
         const Ring ring{ceChunk_ + 0x10000, kCeVa + 0x10000, 0x1E0000,
                         ceChunk_ + 0x1F0000, kCeVa + 0x1F0000, ceChunk_,
@@ -5328,23 +5917,24 @@ IOReturn NVGspControl::submitCe(const void *owner, const UInt32 *words, UInt32 c
     return ret;
 }
 
-// Video engine channels. One channel per engine (NVDEC0 / NVENC0 / OFA0), brought up
-// the first time a user client needs it, with synchronous RPCs (userRpc), same way as
-// the CE channel at boot:
-//   GET_CONSTRUCTED_FALCON_INFO (context buffer size) -> 2 MiB VRAM chunk (GPFIFO,
-// fence semaphore, tail PB, falcon context; GPU VA = VRAM window + phys) -> USERD /
-// instance / method buffer (RPC memory) -> channel alloc (chid 5/6/7) -> BIND ->
-// SCHEDULE -> work submit token -> PROMOTE_CTX of the falcon context (in the GSP
-// split CPU-RM owns it, see kernel_falcon.c) -> engine object (NVC9B0 / NVC9B7 /
-// NVC9FA).
-// If something fails we free what got made; stage/status tell where it stopped.
-// Also a read-only runlist/CHRAM snapshot of a channel (nouveau ga100: DEVICE_INFO2
-// at 0x22800 gives each engine's runlist PRI base; runlist +0x4 = CHRAM base |
-// log2(channels), +0x8 bits 31:16 = doorbell id, +0x10/0x14 = PBDMA config;
-// CHRAM[chid] bits: ENABLE 1, NEXT 2, BUSY 3, PBDMA_FAULTED 22, ENG_FAULTED 23,
-// ON_PBDMA 24, ON_ENG 25, PENDING 26, CTX_RELOAD 27). devType 0x10 NVDEC, 0x0e NVENC,
-// 0x16 OFA, 0x13 CE. Published as {runlist base, chcfg, dbcfg, pbdma0, pbdma1,
-// CHRAM[chid], doorbell id << 16 | chid, RM work-submit token}. Caller holds lock_.
+// 0.116.0 (V1): video engine channels. A channel per engine (NVDEC0 /
+// NVENC0 / OFA0) is brought up on first use from a user client, with
+// synchronous RPCs (userRpc), the way the CE channel is at boot:
+//   GET_CONSTRUCTED_FALCON_INFO (context buffer size) -> 2 MiB VRAM chunk
+//   (GPFIFO, fence semaphore, tail PB, falcon context; GPU VA = VRAM window
+//   + phys) -> USERD / instance / method buffer (RPC memory) -> channel
+//   alloc (chid 5/6/7) -> BIND -> SCHEDULE -> work submit token ->
+//   PROMOTE_CTX of the falcon context (CPU-RM owns it in the GSP split,
+//   kernel_falcon.c) -> engine object (NVC9B0 / NVC9B7 / NVC9FA).
+// Failure frees what was made; stage/status say where it stopped.
+// 0.123.0: read-only runlist/CHRAM snapshot of a channel (nouveau ga100:
+// DEVICE_INFO2 at 0x22800 gives each engine's runlist PRI base; runlist +0x4
+// = CHRAM base | log2(channels), +0x8 bits 31:16 = doorbell id, +0x10/0x14 =
+// PBDMA config; CHRAM[chid] bits: ENABLE 1, NEXT 2, BUSY 3, PBDMA_FAULTED 22,
+// ENG_FAULTED 23, ON_PBDMA 24, ON_ENG 25, PENDING 26, CTX_RELOAD 27).
+// devType 0x10 NVDEC, 0x0e NVENC, 0x16 OFA, 0x13 CE; published as
+// {runlist base, chcfg, dbcfg, pbdma0, pbdma1, CHRAM[chid], doorbell id << 16 | chid,
+//  RM work-submit token}. Caller holds lock_.
 void NVGspControl::runlistDiagLocked(const char *key, UInt32 devType, UInt32 inst,
                                      UInt32 chid, UInt32 token, UInt32 *runlistOut,
                                      UInt32 *chramOut, UInt32 *tokenOut) {
@@ -5387,11 +5977,10 @@ void NVGspControl::runlistDiagLocked(const char *key, UInt32 devType, UInt32 ins
     if (tokenOut && out[0] != ~0U) *tokenOut = out[6];
 }
 
-// A video ring whose fence didn't come in time: publish its USERD
-// GP_GET/GP_PUT (did the PBDMA fetch anything at all?) and the
-// semaphore, and keep it out of engine drains from now on. Submits are
-// still allowed (for diagnostics); a GPU reset clears the flag. Caller
-// holds lock_.
+// 0.122.0: a video ring whose fence did not arrive in time: publish its
+// USERD GP_GET/GP_PUT (did the PBDMA fetch anything?) and the semaphore,
+// and leave it out of engine drains from now on. Submits stay allowed
+// (diagnostics); a GPU reset clears it. Caller holds lock_.
 void NVGspControl::videoMarkDeadLocked(UInt32 index) {
     if (index >= nvgsp::kVideoEngineCount || !video_[index].ready) return;
     VideoChan &v = video_[index];
@@ -5417,8 +6006,8 @@ void NVGspControl::videoMarkDeadLocked(UInt32 index) {
     videoRunlistDiagLocked(index, "-dead");
 }
 
-// runlist/CHRAM snapshot of video channel `index` and, to compare, of our working CE
-// channel (COPY0 = DEVICE_INFO type 0x13 inst 0, chid 4)
+// 0.123.0: runlist/CHRAM snapshot of video channel `index` and, for
+// comparison, of our working CE channel (COPY0 = DEVICE_INFO type 0x13 inst 0, chid 4).
 void NVGspControl::videoRunlistDiagLocked(UInt32 index, const char *suffix) {
     static const UInt32 kDevType[nvgsp::kVideoEngineCount] = {0x10, 0x0e, 0x16};
     const nvgsp::VideoEngineDesc *e = nvgsp::videoEngine(index);
@@ -5429,10 +6018,9 @@ void NVGspControl::videoRunlistDiagLocked(UInt32 index, const char *suffix) {
     appendStr(key, sizeof(key), &pos, e->name);
     appendStr(key, sizeof(key), &pos, suffix);
     key[pos] = '\0';
-    // RM gives the bare chid (0x5) as work-submit token for the video
-    // channels, but their runlist has doorbell id 3 (nouveau ga100: token =
-    // runlist doorbell << 16 | chid), so we ring the usermode doorbell with
-    // that
+    // 0.129.0: RM's work-submit token for the video channels is the bare chid
+    // (0x5), but their runlist has doorbell id 3 (nouveau ga100: token =
+    // runlist doorbell << 16 | chid); ring the usermode doorbell with that.
     VideoChan &v = video_[index];
     if (!v.rmToken) v.rmToken = v.token;
     UInt32 calc = 0;
@@ -5508,7 +6096,7 @@ static const nvgsp::VideoEngineDesc kKernelCe = {"kce", nvgsp::kEngineTypeCopy0,
                                                  0xc0d20300, 8};
 
 IOReturn NVGspControl::videoSetup(UInt32 index, UInt32 gen) {
-    const bool kce = index == nvgsp::kVideoEngineCount;
+    const bool kce = index == nvgsp::kVideoEngineCount;   // 0.149.0
     const nvgsp::VideoEngineDesc &e = kce ? kKernelCe : *nvgsp::videoEngine(index);
     constexpr UInt32 kClient = 0xc0d00001, kDevice = 0xc0d00080, kSubdev = 0xc0d02080;
     constexpr UInt32 kVas = 0xc0d090f1;
@@ -5522,8 +6110,7 @@ IOReturn NVGspControl::videoSetup(UInt32 index, UInt32 gen) {
     VideoChan v{};
     UInt32 stage = 0, status = 0, rb = 0;
     bool chanMade = false, backMade[3] = {};
-    // one RPC; ok means transport, RPC result and RM status are all
-    // zero
+    // One RPC; ok = transport, RPC result and RM status all zero.
     auto call = [&](UInt32 fn, UInt32 bytes, UInt32 statusAt, UInt32 step) -> bool {
         UInt32 result = ~0U, st = ~0U;
         rb = kReplyCap;
@@ -5631,11 +6218,10 @@ IOReturn NVGspControl::videoSetup(UInt32 index, UInt32 gen) {
         if (ok) __builtin_memcpy(&v.token, reply + 104, 4);
         if (ok && !v.token) { ok = false; status = 0xffff0009; }
     }
-    // 10: promote the falcon context (skipped when the engine reports size 0).
-    // The first layout we used got NV_ERR_INVALID_STATE on hardware, so we go
-    // through the layouts in NVGspVideo.hpp in order and, if all get refused,
-    // create the object without a promote. promote = variant used (3 = none) <<
-    // 32 | first status.
+    // 10: falcon context promote (none when the engine reports size 0).
+    // 0.120.0: 0.116.0's layout got NV_ERR_INVALID_STATE live; try the
+    // layouts of NVGspVideo.hpp in order, then (all refused) the object
+    // without a promote. promote = variant used (3 = none) << 32 | first status.
     UInt32 promoteVariant = nvgsp::kPromoteVariants, promoteFirst = 0, promoteVaStatus = ~0U;
     if (ok && v.ctxBytes) {
         bool promoted = false;
@@ -5649,8 +6235,8 @@ IOReturn NVGspControl::videoSetup(UInt32 index, UInt32 gen) {
             else if (!promoteFirst) promoteFirst = status;
         }
         status = promoted ? 0 : promoteFirst;
-        // after the physical-only promote, bind the context VA too (UVM does a
-        // second promote); without it the object alloc failed with 0x57
+        // 0.121.0: after the physical-only promote, bind the context VA
+        // (UVM's second promote); live 0.120.0 object alloc without it = 0x57.
         if (promoted && promoteVariant == nvgsp::kPromoteRmExternal) {
             UInt8 *p = control(kSubdev, nvgsp::kCmdPromoteCtx, nvgsp::kPromoteCtxBytes);
             const bool bound = nvgsp::buildFalconPromoteVa(e.engineType, kClient, hChan,
@@ -5675,8 +6261,8 @@ IOReturn NVGspControl::videoSetup(UInt32 index, UInt32 gen) {
     if (ok && gen != gpuResets_) { ok = false; status = 0xffff000c; }
     ulk();
     if (!ok) {
-        // free the channel (object + context binding go with it), then the
-        // backing memory; 16-byte NVOS00 {hRoot, hParent, hObject, status}
+        // free the channel (and with it the object + context binding), then
+        // the backing memory; 16-byte NVOS00 {hRoot, hParent, hObject, status}
         UInt32 st = stage, sv = status;
         for (UInt32 i = 0; i < 4; ++i) {
             if (i == 0 ? !chanMade : !backMade[i - 1]) continue;
@@ -5696,7 +6282,7 @@ IOReturn NVGspControl::videoSetup(UInt32 index, UInt32 gen) {
         live = v;
         live.ready = true;
         stage = 12;
-        if (!kce) videoRunlistDiagLocked(index, "");
+        if (!kce) videoRunlistDiagLocked(index, "");   // 0.123.0
     }
     if (kce && !ok) kceFailGen_ = gpuResets_;
     live.stage = stage;
@@ -5713,7 +6299,7 @@ IOReturn NVGspControl::videoSetup(UInt32 index, UInt32 gen) {
         appendStr(key, sizeof(key), &pos, e.name);
         key[pos] = '\0';
         setProperty(key, (UInt64(promoteVariant) << 32) | promoteFirst, 64);
-        pos = 0;   // status of the VA bind promote (~0 = never sent)
+        pos = 0;   // 0.121.0: VA bind promote status (~0 = not sent)
         appendStr(key, sizeof(key), &pos, "NVGspControl-video-promote-va-");
         appendStr(key, sizeof(key), &pos, e.name);
         key[pos] = '\0';
@@ -5731,18 +6317,18 @@ IOReturn NVGspControl::videoSetup(UInt32 index, UInt32 gen) {
     return ok ? kIOReturnSuccess : kIOReturnIOError;
 }
 
-// Caller holds lock_. The channels die along with the GSP/VAS (reset,
-// stop, resume), we only have to drop our chunk bookkeeping.
+// Caller holds lock_. The channels die with the GSP/VAS (reset, stop,
+// resume); only the chunk bookkeeping is ours to drop.
 void NVGspControl::videoDropLocked() {
     for (UInt32 i = 0; i < nvgsp::kVideoEngineCount; ++i) {
         if (video_[i].memHandle) releaseGpuMemLocked(video_[i].memHandle - 1);
         video_[i] = VideoChan{};
     }
-    if (kce_.memHandle) releaseGpuMemLocked(kce_.memHandle - 1);
+    if (kce_.memHandle) releaseGpuMemLocked(kce_.memHandle - 1);   // 0.149.0
     kce_ = VideoChan{};
 }
 
-// memory per client, refreshed from the status poll (every 2 s):
+// 0.160.0: memory per client, refreshed from the status poll (every 2 s):
 // "pid N: objs O, vram V MiB, sys S MiB, user U MiB" plus totals, so a
 // process that keeps allocating (or VRAM filling up) shows at a glance.
 void NVGspControl::publishMemByClientLocked() {
@@ -5777,11 +6363,14 @@ void NVGspControl::publishMemByClientLocked() {
     setProperty("NVGspControl-mem-by-client", s);
     setProperty("NVGspControl-mem-slots-used", used, 32);
     setProperty("NVGspControl-mem-vram-bytes", tv, 64);
+    setProperty("NVGspControl-mem-sys-bytes", ts + tu, 64);   // 0.162.1: NVAccelerator's PerformanceStatistics
 }
 
 IOReturn NVGspControl::pollStatusLocked() {
     publishMemByClientLocked();
     if (!executed_) return kIOReturnNotReady;
+    // 0.81.0: the 0.9.6 per-poll bisect64 properties (4 new keys per
+    // poll, unbounded) are gone.
     nvgsp::MsgqTxHeader header{};
     UInt32 readPtr = 0;
     UInt8 first[64]{};
@@ -5843,34 +6432,34 @@ IOReturn NVGspControl::pollStatusLocked() {
     bool gpfifoBackingAllocResponse = false, userdBackingAllocResponse = false;
     bool methodSizeResponse = false, instanceBackingAllocResponse = false;
     bool methodBackingAllocResponse = false;
-    // a refused answer is different from no answer at all (stall)
+    // 0.7.0: answered-but-refused is distinct from no-answer (stall).
     bool methodSizeAnswered = false, instanceBackingAnswered = false;
     bool methodBackingAnswered = false;
     bool errBackingAllocResponse = false;
     bool errCtxAllocReturned = false, errCtxAllocResponse = false;
     bool channelAllocReturned = false, channelAllocResponse = false;
-    // bind + schedule keep a channel alive once it's allocated
+    // 0.7.1: bind + schedule keep a successfully allocated channel alive.
     bool bindReturned = false, bindResponse = false;
     bool scheduleReturned = false, scheduleResponse = false;
-    // bind + schedule at TSG level (channel-level schedule gives 0x1f)
+    // 0.7.2: TSG-level bind + schedule (channel-level schedule is 0x1f).
     bool tsgBindReturned = false, tsgBindResponse = false;
     bool tsgScheduleReturned = false, tsgScheduleResponse = false;
-    // TSG GET_INFO diagnostic between bind and schedule
+    // 0.7.3: TSG GET_INFO diagnostic between bind and schedule.
     bool tsgInfoReturned = false, tsgInfoResponse = false;
-    // SET_TIMESLICE policy check (disable also gave 0x1f, so that probe
-    // went)
+    // 0.7.5: SET_TIMESLICE policy discriminator (replaces the 0.7.4
+    // disable probe — disable also 0x1f, matrix resolved).
     bool tsgTimesliceReturned = false, tsgTimesliceResponse = false;
-    // FIFO info (58-61) + token (62) + DMA flush (63). No schedule.
+    // 0.8.0: FIFO intel (58-61) + token (62) + DMA flush (63). No schedule.
     bool fifoInfoReturned = false, fifoInfoResponse = false;
     bool userdLocReturned = false, userdLocResponse = false;
     bool partnerReturned = false, partnerResponse = false;
     bool priBaseReturned = false, priBaseResponse = false;
     bool tokenReturned = false, tokenResponse = false;
     bool flushReturned = false, flushResponse = false;
-    // display parent (64) + PB backing (65) + ctxdma (66) + notifier backing
-    // (67) + notifier ctxdma (68). Phase 69 is the split-RM physical
-    // pushbuffer control, its function-76 response is let through by
-    // expectedPostInit below.
+    // 0.8.1: display parent (64) + PB backing (65) + ctxdma (66) + c77d (67).
+    // 0.8.4: + notifier backing (67) + notifier ctxdma (68); c77d moves to 69.
+    // 0.8.5: phase 69 is the split-RM physical pushbuffer control instead.
+    // 0.8.6: its function-76 response is admitted by expectedPostInit below.
     bool dispReturned = false, dispResponse = false;
     bool pbBackingReturned = false, pbBackingResponse = false;
     bool pbCtxdmaReturned = false, pbCtxdmaResponse = false;
@@ -5878,162 +6467,160 @@ IOReturn NVGspControl::pollStatusLocked() {
     bool notifyCtxdmaReturned = false, notifyCtxdmaResponse = false;
     bool dispPbProgramReturned = false, dispPbProgramResponse = false;
     bool dispKickFlushReturned = false, dispKickFlushResponse = false;
-    // handler validation probes (71: valid=0/ch0, 72: valid=1/ch7)
+    // 0.8.9: handler-validation probes (71: valid=0/ch0, 72: valid=1/ch7).
     bool dispHandlerProbe1Returned = false, dispHandlerProbe1Response = false;
     bool dispHandlerProbe2Returned = false, dispHandlerProbe2Response = false;
-    // function-97 schedule retry (73: channel, 74: TSG)
+    // 0.9.0: function-97 schedule retry (73: channel, 74: TSG).
     bool sched97chanReturned = false, sched97chanResponse = false;
     bool sched97tsgReturned = false, sched97tsgResponse = false;
-    // C372 display-SW alloc probe (75) + head survey after FWSEC
+    // 0.9.1: C372 display-SW alloc probe (75) + post-FWSEC head survey.
     bool dispC372Returned = false, dispC372Response = false;
-    // display-common (0x73) alloc probe (76)
+    // 0.9.2: display-common (0x73) alloc probe (76).
     bool dispCommonReturned = false, dispCommonResponse = false;
-    // display-common queries on the 0x73 object (77: GET_SUPPORTED, 78:
-    // GET_NUM_HEADS, 79: GET_ACTIVE head0), the first RM display queries
+    // 0.9.7: display-common queries on the 0x73 object (77: GET_SUPPORTED,
+    // 78: GET_NUM_HEADS, 79: GET_ACTIVE head0). First RM display queries.
     bool dispSysSupportedReturned = false, dispSysSupportedResponse = false;
     bool dispSysNumHeadsReturned = false, dispSysNumHeadsResponse = false;
     bool dispSysActiveReturned = false, dispSysActiveResponse = false;
-    // GET_ACTIVE heads 1-3 (80-82), GET_CONNECT_STATE (83),
+    // 0.9.8: GET_ACTIVE heads 1-3 (80-82), GET_CONNECT_STATE (83),
     // GET_BOOT_DISPLAYS (84). All read-only on the 0x73 object.
     bool dispSysActive1Returned = false, dispSysActive1Response = false;
     bool dispSysActive2Returned = false, dispSysActive2Response = false;
     bool dispSysActive3Returned = false, dispSysActive3Response = false;
     bool dispConnectReturned = false, dispConnectResponse = false;
     bool dispBootDisplaysReturned = false, dispBootDisplaysResponse = false;
-    // SCANLINE head0 (85), VBLANK_COUNTER head0 (86), HEAD_ROUTING_MAP
-    // (87). Read-only, just proves scanout is alive.
+    // 0.9.9: SCANLINE head0 (85), VBLANK_COUNTER head0 (86),
+    // HEAD_ROUTING_MAP (87). Read-only scanout-state proof.
     bool dispScanlineReturned = false, dispScanlineResponse = false;
     bool dispVblankReturned = false, dispVblankResponse = false;
     bool dispRoutingReturned = false, dispRoutingResponse = false;
-    // first C372 control call: GET_ACTIVE_VIEWPORT_POINT_IN
+    // 0.10.0: first C372 control call — GET_ACTIVE_VIEWPORT_POINT_IN
     // (0xc3720104) window 0 on the 0xc0d0c372 object (88). Read-only.
     bool dispViewportReturned = false, dispViewportResponse = false;
-    // DFP_GET_INFO (0x731140) on display 0x200 through the 0x73 object
-    // (like nvkms GetDfpInfo, phase 89). Read-only.
+    // 0.11.0: DFP_GET_INFO (0x731140) on display 0x200 via the 0x73
+    // object (nvkms GetDfpInfo pattern, phase 89). Read-only.
     bool dispDfpReturned = false, dispDfpResponse = false;
-    // SPECIFIC_GET_EDID_V2 (0x730245) cached read on display 0x200
-    // through the 0x73 object (like nvkms ReadEdidFromResman, phase
-    // 90). 2064 B params; we hash the EDID and keep the first bytes.
+    // 0.12.0: SPECIFIC_GET_EDID_V2 (0x730245) cached read on display
+    // 0x200 via the 0x73 object (nvkms ReadEdidFromResman pattern,
+    // phase 90). 2064B params; EDID hashed + first bytes captured.
     bool dispEdidReturned = false, dispEdidResponse = false;
-    // SPECIFIC_GET_PCLK_LIMIT (0x73028a, phase 91) +
+    // 0.14.0: SPECIFIC_GET_PCLK_LIMIT (0x73028a, phase 91) +
     // SPECIFIC_OR_GET_INFO (0x73028b, phase 92, index 0) on display
-    // 0x200: pixel clock limits, SOR/OR assignment and the VBIOS-lit
-    // flag
+    // 0x200. Pixel-clock bounds + SOR/OR assignment + VBIOS-lit flag.
     bool dispPclkReturned = false, dispPclkResponse = false;
     bool dispOrReturned = false, dispOrResponse = false;
-    // SYSTEM_GET_CAPS_V2 (0x730101, phase 93, 2 B caps table) +
-    // SYSTEM_GET_VBLANK_ENABLE head0 (0x730106, phase 94)
+    // 0.15.0: SYSTEM_GET_CAPS_V2 (0x730101, phase 93, 2B caps table)
+    // + SYSTEM_GET_VBLANK_ENABLE head0 (0x730106, phase 94).
     bool dispCapsReturned = false, dispCapsResponse = false;
     bool dispVbEnReturned = false, dispVbEnResponse = false;
-    // C372 IS_MODE_POSSIBLE (0xc3720101, phase 95) with a zeroed 2048 B
-    // struct (numHeads=0, sizeof checked on the host against the open
-    // headers). Only checks the validation path is alive, no made-up
+    // 0.16.0: C372 IS_MODE_POSSIBLE (0xc3720101, phase 95) with a
+    // zeroed 2048B struct (numHeads=0; host-verified sizeof against
+    // the open headers). Validation-path liveness, no fabricated
     // timing. bIsPossible @1904.
     bool dispImpReturned = false, dispImpResponse = false;
-    // IS_MODE_POSSIBLE head0 with CTA-861 4K60 (phase 96). Same 2048 B
-    // struct; head0 = {594 MHz, 3840x2160, blank
-    // (4016,2168)-(4400,2250)}, numWindows=0. Read-only check of real
-    // timing (the GOP mode), no windows or surfaces.
+    // 0.17.0: IS_MODE_POSSIBLE head0 CTA-861 4K60 (phase 96).
+    // Same 2048B struct; head0 = {594 MHz, 3840x2160, blank
+    // (4016,2168)-(4400,2250)}, numWindows=0. Read-only validation
+    // of real timing (GOP mode), no windows/surfaces.
     bool dispModeReturned = false, dispModeResponse = false;
-    // SPECIFIC_GET_CONNECTOR_DATA (0x730250, phase 97, 72 B) on display
-    // 0x200: physical connector index/type/location from firmware
-    // (should need no engine init)
+    // 0.18.0: SPECIFIC_GET_CONNECTOR_DATA (0x730250, phase 97,
+    // 72B) on display 0x200 — physical connector index/type/
+    // location from firmware (no engine init needed, hopefully).
     bool dispConnReturned = false, dispConnResponse = false;
-    // subdevice discovery: MC_GET_ARCH_INFO (0x20801701, phase 98, 13
-    // B) + GPU_GET_NAME_STRING ASCII (0x20800110, phase 99, 68 B) on
-    // 0xc0d02080. Read-only engine/chip IDs.
+    // 0.19.0: subdevice discovery — MC_GET_ARCH_INFO (0x20801701,
+    // phase 98, 13B) + GPU_GET_NAME_STRING ASCII (0x20800110,
+    // phase 99, 68B) on 0xc0d02080. Read-only engine/chip IDs.
     bool dispArchReturned = false, dispArchResponse = false;
     bool dispNameReturned = false, dispNameResponse = false;
-    // FIFO_GET_PHYSICAL_CHANNEL_COUNT (0x20801108, phase 100, 8 B) on
-    // the subdevice, to see if the 0x1F refusal is for the whole object
-    // or just one interface
+    // 0.20.0: FIFO_GET_PHYSICAL_CHANNEL_COUNT (0x20801108, phase
+    // 100, 8B) on the subdevice — wall test: is the 0x1F wall
+    // object-wide (close subdevice branch) or interface-specific?
     bool dispFifoReturned = false, dispFifoResponse = false;
-    // FIFO_GET_ALLOCATED_CHANNELS (0x20801119, phase 101, 516 B,
-    // runlist 0): is our cid-3 channel counted in RM's runlist?
-    // popcount + first words get published
+    // 0.21.0: FIFO_GET_ALLOCATED_CHANNELS (0x20801119, phase 101,
+    // 516B, runlist 0) — is our cid-3 channel in RM's runlist
+    // accounting? popcount + first words published.
     bool dispRunlistReturned = false, dispRunlistResponse = false;
-    // GR BIND (0xa06f0104, engineType=1) on the COPY-bound channel
-    // (phase 102). BIND sets things up for scheduling, a GR bind might
-    // go through where the COPY schedule got refused. An empty GPFIFO
-    // just idles.
+    // 0.22.0: GR BIND (0xa06f0104, engineType=1) on the COPY-bound
+    // channel (phase 102). BIND configures for scheduling; a GR bind
+    // may succeed where COPY-schedule refused. Empty GPFIFO idles.
     bool dispGrBindReturned = false, dispGrBindResponse = false;
-    // query the runlist again after the GR bind (phase 103, same 516 B
-    // command, runlist 0): did our channel get scheduled? Compare
-    // popcount/w0 with the earlier sample (58/0x0).
+    // 0.23.0: runlist RE-QUERY after the GR bind (phase 103, same
+    // 516B command, runlist 0) — did our channel get scheduled?
+    // Compare popcount/w0 against 0.21.0 (58/0x0).
     bool dispReRunReturned = false, dispReRunResponse = false;
-    // runlist isolation: phase 104 = third sample of runlist 0 (bind vs
-    // time), 105/106 = runlists 1/2 (maybe our channel sits on another
-    // runlist). Same 516 B command.
+    // 0.24.0: runlist isolation — phase 104 = runlist 0 third
+    // sample (bind-vs-time), 105/106 = runlists 1/2 (is our
+    // channel on another runlist?). Same 516B command.
     bool dispRl0cReturned = false, dispRl0cResponse = false;
     bool dispRl1Returned = false, dispRl1Response = false;
     bool dispRl2Returned = false, dispRl2Response = false;
-    // GPFIFO_SCHEDULE after the GR bind (0xa06f0103, phase 107, exactly
-    // 2 B {bEnable=1, bSkipSubmit=0} as per header) + rl0 query again
-    // (phase 108). Schedule was never retried after a GR bind before,
-    // so this is a new condition. An empty GPFIFO idles if enabled.
+    // 0.26.0: post-GR-bind GPFIFO_SCHEDULE (0xa06f0103, phase 107,
+    // exact 2B {bEnable=1, bSkipSubmit=0} per header) + rl0 re-query
+    // (phase 108). Schedule never retried after GR bind — new
+    // condition. Empty GPFIFO idles if enabled.
     bool dispSchedReturned = false, dispSchedResponse = false;
     bool dispPostReturned = false, dispPostResponse = false;
-    // rl1/rl2 samples after the schedule (phases 109/110, same 516 B
-    // command): did schedule move us off rl0? Only popcount + hash +
-    // w0/w1 get published (keeps telemetry small).
+    // 0.27.0: rl1/rl2 POST-schedule samples (phases 109/110,
+    // same 516B command) — did schedule place us off rl0?
+    // Publish popcount + hash + w0/w1 only (telemetry trim).
     bool dispPs1Returned = false, dispPs1Response = false;
     bool dispPs2Returned = false, dispPs2Response = false;
-    // FIFO_GET_DEVICE_INFO_TABLE (0x20801112, phase 111, 3212 B:
-    // baseIndex=0, numEntries=32): engine entries with PBDMA ids and
-    // names, read-only, for the doorbell
+    // 0.29.0: FIFO_GET_DEVICE_INFO_TABLE (0x20801112, phase 111,
+    // 3212B: baseIndex=0, numEntries=32) — engine entries with
+    // PBDMA ids + names. Read-only PBDMA identity for doorbell.
     bool dispDevInfoReturned = false, dispDevInfoResponse = false;
-    // local VRAM surveys (no RPC): USERD slot baseline (phase 112, 8x
-    // u64 including GET) + compute GPFIFO head (phase 113, 4x u64
-    // entries) through the PRAMIN window. Tells us whether the engine
-    // touched anything, which decides the kick design.
+    // 0.31.0: local VRAM surveys (no RPC) — USERD slot baseline
+    // (phase 112, 8x u64 incl. GET) + compute GPFIFO head
+    // (phase 113, 4x u64 entries) via the proven PRAMIN window.
+    // Decides kick design: engine touched anything?
     bool dispUserdReturned = false, dispUserdResponse = false;
     bool dispGpfifoReturned = false, dispGpfifoResponse = false;
-    // RAMFC/instance survey (phase 114, 8x u64 at
-    // instanceBackingOffset_): PUT/GET shadows the way RM sees them
+    // 0.32.0: RAMFC/instance survey (phase 114, 8x u64 at
+    // instanceBackingOffset_) — PUT/GET shadows as RM sees them.
     bool dispRamfcReturned = false, dispRamfcResponse = false;
-    // FIFO on the DEVICE object: FIFO_GET_CAPS_V2 (0x801713, phase 115,
-    // 2 B) + GET_ENGINE_CONTEXT_PROPERTIES GRAPHICS (0x801707, phase
-    // 116, 12 B) on device 0xc0d00080. Read-only.
+    // 0.33.0: DEVICE-object FIFO plane (new wall surface) —
+    // FIFO_GET_CAPS_V2 (0x801713, phase 115, 2B) +
+    // GET_ENGINE_CONTEXT_PROPERTIES GRAPHICS (0x801707, phase 116,
+    // 12B) on device 0xc0d00080. Read-only.
     bool dispFifoCapsReturned = false, dispFifoCapsResponse = false;
     bool dispCtxPropReturned = false, dispCtxPropResponse = false;
-    // GR_GET_TPC_PARTITION_MODE (0x801107, phase 117, 32 B: hTSG +
-    // zeros) on the device: TPC partition state for our TSG (decides
-    // which GR units we get). GET only.
+    // 0.34.0: GR_GET_TPC_PARTITION_MODE (0x801107, phase 117,
+    // 32B: hTSG + zeros) on device — TPC partition state for OUR
+    // TSG (affects GR units available). GET only.
     bool dispTpcReturned = false, dispTpcResponse = false;
-    // GPFIFO_GET_WORK_SUBMIT_TOKEN (0xc36f0108, phase 118, 4 B) on the
-    // GR-bound scheduled channel, then a local NOP kick (phase 119:
-    // poll GP_GET). Control entry with LENGTH 0, so no PB fetch.
+    // 0.35.0: GPFIFO_GET_WORK_SUBMIT_TOKEN (0xc36f0108, phase 118,
+    // 4B) on the GR-bound scheduled channel, then local NOP kick
+    // (phase 119: GP_GET poll). Control entry, LENGTH 0: no PB fetch.
     bool dispTokenReturned = false, dispTokenResponse = false;
-    // INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO (0x20800a32, phase
-    // 121, 1664 B) on the internal subdevice: GR0 ctx buffer
-    // sizes/alignments (26 ids) we need for the client-RM ctx alloc and
-    // PROMOTE_CTX
+    // 0.37.0: INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO (0x20800a32,
+    // phase 121, 1664B) on the internal subdevice — GR0 ctx buffer
+    // sizes/alignments (26 ids) for client-RM ctx alloc + PROMOTE_CTX.
     bool dispCtxBufReturned = false, dispCtxBufResponse = false;
-    // ctx VRAM alloc (103, phase 122), PROMOTE_CTX (0x2080012b, phase
-    // 123), ADA_COMPUTE_A object on the channel (103, phase 124), then
-    // a local SET_OBJECT + WFI semaphore kick poll (phase 125)
+    // 0.38.0: ctx VRAM alloc (103, phase 122), PROMOTE_CTX (0x2080012b,
+    // phase 123), ADA_COMPUTE_A object on the channel (103, phase 124),
+    // then local SET_OBJECT + WFI semaphore kick poll (phase 125).
     bool ctxMemReturned = false, ctxMemResponse = false;
     bool promoteReturned = false, promoteResponse = false;
     bool grObjReturned = false, grObjResponse = false;
-    // display core channel probe (experiment bit1): 64 KiB display instance
-    // VRAM (103, phase 200), INTERNAL_DISPLAY_WRITE_INST_MEM (0x20800a49,
-    // phase 201), then after set_pushbuf the C77D core channel alloc with the
-    // nouveau r535 params (103, phase 202)
+    // 0.51.0: display core-channel probe (experiment bit1): 64 KiB
+    // display instance VRAM (103, phase 200), INTERNAL_DISPLAY_WRITE_INST_MEM
+    // (0x20800a49, phase 201), then after set_pushbuf the C77D core
+    // channel alloc with nouveau r535 params (103, phase 202).
     bool dispInstMemReturned = false, dispInstMemResponse = false;
     bool dispInstWriteReturned = false, dispInstWriteResponse = false;
     bool coreChanReturned = false, coreChanResponse = false;
-    // display health after the kick (display common 0x73 alloc 203,
-    // GET_ACTIVE head0 204, GET_SCANLINE head0 twice 205/206)
+    // 0.53.0: post-kick display health (display common 0x73 alloc 203,
+    // GET_ACTIVE head0 204, GET_SCANLINE head0 x2 205/206).
     bool dispHealthReturned = false, dispHealthOk = false;
-    // window 0 channel (experiment bit2): set_pushbuf C67E (207), C67E
-    // alloc (208), then a local flip kick
+    // 0.54.0: window 0 channel (experiment bit2): set_pushbuf C67E (207),
+    // C67E alloc (208), then a local flip kick.
     bool wndPbReturned = false, wndPbOk = false;
     bool wndChanReturned = false, wndChanOk = false;
-    // reply to the 2D object alloc (phase 209)
+    // 0.57.0: 2D object alloc reply (phase 209).
     bool twoDReturned = false;
     bool scratchReturned = false;
-    // CE chain replies (212 alloc, 213 bind, 214 schedule, 215 token,
-    // 216 CE object)
+    // 0.63.0: CE chain replies (212 alloc, 213 bind, 214 schedule,
+    // 215 token, 216 CE object).
     bool ceReturned = false, ceOk = false;
     bool ceUserdReturned = false, ceBackingOk = false;
     bool perfReturned = false;
@@ -6054,9 +6641,9 @@ IOReturn NVGspControl::pollStatusLocked() {
     UInt8 classList[404]{};
     UInt32 classListStatus = ~0U;
     UInt32 deviceIds = 0, attachedIds[32]{};
-    // Draining NOCAT journal records is fine, NVIDIA's host handler only copies
-    // them into an optional diagnostic journal. Once we release them GSP-RM can
-    // post the rest of its boot events into its 63-entry ring.
+    // Draining NOCAT journal records is safe: NVIDIA's host handler only copies
+    // them into an optional diagnostic journal. Releasing them lets GSP-RM
+    // publish the remaining boot events into its 63-entry ring.
     UInt32 idleWaits = 0;
     for (UInt32 wait = 0; wait < 4000 && recordCount < kMaxRecords; ++wait) {
         if (!init_.snapshotStatus(&header, &readPtr, first, sizeof(first))) {
@@ -6065,22 +6652,25 @@ IOReturn NVGspControl::pollStatusLocked() {
         UInt32 available = header.writePtr + header.msgCount - readPtr;
         if (available >= header.msgCount) available -= header.msgCount;
         if (!available) {
-            // Once the chain is parked (phase 33) an empty queue just
-            // means there's nothing to do, so return instead of
-            // busy-waiting 4 s with lock_ held (every daemon poll used
-            // to take 4.3 s and vblank/flip/submit all got stuck behind
-            // it). Waiters (userRpc, ping) loop on pollStatusLocked
-            // themselves.
+            // 0.81.0: once the chain is parked (phase 33) an empty queue
+            // means "nothing to do" — return instead of busy-waiting 4 s
+            // with lock_ held (0.80.0: every daemon poll took 4.3 s and
+            // stalled vblank/flip/submit behind it). Waiters (userRpc,
+            // ping) loop on pollStatusLocked themselves.
             if (postInitPhase_ == 33) break;
-            // Leave once a collected batch has gone quiet for 50 ms instead
-            // of burning the ~4 s tail. An empty drain still waits exactly
-            // like before, because local (no-RPC) chain phases depend on
-            // this loop continuing; an earlier idle exit (150 ms without a
-            // message) parked the chain at pb-backing / disp-sched. Only the
-            // watchdog is time based.
+            // 0.90.0: during the chain, stop after 150 ms without a new
+            // message (replies normally land within a few ms); the daemon's
+            // next 1 s poll picks up slow ones. Was a fixed 4 s busy-wait
+            // per poll → ~7 minutes for the 114-poll chain.
+            // 0.92.0: idle-exit reverted — local (no-RPC) chain phases rely
+            // on this loop continuing; 0.90/0.91 parked the chain at
+            // pb-backing / disp-sched. Only the watchdog stays time-based.
+            // 0.95.0: exit once a collected batch goes quiet (50 ms) instead
+            // of burning the ~4 s tail; an empty drain keeps waiting exactly
+            // like before, so the 0.90/0.91 park class cannot recur.
             ++idleWaits;
-            // nothing outstanding (last step queued no RPC) so no reply to
-            // wait for, let the phase machine run right away
+            // 0.100.6: nothing outstanding (previous step queued no RPC) ⇒ no
+            // reply to wait for; let the phase machine run now.
             if (drainNoWait_ && recordCount == 0) {
                 profDrainEnd_ = mach_absolute_time();
                 profIdle_ = idleWaits;
@@ -6091,7 +6681,7 @@ IOReturn NVGspControl::pollStatusLocked() {
                 profIdle_ = idleWaits;
                 break;
             }
-            // wait for the reply with lock_ dropped (each pass
+            // 0.146.4: wait for the reply with lock_ dropped (each pass
             // re-snapshots the queue and nothing is half-consumed here);
             // this 1 ms busy-wait under the lock was the remaining 10-100 ms
             // interrupt/vblank stalls at boot.
@@ -6111,9 +6701,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             badReason = 3; break;
         }
         uint64_t messageBytes = static_cast<uint64_t>(sizeof(q)) + rpc.length;
-        // A big reply (e.g. the ALLOC_MEMORY memlist echo) gives its full
-        // length in the first element and the rest comes as CONTINUATION
-        // records (fn 71, eaten below). We keep only the first part.
+        // 0.100.0: a large reply (e.g. ALLOC_MEMORY memlist echo) announces its
+        // full length in the first element; the rest follows as CONTINUATION
+        // records (fn 71, consumed below). Keep only the first part.
         if (largeReplyOk_ && rpc.length >= sizeof(rpc) &&
             messageBytes > q.elementCount * 4096ULL)
             messageBytes = q.elementCount * 4096ULL;
@@ -6188,7 +6778,7 @@ IOReturn NVGspControl::pollStatusLocked() {
         if (rpc.function == kLibosPrint) ++libosPrints;
         if (rpc.function == kOsErrorLog) {
             ++osErrors;
-            // keep the last Xid text (rpc_os_error_log_v17_00:
+            // 0.138.3: keep the last Xid text (rpc_os_error_log_v17_00:
             // exceptType, runlistId, chid, errString[0x100] at payload 80).
             if (messageBytes > 80 + 12) {
                 char text[160]{};
@@ -6199,12 +6789,24 @@ IOReturn NVGspControl::pollStatusLocked() {
                 __builtin_memcpy(hdr, entry + 80, sizeof(hdr));
                 setProperty("NVGspControl-os-error-last", text);
                 setProperty("NVGspControl-os-error-last-type", hdr[0], 32);
+                // 0.164.0: and the last 8, oldest first
+                char *slot = osErrLog_[osErrCount_ % 8];
+                __builtin_memcpy(slot, text, sizeof(osErrLog_[0]) - 1);
+                slot[sizeof(osErrLog_[0]) - 1] = 0;
+                ++osErrCount_;
+                if (OSArray *log = OSArray::withCapacity(8)) {
+                    const UInt32 n = osErrCount_ < 8 ? osErrCount_ : 8;
+                    for (UInt32 k = osErrCount_ - n; k < osErrCount_; ++k)
+                        if (OSString *str = OSString::withCString(osErrLog_[k % 8])) { log->setObject(str); str->release(); }
+                    setProperty("NVGspControl-os-error-log", log);
+                    log->release();
+                }
             }
         }
         if (rpc.function == kLockdownNotice) ++lockdownNotices;
-        // RC_TRIGGERED (0x1004) / MMU_FAULT_QUEUED (0x1005) are consumed
-        // and decoded instead of blocking the queue (a GR RC event used
-        // to park the queue so the free reply never came).
+        // 0.41.0: RC_TRIGGERED (0x1004) / MMU_FAULT_QUEUED (0x1005) are
+        // consumed and decoded instead of blocking the queue (0.39/0.40:
+        // a GR RC event parked the queue so the free reply never landed).
         // rpc_rc_triggered_v17_02 payload at 80: engine, chid, gfid,
         // exceptLevel, exceptType, scope, partId, mmuFaultLo/Hi/Type.
         constexpr UInt32 kRcTriggered = 0x1004, kMmuFaultQueued = 0x1005;
@@ -6222,18 +6824,75 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-rc-mmu-fault-hi", rc[8], 32);
             setProperty("NVGspControl-rc-mmu-fault-type", rc[9], 32);
             setProperty("NVGspControl-rc-at-phase", postInitPhase_, 32);
-            if (rc[7] || rc[8]) explainFaultLocked((UInt64(rc[8]) << 32) | rc[7]);
-            // an RC on our channel kills it; stop accepting submits.
+            {   // 0.165.0: when, and whose arena the GPU was in (attribution)
+                UInt64 now = 0, ms = 0;
+                clock_get_uptime(&now);
+                absolutetime_to_nanoseconds(now, &ms);
+                setProperty("NVGspControl-rc-uptime-ms", ms / 1000000, 64);
+                setProperty("NVGspControl-rc-arena-pid", arenaActive_ ? static_cast<UInt32>(arenaActive_->pid) : 0U, 32);
+            }
+            {   // 0.170.0: every GPU event in one history that survives resets
+                char e[160];
+                snprintf(e, sizeof(e), "RC chid %u eng %u type %u va 0x%x%08x arena pid %d phase %u", rc[1], rc[0], rc[4],
+                         rc[8], rc[7], arenaActive_ ? arenaActive_->pid : -1, postInitPhase_);
+                noteGpuEventLocked(e);
+            }
+            if (rc[7] || rc[8]) explainFaultLocked((UInt64(rc[8]) << 32) | rc[7]);   // 0.158.0
+            // 0.59.0: an RC on our channel kills it; stop accepting submits.
             if (rc[1] == channelCid_ && grPersistent_) {
                 grPersistent_ = false;
                 setProperty("NVGspControl-gr-persistent", false);
+                scheduleAutoResetLocked();                     // 0.115.0
+            } else if (rc[1] >= 9 && rc[1] < 9 + kMaxClientChannels &&
+                       cchan_[rc[1] - 9].state) {
+                // 0.178.11: a client's own GR channel (was taken for the CE
+                // channel: "CE ring hung"). Its stamps can no longer land and
+                // every other channel orders behind them: reset everything.
+                const ClientChannel &cc = cchan_[rc[1] - 9];
+                ArenaCtx *a = cc.owner ? arenaForLocked(cc.owner, false) : nullptr;
+                char e[96];
+                snprintf(e, sizeof(e), "client channel %u RC type %u pid %d", rc[1], rc[4], a ? a->pid : -1);
+                noteGpuEventLocked(e);
+                setProperty("NVGspControl-cchan-rc-chid", rc[1], 32);
+                {   // 0.178.15: who was switching: FECS current/new context (instance
+                    // block >> 12) against every channel's instance, GR status
+                    UInt32 d[kGrDiagCount] = {};
+                    readGrDiag(pci_, d);
+                    setProperty("NVGspControl-cchan-rc-grdiag", d, sizeof(d));
+                    UInt64 inst[kMaxClientChannels + 1] = {};
+                    for (UInt32 i = 0; i < kMaxClientChannels; ++i) inst[i] = cchan_[i].state ? cchan_[i].inst : 0;
+                    inst[kMaxClientChannels] = instanceBackingOffset_;
+                    setProperty("NVGspControl-cchan-rc-insts", inst, sizeof(inst));
+                    UInt32 sq[10] = {stampQHead_, stampQTail_};
+                    if (stampQHead_ != stampQTail_) {
+                        const PendingStamp &q = stampQ_[stampQHead_ % kStampQ];
+                        sq[2] = q.value; sq[3] = q.seq; sq[4] = q.slot; sq[5] = q.serial;
+                        if (q.slot < kMaxClientChannels) {
+                            const ClientChannel &c = cchan_[q.slot];
+                            sq[6] = c.state; sq[7] = c.serial; sq[8] = c.seq;
+                            Ring r{};
+                            if (clientRingLocked(&cchan_[q.slot], &r)) readRingSem(r, &sq[9]);
+                        }
+                    }
+                    setProperty("NVGspControl-cchan-rc-stampq", sq, sizeof(sq));
+                }
                 scheduleAutoResetLocked();
+            } else if (rc[1] != channelCid_) {
+                // 0.164.0: the video channels have their own dead state; any
+                // other channel of ours is the CE one (a CE fault used to
+                // leave it "alive", every CE submit then waited it out)
+                bool video = false;
+                for (UInt32 i = 0; i < nvgsp::kVideoEngineCount; ++i)
+                    if (nvgsp::videoEngine(i)->chid == rc[1]) {
+                        video = true;
+                        if (video_[i].seq && !video_[i].dead) videoMarkDeadLocked(i);
+                    }
+                if (!video && cePersistent_ && !ceStall_.hung) ringHungLocked(&ceStall_);
             }
         }
-        // POST_EVENT (NV_VGPU_MSG_EVENT_POST_EVENT 0x1003,
+        // 0.89.0: POST_EVENT (NV_VGPU_MSG_EVENT_POST_EVENT 0x1003,
         // rpc_post_event_v17_00 @80): hotplug = notifyIndex 1, eventData
-        // {plugDisplayMask, unplugDisplayMask} (see nouveau
-        // r535_disp_hpd)
+        // {plugDisplayMask, unplugDisplayMask} (nouveau r535_disp_hpd).
         if (rpc.function == 0x1003 && messageBytes >= 117) {
             UInt32 hEvent = 0, notifyIndex = 0, dataSize = 0, plug = 0, unplug = 0;
             __builtin_memcpy(&hEvent, entry + 84, 4);
@@ -6256,16 +6915,16 @@ IOReturn NVGspControl::pollStatusLocked() {
         if (rpc.function == kMmuFaultQueued) {
             ++mmuFaultEvents_;
             setProperty("NVGspControl-mmu-fault-events", mmuFaultEvents_, 32);
-            // raw payload of the last one (layout not in the open
+            // 0.158.0: raw payload of the last one (layout not in the open
             // headers; kept for decoding next to the RC that follows)
             if (messageBytes > 80)
                 setProperty("NVGspControl-mmu-fault-queued-last",
                             const_cast<void *>(static_cast<const void *>(entry + 80)),
                             static_cast<unsigned>(messageBytes - 80 < 64 ? messageBytes - 80 : 64));
         }
-        // every other GSP event (0x1000..0x1fff, e.g. 0x100F
-        // PERF_BRIDGELESS_INFO_UPDATE which once parked a free) gets
-        // consumed and recorded; only RPC replies can be "unexpected"
+        // 0.52.0: every other GSP event (0x1000..0x1fff, e.g. 0x100F
+        // PERF_BRIDGELESS_INFO_UPDATE which parked the 0.51.0 free) is
+        // consumed and recorded; only RPC replies can be "unexpected".
         const bool otherEvent = rpc.function >= 0x1000 &&
             rpc.function < 0x2000 && rpc.function != kInitDone &&
             rpc.function != kRunCpuSequencer && rpc.function != kPostNocat;
@@ -6379,10 +7038,20 @@ IOReturn NVGspControl::pollStatusLocked() {
             (rpc.function == 76 && postInitPhase_ == 33 && pingOutstanding_) ||
             (postInitPhase_ == 33 && userRpcOutstanding_ &&
              rpc.function == userRpcFunction_) ||
-            (postInitPhase_ == 33 && rpc.function == 71);   // continuation
-        // generic user RPC reply (raw copy of the status-queue entry)
+            (postInitPhase_ == 33 && rpc.function == 71);   // 0.100.0 continuation
+        // 0.80.0: generic user RPC reply (raw status-queue entry copy).
+        // 0.178.9: and the request's sequence when the reply carries one; a
+        // reply to some other RPC with the same function used to complete it
+        // (short reply, client channel open failed at stage 12)
+        const bool seqOk = !rpc.sequence || rpc.sequence == userRpcSeq_;
+        if (postInitPhase_ == 33 && userRpcOutstanding_ && rpc.function == userRpcFunction_ && !seqOk) {
+            ++userRpcSeqMismatch_;
+            setProperty("NVGspControl-user-rpc-seq-mismatch", userRpcSeqMismatch_, 32);
+        }
+        if (postInitPhase_ == 33 && userRpcOutstanding_ && rpc.sequence)
+            setProperty("NVGspControl-user-rpc-seq-echo", true);
         if (postInitPhase_ == 33 && userRpcOutstanding_ &&
-            rpc.function == userRpcFunction_) {
+            rpc.function == userRpcFunction_ && seqOk) {
             const UInt32 n = messageBytes < sizeof(userRpcReply_)
                 ? static_cast<UInt32>(messageBytes) : sizeof(userRpcReply_);
             __builtin_memcpy(userRpcReply_, entry, n);
@@ -6390,7 +7059,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             userRpcResult_ = rpc.result;
             userRpcOutstanding_ = false;
         }
-        // ping reply (P-state read) at phase 33
+        // 0.71.0: ping reply (P-state read) at phase 33.
         if (rpc.function == 76 && postInitPhase_ == 33 && pingOutstanding_) {
             UInt64 now = 0;
             clock_get_uptime(&now);
@@ -6426,7 +7095,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             initPrivateResult = rpc.privateResult;
             initDone_ = true;
             markBoot("init-done");
-            if (!bar1Finished_) bar1EarlyPending_ = true;
+            if (!bar1Finished_) bar1EarlyPending_ = true;   // 0.146.6
             initResult_ = rpc.result;
             initPrivateResult_ = rpc.privateResult;
         }
@@ -6445,9 +7114,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             }
         }
         if (rpc.function == 64 && postInitPhase_ == 2) {
-            // Some bare-metal GSP-RM images leave out the vGPU extension
+            // Some bare-metal GSP-RM images omit the vGPU-oriented extension
             // handler. NV_ERR_INVALID_FUNCTION is an explicit compatibility
-            // answer; the base handshake succeeding is what counts.
+            // response; the successful base handshake remains authoritative.
             guestInfoExtResponse = (rpc.result == 0 && rpc.privateResult == 0) ||
                 rpc.result == 0x2a;
             setProperty("NVGspControl-guest-info-ext-result", rpc.result, 32);
@@ -6934,9 +7603,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             channelAllocResponse = rpc.result == 0 && rpc.privateResult == 0 &&
                 allocStatus == 0 && paramsBytes == sizeof(params);
         }
-        // BIND (52) + GPFIFO_SCHEDULE (53) decoders. Lenient on echo
-        // length (we don't know the server's echo shape for sure),
-        // strict on statuses.
+        // 0.7.1: BIND (52) + GPFIFO_SCHEDULE (53) decoders. Lenient on
+        // echo length (server echo shape unproven); strict on statuses.
         if (rpc.function == 76 &&
             (postInitPhase_ == 52 || postInitPhase_ == 53)) {
             const bool isBind = postInitPhase_ == 52;
@@ -6971,7 +7639,7 @@ IOReturn NVGspControl::pollStatusLocked() {
                 scheduleResponse = ok;
             }
         }
-        // TSG-level BIND (54) + GPFIFO_SCHEDULE (55) decoders
+        // 0.7.2: TSG-level BIND (54) + GPFIFO_SCHEDULE (55) decoders.
         if (rpc.function == 76 &&
             (postInitPhase_ == 54 || postInitPhase_ == 55)) {
             const bool isTsgBind = postInitPhase_ == 54;
@@ -7006,7 +7674,7 @@ IOReturn NVGspControl::pollStatusLocked() {
                 tsgScheduleResponse = ok;
             }
         }
-        // TSG GET_INFO (56) decoder, output is just a 4-byte tsgID
+        // 0.7.3: TSG GET_INFO (56) decoder. Output-only 4-byte tsgID.
         if (rpc.function == 76 && postInitPhase_ == 56) {
             tsgInfoReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0, flags = 0;
@@ -7029,7 +7697,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             tsgInfoResponse = rpc.result == 0 && rpc.privateResult == 0 &&
                 controlStatus == 0 && paramsBytes == 4;
         }
-        // TSG SET_TIMESLICE (57) decoder, same wire shape as 55
+        // 0.7.5: TSG SET_TIMESLICE (57) decoder. Same wire shape as 55.
         if (rpc.function == 76 && postInitPhase_ == 57) {
             tsgTimesliceReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0, flags = 0;
@@ -7050,8 +7718,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             tsgTimesliceResponse = rpc.result == 0 && rpc.privateResult == 0 &&
                 controlStatus == 0;
         }
-        // FIFO info + token + flush decoders (58-63). Every read is
-        // bounds-checked against messageBytes, short echoes still give us
+        // 0.8.0: FIFO intel + token + flush decoders (58-63). Every read is
+        // bounds-checked against messageBytes; short echoes still yield
         // their status codes.
         if (rpc.function == 76 &&
             postInitPhase_ >= 58 && postInitPhase_ <= 63) {
@@ -7134,8 +7802,8 @@ IOReturn NVGspControl::pollStatusLocked() {
                 setProperty("NVGspControl-dma-flush-status",
                             controlStatus, 32);
             }
-            // echo length per phase (rpc/private fold into ok; both have
-            // been zero on every control so far)
+            // Per-phase echo length (rpc/private fold into ok; both have
+            // been zero on every control in every cycle to date).
             if (postInitPhase_ == 58)
                 setProperty("NVGspControl-fifo-info-params-bytes",
                             paramsBytes, 32);
@@ -7155,8 +7823,8 @@ IOReturn NVGspControl::pollStatusLocked() {
                 setProperty("NVGspControl-dma-flush-params-bytes",
                             paramsBytes, 32);
         }
-        // display alloc decoders (64-67). Normal function-103 shape,
-        // each one records its own status triple.
+        // 0.8.1: display alloc decoders (64-67). Standard function-103
+        // shape; each records its own status triple.
         if (rpc.function == 103 &&
             postInitPhase_ >= 64 && postInitPhase_ <= 68) {
             UInt32 allocStatus = ~0U, paramsBytes = 0;
@@ -7215,12 +7883,11 @@ IOReturn NVGspControl::pollStatusLocked() {
                             paramsBytes, 32);
             }
         }
-        // This is how CPU-RM actually splits the display path. The C77D
-        // object is owned by the host because its constructor calls osMapGPU;
-        // physical RM only gets this internal subdevice control. So
-        // allocating C77D directly on GSP ended in NV_ERR_GENERIC after the
-        // physical parameters were programmed, since GSP couldn't do the host
-        // mapping.
+        // 0.8.5/0.8.6: CPU-RM's actual split display path. The C77D object is
+        // host-owned because its constructor calls osMapGPU; physical RM gets
+        // only this internal subdevice control. Direct C77D allocation on GSP
+        // therefore ended at NV_ERR_GENERIC after programming the physical
+        // parameters, when GSP could not perform the host mapping.
         if (rpc.function == 76 && postInitPhase_ == 69) {
             dispPbProgramReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0, flags = 0;
@@ -7257,9 +7924,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-kick-flush-params-bytes",
                         paramsBytes, 32);
         }
-        // handler validation probes. The control status is the data
-        // here (0 vs refusal), so if transport is OK we always move on;
-        // only a missing or broken reply stalls into the watchdog.
+        // 0.8.9: handler-validation probes. The control status is the
+        // data (0 vs refusal), so transport-OK always advances; only a
+        // missing/transport-broken reply stalls into the watchdog.
         if (rpc.function == 76 && postInitPhase_ == 71) {
             dispHandlerProbe1Returned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0, flags = 0;
@@ -7302,10 +7969,9 @@ IOReturn NVGspControl::pollStatusLocked() {
                         paramsBytes, 32);
             setProperty("NVGspControl-disp-handler-probe2-flags", flags, 32);
         }
-        // function-97 schedule replies. The server side is closed so we
-        // don't know the reply layout, we capture the rpc results plus up
-        // to 6 raw echo words. Any reply at all moves us forward (it's
-        // data, not danger).
+        // 0.9.0: function-97 schedule replies. Server side is closed, so
+        // the reply layout is unknown — capture rpc results plus up to 6
+        // raw echo words. Any answered reply advances (data, not danger).
         if (rpc.function == 97 && postInitPhase_ == 73) {
             sched97chanReturned = true;
             UInt32 words[6];
@@ -7350,8 +8016,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-sched97tsg-w4", words[4], 32);
             setProperty("NVGspControl-sched97tsg-w5", words[5], 32);
         }
-        // C372 display-SW alloc (function 103, device parent, NULL
-        // params, exactly like nvkms). Normal 103 reply shape.
+        // 0.9.1: C372 display-SW alloc (function 103, device parent,
+        // NULL params — nvkms-exact). Standard 103 reply shape.
         if (rpc.function == 103 && postInitPhase_ == 75) {
             dispC372Returned = true;
             UInt32 allocStatus = ~0U, paramsBytes = 0;
@@ -7366,8 +8032,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-c372-params-bytes",
                         paramsBytes, 32);
         }
-        // display-common (0x73) alloc. Same 103 shape, NULL params
-        // (like nvkms: displayCommonHandle under device).
+        // 0.9.2: display-common (0x73) alloc. Same 103 shape, NULL
+        // params (nvkms-exact: displayCommonHandle under device).
         if (rpc.function == 103 && postInitPhase_ == 76) {
             dispCommonReturned = true;
             UInt32 allocStatus = ~0U, paramsBytes = 0;
@@ -7382,8 +8048,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-common-params-bytes",
                         paramsBytes, 32);
         }
-        // SYSTEM_GET_SUPPORTED (0x730107) reply. Echo: subdev@104,
-        // displayMask@108, displayMaskDDC@112.
+        // 0.9.7: SYSTEM_GET_SUPPORTED (0x730107) reply. Echo:
+        // subdev@104, displayMask@108, displayMaskDDC@112.
         if (rpc.function == 76 && postInitPhase_ == 77) {
             dispSysSupportedReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7406,8 +8072,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-sys-supported-mask-ddc",
                         maskDdc, 32);
         }
-        // SYSTEM_GET_NUM_HEADS (0x730102) reply. Echo: subdev@104,
-        // flags@108, numHeads@112.
+        // 0.9.7: SYSTEM_GET_NUM_HEADS (0x730102) reply. Echo:
+        // subdev@104, flags@108, numHeads@112.
         if (rpc.function == 76 && postInitPhase_ == 78) {
             dispSysNumHeadsReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7426,8 +8092,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-sys-num-heads",
                         numHeads, 32);
         }
-        // SYSTEM_GET_ACTIVE (0x73010c) head0 reply. Echo: subdev@104,
-        // head@108, flags@112, displayId@116.
+        // 0.9.7: SYSTEM_GET_ACTIVE (0x73010c) head0 reply. Echo:
+        // subdev@104, head@108, flags@112, displayId@116.
         if (rpc.function == 76 && postInitPhase_ == 79) {
             dispSysActiveReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7446,8 +8112,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-sys-active-display-id",
                         displayId, 32);
         }
-        // SYSTEM_GET_ACTIVE (0x73010c) head1 reply. Same echo layout as
-        // head0 (displayId@116).
+        // 0.9.8: SYSTEM_GET_ACTIVE (0x73010c) head1 reply. Same echo
+        // layout as head0 (displayId@116).
         if (rpc.function == 76 && postInitPhase_ == 80) {
             dispSysActive1Returned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7466,7 +8132,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-sys-active1-display-id",
                         displayId, 32);
         }
-        // SYSTEM_GET_ACTIVE (0x73010c) head2 reply.
+        // 0.9.8: SYSTEM_GET_ACTIVE (0x73010c) head2 reply.
         if (rpc.function == 76 && postInitPhase_ == 81) {
             dispSysActive2Returned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7485,7 +8151,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-sys-active2-display-id",
                         displayId, 32);
         }
-        // SYSTEM_GET_ACTIVE (0x73010c) head3 reply.
+        // 0.9.8: SYSTEM_GET_ACTIVE (0x73010c) head3 reply.
         if (rpc.function == 76 && postInitPhase_ == 82) {
             dispSysActive3Returned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7504,8 +8170,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-sys-active3-display-id",
                         displayId, 32);
         }
-        // SYSTEM_GET_CONNECT_STATE (0x730108) reply. Echo: subdev@104,
-        // flags@108, displayMask@112, retryTimeMs@116.
+        // 0.9.8: SYSTEM_GET_CONNECT_STATE (0x730108) reply. Echo:
+        // subdev@104, flags@108, displayMask@112, retryTimeMs@116.
         if (rpc.function == 76 && postInitPhase_ == 83) {
             dispConnectReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7524,8 +8190,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-connect-mask",
                         connMask, 32);
         }
-        // SYSTEM_GET_BOOT_DISPLAYS (0x73011e) reply. Echo: subdev@104,
-        // bootDisplayMask@108.
+        // 0.9.8: SYSTEM_GET_BOOT_DISPLAYS (0x73011e) reply. Echo:
+        // subdev@104, bootDisplayMask@108.
         if (rpc.function == 76 && postInitPhase_ == 84) {
             dispBootDisplaysReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7544,9 +8210,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-boot-displays-mask",
                         bootMask, 32);
         }
-        // SYSTEM_GET_SCANLINE (0x730104) head0 reply. Echo: subdev@104,
-        // head@108, scanline@112, eye@120. 0xffffffff = no valid mode
-        // on the head.
+        // 0.9.9: SYSTEM_GET_SCANLINE (0x730104) head0 reply. Echo:
+        // subdev@104, head@108, scanline@112, eye@120. 0xffffffff =
+        // no valid mode on the head.
         if (rpc.function == 76 && postInitPhase_ == 85) {
             dispScanlineReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7565,8 +8231,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-scanline-head0",
                         scanline, 32);
         }
-        // SYSTEM_GET_VBLANK_COUNTER (0x730105) head0 reply. Echo:
-        // subdev@104, head@108, hint@112, counter@116.
+        // 0.9.9: SYSTEM_GET_VBLANK_COUNTER (0x730105) head0 reply.
+        // Echo: subdev@104, head@108, hint@112, counter@116.
         if (rpc.function == 76 && postInitPhase_ == 86) {
             dispVblankReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7585,7 +8251,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-vblank-head0",
                         counter, 32);
         }
-        // SYSTEM_GET_HEAD_ROUTING_MAP (0x73010b) reply. Echo:
+        // 0.9.9: SYSTEM_GET_HEAD_ROUTING_MAP (0x73010b) reply. Echo:
         // subdev@104, mask@108, oldMask@112, oldMap@116, map@120.
         if (rpc.function == 76 && postInitPhase_ == 87) {
             dispRoutingReturned = true;
@@ -7605,9 +8271,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-routing-map",
                         routeMap, 32);
         }
-        // C372 GET_ACTIVE_VIEWPORT_POINT_IN (0xc3720104) window 0
-        // reply. Echo: base.subdev@104, windowIndex@108, point.x@112,
-        // point.y@116.
+        // 0.10.0: C372 GET_ACTIVE_VIEWPORT_POINT_IN (0xc3720104)
+        // window 0 reply. Echo: base.subdev@104, windowIndex@108,
+        // point.x@112, point.y@116.
         if (rpc.function == 76 && postInitPhase_ == 88) {
             dispViewportReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7630,7 +8296,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-viewport-y",
                         pointY, 32);
         }
-        // DFP_GET_INFO (0x731140) display 0x200 reply. Echo:
+        // 0.11.0: DFP_GET_INFO (0x731140) display 0x200 reply. Echo:
         // subdev@104, displayId@108, flags@112, UHBR@116.
         if (rpc.function == 76 && postInitPhase_ == 89) {
             dispDfpReturned = true;
@@ -7654,8 +8320,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-dfp-uhbr",
                         uhbr, 32);
         }
-        // SPECIFIC_GET_EDID_V2 (0x730245) display 0x200 reply. Echo:
-        // subdev@104, displayId@108, bufferSize@112, flags@116,
+        // 0.12.0: SPECIFIC_GET_EDID_V2 (0x730245) display 0x200 reply.
+        // Echo: subdev@104, displayId@108, bufferSize@112, flags@116,
         // edid[2048]@120. Hash the returned bytes (FNV-1a) + capture
         // the first 32 bytes (4x u64) for the manufacturer/model check.
         if (rpc.function == 76 && postInitPhase_ == 90) {
@@ -7717,8 +8383,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-edid-w2", edidW[2], 64);
             setProperty("NVGspControl-disp-edid-w3", edidW[3], 64);
         }
-        // SPECIFIC_GET_PCLK_LIMIT (0x73028a) display 0x200 reply. Echo:
-        // subdev@104, displayId@108, pclk@112, orPclk@116, vbPclk@120.
+        // 0.14.0: SPECIFIC_GET_PCLK_LIMIT (0x73028a) display 0x200
+        // reply. Echo: subdev@104, displayId@108, pclk@112,
+        // orPclk@116, vbPclk@120.
         if (rpc.function == 76 && postInitPhase_ == 91) {
             dispPclkReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7744,9 +8411,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-pclk-vb-limit",
                         vbPclk, 32);
         }
-        // SPECIFIC_OR_GET_INFO (0x73028b) display 0x200 index 0 reply.
-        // Echo: type@112, protocol@116, dcbIndex@140, vbiosAddress@144,
-        // litByVbios@152, dispDynamic@153.
+        // 0.14.0: SPECIFIC_OR_GET_INFO (0x73028b) display 0x200
+        // index 0 reply. Echo: type@112, protocol@116, dcbIndex@140,
+        // vbiosAddress@144, litByVbios@152, dispDynamic@153.
         if (rpc.function == 76 && postInitPhase_ == 92) {
             dispOrReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7778,8 +8445,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-or-lit-by-vbios",
                         litByVbios, 8);
         }
-        // SYSTEM_GET_CAPS_V2 (0x730101) reply. Echo: 2-byte caps table
-        // @104.
+        // 0.15.0: SYSTEM_GET_CAPS_V2 (0x730101) reply. Echo: 2-byte
+        // caps table @104.
         if (rpc.function == 76 && postInitPhase_ == 93) {
             dispCapsReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7798,8 +8465,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-caps",
                         caps, 16);
         }
-        // SYSTEM_GET_VBLANK_ENABLE (0x730106) head0 reply. Echo:
-        // subdev@104, head@108, enabled@112 (byte).
+        // 0.15.0: SYSTEM_GET_VBLANK_ENABLE (0x730106) head0 reply.
+        // Echo: subdev@104, head@108, enabled@112 (byte).
         if (rpc.function == 76 && postInitPhase_ == 94) {
             dispVbEnReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7818,8 +8485,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-vblank-en-head0",
                         enabled, 8);
         }
-        // C372 IS_MODE_POSSIBLE (0xc3720101) numHeads=0 reply. Echo:
-        // status@92, paramsBytes@96 (2048), bIsPossible@2008.
+        // 0.16.0: C372 IS_MODE_POSSIBLE (0xc3720101) numHeads=0 reply.
+        // Echo: status@92, paramsBytes@96 (2048), bIsPossible@2008.
         if (rpc.function == 76 && postInitPhase_ == 95) {
             dispImpReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7838,8 +8505,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-imp-possible",
                         possible, 8);
         }
-        // IS_MODE_POSSIBLE head0 4K60 reply. Same echo (status@92,
-        // paramsBytes@96 = 2048, bIsPossible@2008).
+        // 0.17.0: IS_MODE_POSSIBLE head0 4K60 reply. Same echo
+        // (status@92, paramsBytes@96 = 2048, bIsPossible@2008).
         if (rpc.function == 76 && postInitPhase_ == 96) {
             dispModeReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7858,9 +8525,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-mode-possible",
                         possible, 8);
         }
-        // SPECIFIC_GET_CONNECTOR_DATA (0x730250) 0x200 reply. Echo:
-        // flags@112, DDCPartners@116, count@120, data0 {index@124,
-        // type@128, location@132}, platform@172.
+        // 0.18.0: SPECIFIC_GET_CONNECTOR_DATA (0x730250) 0x200 reply.
+        // Echo: flags@112, DDCPartners@116, count@120, data0
+        // {index@124, type@128, location@132}, platform@172.
         if (rpc.function == 76 && postInitPhase_ == 97) {
             dispConnReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7895,8 +8562,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-conn-loc0",
                         connLoc, 32);
         }
-        // MC_GET_ARCH_INFO (0x20801701) reply. Echo: arch@104,
-        // impl@108, rev@112, subRev@116 (byte).
+        // 0.19.0: MC_GET_ARCH_INFO (0x20801701) reply. Echo:
+        // arch@104, impl@108, rev@112, subRev@116 (byte).
         if (rpc.function == 76 && postInitPhase_ == 98) {
             dispArchReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7927,8 +8594,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-arch-subrev",
                         subRev, 8);
         }
-        // GPU_GET_NAME_STRING ASCII (0x20800110) reply. Echo:
-        // flags@104, string[64]@108. Capture first 32 bytes.
+        // 0.19.0: GPU_GET_NAME_STRING ASCII (0x20800110) reply.
+        // Echo: flags@104, string[64]@108. Capture first 32 bytes.
         if (rpc.function == 76 && postInitPhase_ == 99) {
             dispNameReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7965,8 +8632,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-name-w2", nameW[2], 64);
             setProperty("NVGspControl-disp-name-w3", nameW[3], 64);
         }
-        // FIFO_GET_PHYSICAL_CHANNEL_COUNT (0x20801108) reply. Echo:
-        // count@104, inUse@108.
+        // 0.20.0: FIFO_GET_PHYSICAL_CHANNEL_COUNT (0x20801108)
+        // reply. Echo: count@104, inUse@108.
         if (rpc.function == 76 && postInitPhase_ == 100) {
             dispFifoReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -7989,10 +8656,10 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-fifo-in-use",
                         fifoInUse, 32);
         }
-        // FIFO_GET_ALLOCATED_CHANNELS (0x20801119) runlist 0 reply.
-        // Echo: runlistId@104, bitmask[128]@108..619. + words 0-7 +
-        // FNV-1a mask hash (diff pre/post bind). Publish popcount +
-        // words 0-1 (channels 0-63, incl. cid 3).
+        // 0.21.0: FIFO_GET_ALLOCATED_CHANNELS (0x20801119) runlist 0
+        // reply. Echo: runlistId@104, bitmask[128]@108..619.
+        // 0.25.0: + words 0-7 + FNV-1a mask hash (diff pre/post bind).
+        // Publish popcount + words 0-1 (channels 0-63, incl. cid 3).
         if (rpc.function == 76 && postInitPhase_ == 101) {
             dispRunlistReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -8057,8 +8724,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-runlist-mask-hash",
                         maskHash, 64);
         }
-        // GPFIFO BIND to GR (0xa06f0104, engineType=1) reply. Echo:
-        // status@92, paramsBytes@96 (4).
+        // 0.22.0: GPFIFO BIND to GR (0xa06f0104, engineType=1) reply.
+        // Echo: status@92, paramsBytes@96 (4).
         if (rpc.function == 76 && postInitPhase_ == 102) {
             dispGrBindReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -8074,9 +8741,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-grbind-params-bytes",
                         paramsBytes, 32);
         }
-        // FIFO_GET_ALLOCATED_CHANNELS re-query (runlist 0) after the GR
-        // bind. Same echo (popcount + w0/w1). + words 2-7 + mask hash
-        // (same as phase 101).
+        // 0.23.0: FIFO_GET_ALLOCATED_CHANNELS re-query (runlist 0)
+        // after the GR bind. Same echo (popcount + w0/w1).
+        // 0.25.0: + words 2-7 + mask hash (same as phase 101).
         if (rpc.function == 76 && postInitPhase_ == 103) {
             dispReRunReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -8141,9 +8808,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-rerun-mask-hash",
                         maskHash, 64);
         }
-        // Runlist samples 104 (rl0), 105 (rl1), 106 (rl2). Same 516B
-        // echo (popcount + w0/w1). + words 2-7 + mask hash (same as
-        // phase 101).
+        // 0.24.0: runlist samples 104 (rl0), 105 (rl1), 106 (rl2).
+        // Same 516B echo (popcount + w0/w1).
+        // 0.25.0: + words 2-7 + mask hash (same as phase 101).
         if ((rpc.function == 76 && postInitPhase_ == 104) ||
             (rpc.function == 76 && postInitPhase_ == 105) ||
             (rpc.function == 76 && postInitPhase_ == 106)) {
@@ -8239,8 +8906,8 @@ IOReturn NVGspControl::pollStatusLocked() {
                             maskHash, 64);
             }
         }
-        // post-bind GPFIFO_SCHEDULE (0xa06f0103) reply. Echo:
-        // status@92, paramsBytes@96 (2).
+        // 0.26.0: post-bind GPFIFO_SCHEDULE (0xa06f0103) reply.
+        // Echo: status@92, paramsBytes@96 (2).
         if (rpc.function == 76 && postInitPhase_ == 107) {
             dispSchedReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -8256,9 +8923,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-sched-params-bytes",
                         paramsBytes, 32);
         }
-        // rl0 re-query after the schedule attempt. Same 516B echo
-        // (popcount + w0-w1 + hash only, words trimmed to keep the
-        // telemetry small).
+        // 0.26.0: rl0 re-query after the schedule attempt. Same
+        // 516B echo (popcount + w0-w1 + hash only — words trimmed
+        // to keep the telemetry small).
         if (rpc.function == 76 && postInitPhase_ == 108) {
             dispPostReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -8306,9 +8973,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-post-mask-hash",
                         maskHash, 64);
         }
-        // post-schedule rl1 (109) / rl2 (110) samples. Same 516B echo;
-        // popcount + w0/w1 + hash. + words 2-7 (locate post-schedule
-        // new bits).
+        // 0.27.0: post-schedule rl1 (109) / rl2 (110) samples.
+        // Same 516B echo; popcount + w0/w1 + hash.
+        // 0.28.0: + words 2-7 (locate post-schedule new bits).
         if ((rpc.function == 76 && postInitPhase_ == 109) ||
             (rpc.function == 76 && postInitPhase_ == 110)) {
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -8386,12 +9053,13 @@ IOReturn NVGspControl::pollStatusLocked() {
                             maskHash, 64);
             }
         }
-        // FIFO_GET_DEVICE_INFO_TABLE (0x20801112) reply. Echo:
-        // baseIndex@104, numEntries@108, bMore@112, entry0
-        // {engineData[16]@116, pbdmaIds@180, faultIds@188,
-        // numPbdmas@196, name[16]@200}. scan all 12 entries (name0 +
-        // pbdma0 + npbdma each) to locate GR and its PBDMA ids. Entry i
-        // @ 116+i*100: pbdma0 @ +64, npbdma @ +76, name @ +80.
+        // 0.29.0: FIFO_GET_DEVICE_INFO_TABLE (0x20801112) reply.
+        // Echo: baseIndex@104, numEntries@108, bMore@112,
+        // entry0 {engineData[16]@116, pbdmaIds@180, faultIds@188,
+        // numPbdmas@196, name[16]@200}.
+        // 0.30.0: scan all 12 entries (name0 + pbdma0 + npbdma each)
+        // to locate GR and its PBDMA ids. Entry i @ 116+i*100:
+        // pbdma0 @ +64, npbdma @ +76, name @ +80.
         if (rpc.function == 76 && postInitPhase_ == 111) {
             dispDevInfoReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -8422,12 +9090,12 @@ IOReturn NVGspControl::pollStatusLocked() {
                     nameW1 |= static_cast<UInt64>(byte) << (b * 8);
                 }
             }
-            // Entries start at echo+120 (16 B header: baseIndex@104,
-            // numEntries@108, bMore@112 + pad), NOT +116, an older loop
-            // was off by 4. Entry i sits at 120+i*100: pbdma0 @ +64,
-            // npbdma @ +76, name @ +80. The table is 104+3212 = 3316 B
-            // < 4096 from the message start, so it's one page and we
-            // read it directly (no slot walk).
+            // 0.30.1: entries start at echo+120 (16B header:
+            // baseIndex@104, numEntries@108, bMore@112+pad), NOT +116.
+            // Entry i @ 120+i*100: pbdma0 @ +64, npbdma @ +76,
+            // name @ +80. (0.30.0 loop was off by 4.)
+            // 0.30.2: table is 104+3212=3316B < 4096 from message
+            // start: single page, direct reads (no slot-walk).
             if (numEntries > 12)
                 numEntries = 12;
             for (UInt32 e = 0; e < numEntries; ++e) {
@@ -8482,8 +9150,8 @@ IOReturn NVGspControl::pollStatusLocked() {
                 setProperty(keyCount, entryCount[e], 32);
             }
         }
-        // DEVICE FIFO_GET_CAPS_V2 (0x801713) reply. Echo: 2-byte caps
-        // table @104.
+        // 0.33.0: DEVICE FIFO_GET_CAPS_V2 (0x801713) reply. Echo:
+        // 2-byte caps table @104.
         if (rpc.function == 76 && postInitPhase_ == 115) {
             dispFifoCapsReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -8502,8 +9170,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-fifocaps",
                         caps, 16);
         }
-        // DEVICE GET_ENGINE_CONTEXT_PROPERTIES (0x801707) GRAPHICS
-        // reply. Echo: engineId@104, alignment@108, size@112.
+        // 0.33.0: DEVICE GET_ENGINE_CONTEXT_PROPERTIES (0x801707)
+        // GRAPHICS reply. Echo: engineId@104, alignment@108,
+        // size@112.
         if (rpc.function == 76 && postInitPhase_ == 116) {
             dispCtxPropReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -8526,8 +9195,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-ctxprop-size",
                         ctxSize, 32);
         }
-        // GR_GET_TPC_PARTITION_MODE (0x801107) reply. Echo: hTSG@104,
-        // mode@108, bEnableAllTpcs@112 (byte).
+        // 0.34.0: GR_GET_TPC_PARTITION_MODE (0x801107) reply. Echo:
+        // hTSG@104, mode@108, bEnableAllTpcs@112 (byte).
         if (rpc.function == 76 && postInitPhase_ == 117) {
             dispTpcReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
@@ -8551,7 +9220,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-tpc-enable-all",
                         tpcEnable, 8);
         }
-        // display probe replies.
+        // 0.51.0: display probe replies.
         if (rpc.function == 103 && postInitPhase_ == 200) {
             dispInstMemReturned = true;
             UInt32 st = ~0U, pb = 0;
@@ -8639,8 +9308,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             key[pos] = '\0';
             setProperty(key, (UInt64(st) << 40) | off, 64);
         }
-        // DP AUXCH_CTRL reply (48B params @104): data@124, size@140 (bytes
-        // done, 1-indexed), replyType@144 (0 ACK, 2 DEFER).
+        // 0.77.0: DP AUXCH_CTRL reply (48B params @104): data@124,
+        // size@140 (bytes done, 1-indexed), replyType@144 (0 ACK, 2 DEFER).
         if (rpc.function == 76 && postInitPhase_ == 224) {
             perfReturned = true;
             UInt32 st = ~0U, done = 0, reply = ~0U;
@@ -8660,7 +9329,7 @@ IOReturn NVGspControl::pollStatusLocked() {
                 edidBytes_ = (auxStep_ - 4) * 16 + done;
             }
         }
-        // INTERNAL_INTR_GET_KERNEL_TABLE reply (2068B params):
+        // 0.69.0: INTERNAL_INTR_GET_KERNEL_TABLE reply (2068B params):
         // tableLen@104, table[128]{u16 engineIdx, u32 pmcMask, u32 stall,
         // u32 nonStall} (16B each)@108, subtreeMap[7]{u8,u8}@2156.
         if (rpc.function == 76 && postInitPhase_ == 223) {
@@ -8727,8 +9396,8 @@ IOReturn NVGspControl::pollStatusLocked() {
                         msixCap ? pci_->configRead16(msixCap + 2) : 0, 16);
             setProperty("NVGspControl-pci-command",
                         pci_->configRead16(kIOPCIConfigCommand), 16);
-            // Arm the MSI path: GSP stall (50), DISP stall (2) and GR
-            // non-stall (84) vectors from the table.
+            // 0.70.0: arm the MSI path. 0.74.0: GSP stall (50), DISP stall
+            // (2), GR non-stall (84) vectors from the table.
             if ((experimentFlags_ & 8) && rpc.result == 0 && st == 0 &&
                 pb == 2068 && len <= 128 && messageBytes >= 104 + 2068) {
                 UInt32 vecs[kVecCount] = {~0U, ~0U, ~0U, ~0U};
@@ -8741,7 +9410,7 @@ IOReturn NVGspControl::pollStatusLocked() {
                     if (eng == 50) vecs[kVecGsp] = stall;
                     if (eng == 2) vecs[kVecDisp] = stall;
                     if (eng == 84) vecs[kVecGrNs] = nonStall;
-                    if (eng == 15) vecs[kVecCeNs] = nonStall;   // CE0
+                    if (eng == 15) vecs[kVecCeNs] = nonStall;   // 0.119.0: CE0
                 }
                 setProperty("NVGspControl-intr-armed", armInterrupts(vecs));
             }
@@ -8772,7 +9441,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             if (rpc.result == 0 && st == 0 && off && !(off & 0x1fffff))
                 scratchOffset_ = off;
             else if (scratchTry_ > 0x1000000)
-                scratchRetry_ = true;  // halve and retry
+                scratchRetry_ = true;  // 0.60.0: halve and retry
             setProperty("NVGspControl-scratch-status", st, 32);
             setProperty("NVGspControl-scratch-offset", off, 64);
         }
@@ -8803,8 +9472,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-corechan-rpc", rpc.result, 32);
             setProperty("NVGspControl-corechan-status", st, 32);
         }
-        // Ctx VRAM alloc reply (offset at params+80), PROMOTE_CTX reply
-        // (status@92), GR object alloc reply (status@96).
+        // 0.38.0: ctx VRAM alloc reply (offset at params+80), PROMOTE_CTX
+        // reply (status@92), GR object alloc reply (status@96).
         if (rpc.function == 103 && postInitPhase_ == 122) {
             ctxMemReturned = true;
             UInt32 allocStatus = ~0U, paramsBytes = 0;
@@ -8854,7 +9523,7 @@ IOReturn NVGspControl::pollStatusLocked() {
                              : "NVGspControl-grobjc-status",
                         allocStatus, 32);
         }
-        // CONTEXT_BUFFERS_INFO reply. Params at 104:
+        // 0.37.0: CONTEXT_BUFFERS_INFO reply. Params at 104:
         // engine[26]{size,alignment} per GR instance; publish GR0.
         if (rpc.function == 76 && postInitPhase_ == 121) {
             dispCtxBufReturned = true;
@@ -8885,7 +9554,7 @@ IOReturn NVGspControl::pollStatusLocked() {
                 }
             }
         }
-        // GPFIFO_GET_WORK_SUBMIT_TOKEN reply. Echo:
+        // 0.35.0: GPFIFO_GET_WORK_SUBMIT_TOKEN reply. Echo:
         // workSubmitToken@104.
         if (rpc.function == 76 && postInitPhase_ == 118) {
             dispTokenReturned = true;
@@ -9292,13 +9961,12 @@ IOReturn NVGspControl::pollStatusLocked() {
     }
 
     if (initDone_ && initResult_ == 0 && !badReason) {
-        // Controls we haven't seen work yet (CE size 49, BIND 52, SCHEDULE
-        // 53, TSG BIND 54, TSG SCHEDULE 55, TSG GET_INFO 56, TSG TIMESLICE
-        // 57, FIFO info 58-61, token 62, flush 63, display allocs 64-67)
-        // must never park like phase 39 did. If GSP-RM never answers, put
-        // the PTE back if we installed it and free the tree. Only
-        // function-103 phases we know work skip the watchdog; 64-67 are new
-        // classes/objects so they don't.
+        // 0.7.0-0.8.1: unproven controls (CE size 49, BIND 52, SCHEDULE 53,
+        // TSG BIND 54, TSG SCHEDULE 55, TSG GET_INFO 56, TSG TIMESLICE 57,
+        // FIFO intel 58-61, token 62, flush 63, display allocs 64-67) must
+        // never park like phase 39. If GSP-RM never answers, restore the
+        // PTE when installed and free the tree. Only PROVEN function-103
+        // phases skip the watchdog; 64-67 are new classes/objects.
         const bool phase58Answered = fifoInfoReturned || userdLocReturned ||
             partnerReturned || priBaseReturned || tokenReturned ||
             flushReturned;
@@ -9352,8 +10020,8 @@ IOReturn NVGspControl::pollStatusLocked() {
                postInitPhase_ != 217)) &&
              !phase64Answered);
         if (awaitingUnproven) {
-            // time based too: with 0.2 s daemon polls, 12 polls were only
-            // ~2.4 s and pb-backing tore the chain down
+            // 0.91.0: time-based as well — with 0.2 s daemon polls (0.90.0)
+            // 12 polls were only ~2.4 s and pb-backing tore the chain down.
             UInt64 nowAbs = 0, stalledNs = 0;
             clock_get_uptime(&nowAbs);
             if (ceSizeStallPolls_ == 0) stallStartAbs_ = nowAbs;
@@ -9515,8 +10183,8 @@ IOReturn NVGspControl::pollStatusLocked() {
                 else if (postInitPhase_ == 207 || postInitPhase_ == 208)
                     reason = "disp-window-no-response-watchdog";
                 setProperty("NVGspControl-channel-skipped-reason", reason);
-                // Our ctx mappings go before the client is freed. huge
-                // ctx PTEs are left for RM's VAS free.
+                // 0.39.0: our ctx mappings go before the client is freed.
+                // 0.40.0: huge ctx PTEs are left for RM's VAS free.
                 ctxHugeInstalled_ = 0;
                 finishBar1();
                 if (ctxPtesInstalled_) {
@@ -9555,12 +10223,12 @@ IOReturn NVGspControl::pollStatusLocked() {
                     postInitPhase_ == 217)) {
             ceSizeStallPolls_ = 0;
         }
-        // Common teardown for the ctx path, remove our ctx PTEs (VALID
-        // first), restore the GPFIFO PTE, free the client. scratch VRAM
-        // alloc (phase 210), size scratchTry_.
+        // 0.38.0: common teardown for the ctx path — remove our ctx
+        // PTEs (VALID first), restore the GPFIFO PTE, free the client.
+        // 0.60.0: scratch VRAM alloc (phase 210), size scratchTry_.
         auto scratchAlloc = [&]() {
-            // 256 MiB scratch (2 MiB pages, contiguous, 2 MiB aligned)
-            // for benchmarks, before any PTE is installed.
+            // 0.58.0: 256 MiB scratch (2 MiB pages, contiguous, 2 MiB
+            // aligned) for benchmarks, before any PTE is installed.
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kSubdeviceHandle = 0xc0d02080;
             constexpr UInt32 kMemoryHandle = 0xc0d00070;
@@ -9574,8 +10242,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             __builtin_memcpy(alloc + 20, &kMemoryParamsBytes, 4);
             __builtin_memcpy(alloc + 32, &kClientHandle, 4);
             constexpr UInt32 kDmaType = 6, kFlags = 0x100;
-            // 128 MiB, contiguous in 4 KiB pages with 2 MiB alignment
-            // (256 MiB of HUGE pages gave 0x51 NO_MEMORY)
+            // 0.59.0: 128 MiB, 4 KiB-page contiguous with 2 MiB alignment
+            // (256 MiB HUGE pages -> 0x51 NO_MEMORY in 0.58.0).
             constexpr UInt32 kAttr = 0x10800000, kAttr2 = 0;
             if (!scratchTry_) scratchTry_ = 0x8000000;
             const UInt64 kBytes = scratchTry_;
@@ -9591,7 +10259,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 125;
         };
-        // CE backing allocs via RPC (GSP heap): 218 USERD 4 KiB
+        // 0.66.0: CE backing allocs via RPC (GSP heap): 218 USERD 4 KiB
         // (0xc0d10043), 219 instance 4 KiB (0xc0d10044), 220 method
         // buffer (0xc0d10045).
         auto ceBackingAlloc = [&](UInt32 phase) {
@@ -9619,8 +10287,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 126;
         };
-        // Display health sweep start (display common 0x73 alloc, phase
-        // 203); falls back to teardown.
+        // 0.54.0: display health sweep start (display common 0x73 alloc,
+        // phase 203); falls back to teardown.
         auto dispHealthStart = [&]() {
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kDeviceHandle = 0xc0d00080;
@@ -9639,17 +10307,18 @@ IOReturn NVGspControl::pollStatusLocked() {
         auto ctxTeardown = [&]() {
             if (bar1Early_) { bar1Early_ = false; bar1Finished_ = false; }   // redo at the end
             finishBar1();
-            // With our window owning the screen the whole client (display
-            // + GR channel, golden ctx, mappings) stays alive for
+            // 0.57.0: with our window owning the screen the whole client
+            // (display + GR channel, golden ctx, mappings) stays alive for
             // submitGr; GPFIFO PTE stays installed.
             if (wndOwnsScreen_ && ceMapped_ && !ceStarted_) {
-                // CE bring-up starts with an RPC USERD object (the GR
-                // channel got hUserdMemory 0xc0d00043; with hUserdMemory 0
-                // the CE channel alloc failed with NO_MEMORY).
+                // 0.65.0: CE bring-up starts with an RPC USERD object (the
+                // GR channel got hUserdMemory 0xc0d00043; hUserdMemory 0
+                // made the CE channel alloc fail NO_MEMORY in 0.63/0.64).
                 ceStarted_ = true;
                 grPersistent_ = gr3dOk_ && ctxHugeInstalled_ != 0;
                 setProperty("NVGspControl-gr-persistent", grPersistent_);
-                publishSemVa();
+                syncRingSeqLocked(true, false);          // 0.164.0
+                publishSemVa();                          // 0.128.0
                 constexpr UInt32 kClientHandle = 0xc0d00001;
                 constexpr UInt32 kSubdeviceHandle = 0xc0d02080;
                 constexpr UInt32 kMemoryHandle = 0xc0d10043;
@@ -9676,15 +10345,16 @@ IOReturn NVGspControl::pollStatusLocked() {
                 grPersistent_ = gr3dOk_ && ctxHugeInstalled_ != 0;
                 setProperty("NVGspControl-persistent-client", true);
                 setProperty("NVGspControl-gr-persistent", grPersistent_);
-                publishSemVa();
+                syncRingSeqLocked(true, false);          // 0.164.0
+                publishSemVa();                          // 0.128.0
                 postInitPhase_ = 33;
                 markBoot("phase33");
                 return;
             }
             fbHugeInstalled_ = 0;
-            // Huge ctx PTEs stay till RM frees the VAS: clearing them
-            // under a live GR context faulted the ctx save at free time
-            // (the free just hung). PD0 goes away along with the client.
+            // 0.40.0: huge ctx PTEs stay until RM frees the VAS: clearing
+            // them under a live GR context faulted the free-time ctx save
+            // (0.39.0 free hang). PD0 goes away with the client.
             ctxHugeInstalled_ = 0;
             if (ctxPtesInstalled_) {
                 const bool cleared = praminWritePteRun(
@@ -9708,9 +10378,9 @@ IOReturn NVGspControl::pollStatusLocked() {
                 badReason = 38;
         };
         if (postInitPhase_ == 0) {
-            // No phantom advance without staging (post-S3 quiesce drops
-            // it; the daemon re-boots). Enqueueing RPC 1 into released
-            // queues faked a chain to phase 33 with a dead GSP.
+            // 0.97.0: no phantom advance without staging (post-S3 quiesce
+            // drops it; the daemon re-boots). Enqueueing RPC 1 into
+            // released queues faked a chain to phase 33 with a dead GSP.
             if (!staged_) {
                 setProperty("NVGspControl-resume-wait", true);
             } else {
@@ -9770,7 +10440,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             char name[65]{};
             __builtin_memcpy(name, staticInfo + 1260, 64);
             setProperty("NVGspControl-static-gpu-name", name);
-            // FB map from GspStaticConfigInfo (r570 layout:
+            // 0.61.0: FB map from GspStaticConfigInfo (r570 layout:
             // fbRegionInfoParams@344 = numFBRegions + 16 x 48 B regions
             // @352 {base, limit, reserved, perf, compr, iso, protected},
             // fb_length@1224, fb_bus_width@1240, fb_ram_type@1244).
@@ -9788,8 +10458,8 @@ IOReturn NVGspControl::pollStatusLocked() {
                 if (nRegions > 16) nRegions = 16;
                 setProperty("NVGspControl-fb-region-raw", staticInfo + 352,
                             nRegions * 48);
-                // The largest unreserved region is the client
-                // (CPU-RM/PMA) heap, ours, since this kext is CPU-RM.
+                // 0.62.0: the largest unreserved region is the client
+                // (CPU-RM/PMA) heap — ours, since this kext is CPU-RM.
                 for (UInt32 i = 0; i < nRegions; ++i) {
                     UInt64 base = 0, limit = 0, reserved = ~0ULL;
                     __builtin_memcpy(&base, staticInfo + 352 + i * 48, 8);
@@ -9807,7 +10477,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             __builtin_memcpy(&internalClient_, staticInfo + 1600, 4);
             __builtin_memcpy(&internalDevice_, staticInfo + 1604, 4);
             __builtin_memcpy(&internalSubdevice_, staticInfo + 1608, 4);
-            // published for live INTERNAL_* controls via --rpc.
+            // 0.82.0: published for live INTERNAL_* controls via --rpc.
             setProperty("NVGspControl-internal-client", internalClient_, 32);
             setProperty("NVGspControl-internal-device", internalDevice_, 32);
             setProperty("NVGspControl-internal-subdevice", internalSubdevice_, 32);
@@ -9819,10 +10489,10 @@ IOReturn NVGspControl::pollStatusLocked() {
             } else {
                 bzero(control, 24 + kParamsBytes);
                 const UInt32 command = 0x20800a40;
-                // This internal 0x20800a40 control isn't in the 570.144
-                // FINN serializer table, so NVIDIA's serverSerializeCtrlDown()
-                // leaves the native v28.04 parameter block as it is and
-                // sends flags=0.
+                // This internal 0x20800a40 control is not present in the
+                // 570.144 FINN serializer table. NVIDIA's
+                // serverSerializeCtrlDown() therefore leaves the native
+                // v28.04 parameter block unchanged and sends flags=0.
                 const UInt32 serialized = 0;
                 __builtin_memcpy(control, &internalClient_, 4);
                 __builtin_memcpy(control + 4, &internalSubdevice_, 4);
@@ -10018,14 +10688,14 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 23;
         } else if (localMemoryAllocResponse) {
-            // Same backing flow as before (probe 0x41, GPFIFO 0x42 4 KiB, USERD
-            // 0x43) plus the status-queue gate entries for phases 42/43 that
-            // were missing. Why it used to stall: GSP-RM HAD answered every
-            // second alloc with an all-zero success (blocked data shows
-            // 8192@0x3f1dbb000, 4096@0x3f1dbc000 twice), but expectedPostInit
-            // parked function-103 at phases 42/43 as blocked before the decoder
-            // even ran. The dead BAR2/map/unmap blocks below still say 0x40;
-            // they can't be reached in this build.
+            // 0.5.9: identical backing flow to 0.5.8 (probe 0x41, GPFIFO 0x42
+            // 4 KiB, USERD 0x43) plus the missing status-queue gate entries for
+            // phases 42/43. Root cause of the 0.5.6-0.5.8 stalls: GSP-RM HAD
+            // answered every second alloc with all-zero success (blocked-data
+            // proves 8192@0x3f1dbb000, 4096@0x3f1dbc000 twice), but
+            // expectedPostInit parked function-103 at phases 42/43 as blocked
+            // before the decoder ran. Dead BAR2/map/unmap blocks below still
+            // name 0x40; unreachable in this build, reconciled later.
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kSubdeviceHandle = 0xc0d02080;
             constexpr UInt32 kMemoryHandle = 0xc0d00042;
@@ -10139,12 +10809,11 @@ IOReturn NVGspControl::pollStatusLocked() {
         } else if ((methodSizeAnswered && !methodSizeResponse) ||
                    (instanceBackingAnswered && !instanceBackingAllocResponse) ||
                    (methodBackingAnswered && !methodBackingAllocResponse)) {
-            // split backing refused (CE size not supported or backing
-            // alloc rejected). Fall back to the older shape that worked:
-            // zero the split descriptors and carry on at the GPU-VA
-            // window, instead of parking with the tree held. Successful
-            // polls never get here (their ok flag is true), so attribution
-            // stays clean.
+            // 0.7.0: split-backing refused (CE size unsupported or backing
+            // alloc rejected). Degrade to the proven 0.6.9 shape: zero the
+            // split descriptors and continue at the GPU-VA window instead
+            // of parking with the tree held. Success polls never reach
+            // here (their ok-flag is true), so attribution stays clean.
             instanceBackingOffset_ = instanceBackingSize_ = 0;
             methodBackingOffset_ = methodBackingSize_ = 0;
             setProperty("NVGspControl-channel-split-backing-skipped", true);
@@ -10207,9 +10876,9 @@ IOReturn NVGspControl::pollStatusLocked() {
                 badReason = 43;
         } else if (methodBackingAllocResponse) {
             setProperty("NVGspControl-channel-split-backing-complete", true);
-            // The bare-metal GSP server doesn't expose NV01_CONTEXT_DMA (we
-            // got NV_ERR_NOT_SUPPORTED). hObjectError=0 is valid in
-            // kernel_channel.c, so go straight to the GPU-VA window.
+            // NV01_CONTEXT_DMA is not exposed by the bare-metal GSP server
+            // (0.6.7 returned NV_ERR_NOT_SUPPORTED). hObjectError=0 is valid
+            // in kernel_channel.c, so proceed directly to the GPU-VA window.
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kDeviceHandle = 0xc0d00080;
             constexpr UInt32 kVirtualHandle = 0xc0d050a0;
@@ -10237,10 +10906,10 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 36;
         } else if (errBackingAllocResponse) {
-            // Bind the error backing memory as NV01_CONTEXT_DMA (upstream
-            // errorCtxDma shape: KERNEL mapping + HASH_TABLE DISABLE, offset 0,
-            // limit 4095). ContextDma requires the same parent as hMemory, and
-            // backing object 0x44 is under the subdevice.
+            // 0.6.4: bind the error backing memory as NV01_CONTEXT_DMA
+            // (upstream errorCtxDma shape: KERNEL mapping + HASH_TABLE DISABLE,
+            // offset 0, limit 4095). ContextDma requires the same parent as
+            // hMemory, and backing object 0x44 is under the subdevice.
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kSubdeviceHandle = 0xc0d02080;
             constexpr UInt32 kCtxDmaHandle = 0xc0d00045;
@@ -10299,8 +10968,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 40;
         } else if (virtualMemoryAllocResponse) {
-            // Find where the live PTE for the virtual GPFIFO window is
-            // before mapping (GET_PDE_INFO, known to work).
+            // 0.6.2: resolve the live PTE location for the virtual GPFIFO
+            // window before mapping (GET_PDE_INFO, proven in 0.4.6).
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kDeviceHandle = 0xc0d00080;
             constexpr UInt32 kVaspaceHandle = 0xc0d090f1;
@@ -10322,8 +10991,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-channel-alloc-ok", channelAllocOk_);
             setProperty("NVGspControl-channel-handle-cid", channelCid_, 32);
             if (channelAllocResponse) {
-                // The channel lives, bind it to GRAPHICS exactly like
-                // Linux BindAndScheduleChannel (NVA06F_CTRL_CMD_BIND
+                // 0.7.1: the channel lives — bind it to GRAPHICS exactly
+                // like Linux BindAndScheduleChannel (NVA06F_CTRL_CMD_BIND
                 // 0xa06f0104 + NvU32 engineType).
                 constexpr UInt32 kClientHandle = 0xc0d00001;
                 constexpr UInt32 kChannelHandle = 0xc0d0c56f;
@@ -10334,7 +11003,7 @@ IOReturn NVGspControl::pollStatusLocked() {
                 __builtin_memcpy(control + 4, &kChannelHandle, 4);
                 __builtin_memcpy(control + 8, &kCommand, 4);
                 __builtin_memcpy(control + 16, &kParamsBytes, 4);
-                constexpr UInt32 kEngine = nvgsp::kEngineTypeCopy0;
+                constexpr UInt32 kEngine = nvgsp::kEngineTypeCopy0;  // 0.7.7
                 __builtin_memcpy(control + 24, &kEngine, 4);
                 if (init_.enqueueRpc(76, control, sizeof(control)))
                     postInitPhase_ = 52;
@@ -10366,11 +11035,11 @@ IOReturn NVGspControl::pollStatusLocked() {
         } else if (bindReturned) {
             setProperty("NVGspControl-channel-bind-ok", bindResponse);
             if (bindResponse) {
-                // Channel-level SCHEDULE always gives 0x1f, so skip it
-                // and bind the TSG RM assigned instead
-                // (NVA06C_CTRL_CMD_BIND 0xa06c0102 + NvU32 engineType). A
-                // zero TSG handle means the echo never decoded: don't
-                // guess, tear down with a reason.
+                // 0.7.2: channel-level SCHEDULE is a proven 0x1f (0.7.1),
+                // so skip it and bind the RM-assigned TSG instead
+                // (NVA06C_CTRL_CMD_BIND 0xa06c0102 + NvU32 engineType).
+                // A zero TSG handle means the echo never decoded: never
+                // guess, tear down with a reason instead.
                 if (channelTsgHandle_ == 0) {
                     setProperty("NVGspControl-channel-skipped-reason",
                                 "tsg-handle-unknown");
@@ -10398,7 +11067,7 @@ IOReturn NVGspControl::pollStatusLocked() {
                     __builtin_memcpy(control + 4, &channelTsgHandle_, 4);
                     __builtin_memcpy(control + 8, &kCommand, 4);
                     __builtin_memcpy(control + 16, &kParamsBytes, 4);
-                    constexpr UInt32 kEngine = nvgsp::kEngineTypeCopy0;
+                    constexpr UInt32 kEngine = nvgsp::kEngineTypeCopy0;  // 0.7.7
                     __builtin_memcpy(control + 24, &kEngine, 4);
                     if (init_.enqueueRpc(76, control, sizeof(control)))
                         postInitPhase_ = 54;
@@ -10425,8 +11094,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             }
         } else if (scheduleReturned) {
             setProperty("NVGspControl-channel-schedule-ok", scheduleResponse);
-            // Stops at a scheduled channel: no method is submitted yet.
-            // Teardown is identical on success and refusal.
+            // 0.7.1 stops at a scheduled channel: no method is submitted
+            // yet. Teardown is identical on success and refusal.
             setProperty("NVGspControl-channel-live",
                         scheduleResponse);
             if (!scheduleResponse)
@@ -10451,7 +11120,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 38;
         } else if (tsgBindReturned) {
-            // TSG bound, first query its hardware state
+            // 0.7.3: TSG bound — first query its hardware state
             // (NVA06C_CTRL_CMD_GET_INFO 0xa06c0106, output-only tsgID)
             // before attempting the schedule again.
             setProperty("NVGspControl-tsg-bind-ok", tsgBindResponse);
@@ -10487,9 +11156,9 @@ IOReturn NVGspControl::pollStatusLocked() {
                     badReason = 38;
             }
         } else if (tsgInfoReturned) {
-            // TSG state captured, NO schedule call (6/6 refused). Start
-            // the FIFO intel sweep: P1a FIFO_GET_INFO (0x20801109) with
-            // {size=2, idx 6/7, engineType=GR}.
+            // 0.8.0: TSG state captured — NO schedule call (6/6 refused).
+            // Start the FIFO intel sweep: P1a FIFO_GET_INFO (0x20801109)
+            // with {size=2, idx 6/7, engineType=GR}.
             setProperty("NVGspControl-tsg-info-ok", tsgInfoResponse);
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kSubdeviceHandle = 0xc0d02080;
@@ -10513,9 +11182,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 53;
         } else if (tsgTimesliceReturned) {
-            // Timeslice answered, teardown. The schedule attempt (55) is
-            // skipped: four 0x1f reproductions are enough, and a fifth
-            // adds no information to this matrix.
+            // 0.7.5: timeslice answered — teardown. The schedule attempt
+            // (55) is skipped: four 0x1f reproductions are enough, and a
+            // fifth adds no information to this matrix.
             setProperty("NVGspControl-tsg-timeslice-ok",
                         tsgTimesliceResponse);
             UInt64 original = originalPte_;
@@ -10537,7 +11206,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 38;
         } else if (fifoInfoReturned) {
-            // P1b: FIFO_GET_USERD_LOCATION (0x2080110D), 8 B out.
+            // 0.8.0 P1b: FIFO_GET_USERD_LOCATION (0x2080110D), 8 B out.
             // Answered phases always advance (refusal is data, the sweep
             // phases are independent); only a watchdog stall tears down.
             setProperty("NVGspControl-fifo-info-ok", fifoInfoResponse);
@@ -10555,7 +11224,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 54;
         } else if (userdLocReturned) {
-            // P1c: GPU_GET_ENGINE_PARTNERLIST (0x20800147), 144 B.
+            // 0.8.0 P1c: GPU_GET_ENGINE_PARTNERLIST (0x20800147), 144 B.
             setProperty("NVGspControl-userd-loc-ok", userdLocResponse);
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kSubdeviceHandle = 0xc0d02080;
@@ -10575,8 +11244,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 55;
         } else if (partnerReturned) {
-            // P1d: GPU_GET_ENGINE_RUNLIST_PRI_BASE (0x20800179). 3 x 84
-            // x u32: engineList[0]=GR, rest NULL, outputs zero.
+            // 0.8.0 P1d: GPU_GET_ENGINE_RUNLIST_PRI_BASE (0x20800179).
+            // 3 x 84 x u32: engineList[0]=GR, rest NULL, outputs zero.
             setProperty("NVGspControl-partner-ok", partnerResponse);
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kSubdeviceHandle = 0xc0d02080;
@@ -10600,8 +11269,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 56;
         } else if (priBaseReturned) {
-            // P2: GPFIFO_GET_WORK_SUBMIT_TOKEN (0xc36f0108) on the bound
-            // channel. Record only, no doorbell write (no usermode
+            // 0.8.0 P2: GPFIFO_GET_WORK_SUBMIT_TOKEN (0xc36f0108) on the
+            // bound channel. Record only — no doorbell write (no usermode
             // mapping exists).
             setProperty("NVGspControl-pribase-ok", priBaseResponse);
             constexpr UInt32 kClientHandle = 0xc0d00001;
@@ -10618,7 +11287,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 57;
         } else if (tokenReturned) {
-            // P3: DMA_FLUSH (0x801805) on the device, FB flush.
+            // 0.8.0 P3: DMA_FLUSH (0x801805) on the device, FB flush.
             // Display-path benign probe; no channel alloc here.
             setProperty("NVGspControl-submit-token-ok", tokenResponse);
             constexpr UInt32 kClientHandle = 0xc0d00001;
@@ -10637,8 +11306,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 58;
         } else if (flushReturned && (experimentFlags_ & 2)) {
-            // Display probe, 64 KiB display instance memory (nouveau
-            // r535_disp_oneinit RAMIN), 64 KiB aligned VRAM.
+            // 0.51.0: display probe — 64 KiB display instance memory
+            // (nouveau r535_disp_oneinit RAMIN), 64 KiB aligned VRAM.
             setProperty("NVGspControl-dma-flush-ok", flushResponse);
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kSubdeviceHandle = 0xc0d02080;
@@ -10665,8 +11334,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 120;
         } else if (dispInstMemReturned && dispInstMemResponse) {
-            // Hand the RAMIN to physical RM. zero it first (RAMHT +
-            // ctxdma objects live here).
+            // 0.51.0: hand the RAMIN to physical RM.
+            // 0.54.0: zero it first (RAMHT + ctxdma objects live here).
             setProperty("NVGspControl-dispinst-zeroed",
                         praminZeroRange(pci_, dispInstOffset_, 0x10000));
             UInt8 control[24 + 24]{};
@@ -10689,9 +11358,9 @@ IOReturn NVGspControl::pollStatusLocked() {
                 badReason = 121;
         } else if ((dispInstWriteReturned && dispInstWriteResponse) ||
                    (flushReturned && !(experimentFlags_ & 2))) {
-            // Intel sweep complete, graft the display path onto the live
-            // tree. NVC770_DISPLAY (0xC770) under the device, NULL params
-            // (nvkms-exact: nvRmApiAlloc NULL).
+            // 0.8.1: intel sweep complete — graft the display path onto the
+            // live tree. NVC770_DISPLAY (0xC770) under the device, NULL
+            // params (nvkms-exact: nvRmApiAlloc NULL).
             setProperty("NVGspControl-dma-flush-ok", flushResponse);
             setProperty("NVGspControl-intel-sweep-complete", true);
             constexpr UInt32 kClientHandle = 0xc0d00001;
@@ -10710,7 +11379,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 59;
         } else if (dispReturned && !dispResponse) {
-            // Display parent refused (perm gate 0x1B? class? arg?) ,
+            // Display parent refused (perm gate 0x1B? class? arg?) —
             // record + teardown; the c77d chain needs this handle.
             setProperty("NVGspControl-disp-parent-ok", false);
             setProperty("NVGspControl-display-skipped-reason",
@@ -10730,10 +11399,10 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 38;
         } else if (dispResponse) {
-            // PB backing, back to VRAM (bare-metal GSP-RM refused 0x3E
-            // sysmem with 0x22, so VRAM is the only backing that works).
-            // Class 0x40 under SUBDEVICE, owner + dmaType6 + 4K attr,
-            // 4096 bytes, same shape that worked earlier.
+            // 0.8.4: PB backing — VRAM revert (0.8.2 bytes: bare-metal
+            // GSP-RM refused 0x3E sysmem 0x22, so VRAM is the only viable
+            // backing). Class 0x40 under SUBDEVICE, owner+dmaType6+4K
+            // attr, 4096 bytes — the proven 0.8.2 shape.
             setProperty("NVGspControl-disp-parent-ok", true);
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kSubdeviceHandle = 0xc0d02080;
@@ -10776,8 +11445,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 38;
         } else if (pbBackingResponse) {
-            // PB ctxdma with SUBDEVICE parent (same parent as the VRAM
-            // backing, see context_dma.c:151-154)
+            // 0.8.4: PB ctxdma — SUBDEVICE parent (0.8.2 bytes; matches
+            // the VRAM backing's parent per context_dma.c:151-154).
             setProperty("NVGspControl-pb-backing-ok", true);
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kSubdeviceHandle = 0xc0d02080;
@@ -10818,7 +11487,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 38;
         } else if (pbCtxdmaResponse) {
-            // per-subdevice notifier backing, the skipped
+            // 0.8.4: per-subdevice notifier backing — the skipped
             // RmAllocEvoChannel step-1 (nvkms-rm.c:2666). Same VRAM 0x40
             // shape as the PB backing, fresh handle 0xc0d0004a.
             setProperty("NVGspControl-pb-ctxdma-ok", true);
@@ -10863,10 +11532,10 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 38;
         } else if (notifyBackingResponse) {
-            // Notifier ctxdma, subdevice parent (matches the notifier
-            // backing's parent per context_dma.c:151-154), limit 4095,
-            // handle 0xc0d0004b. hObjectNotify stays 0 in the channel
-            // params (RM ignores it; DISPLAY-ABI §3).
+            // 0.8.4: notifier ctxdma — subdevice parent (matches the
+            // notifier backing's parent per context_dma.c:151-154),
+            // limit 4095, handle 0xc0d0004b. hObjectNotify stays 0 in
+            // the channel params (RM ignores it; DISPLAY-ABI §3).
             setProperty("NVGspControl-notify-backing-ok", true);
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kSubdeviceHandle = 0xc0d02080;
@@ -10907,7 +11576,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 38;
         } else if (notifyCtxdmaResponse) {
-            // Mirror CPU-RM's split display path. C77D allocation is
+            // 0.8.5: mirror CPU-RM's split display path. C77D allocation is
             // host-side and ends in osMapGPU; physical RM receives only this
             // internal control on the INTERNAL subdevice. The PB is local
             // VRAM, so Ada's DISPv0502 path selects PHYS_NVM.
@@ -10936,14 +11605,14 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 62;
         } else if (dispKickFlushReturned) {
-            // The two-dword UPDATE-with-zero-data packet is visible in FB.
-            // Publish PUT=8 exactly like nvkms-dma.c, then see if the
-            // display core channel eats it (GET=8). This is a read-only
-            // check for the earlier "not consumed" result: PUT read after
-            // the write proves the write landed, the 500 ms poll rules out a
-            // slow fetch, and PUT after the poll plus reading the PB back
-            // after the kick show whether the engine touched anything at
-            // all. No new RPC, no new BAR0 offsets, same PUT write.
+            // 0.8.7: the two-dword UPDATE-with-zero-data packet is visible
+            // in FB. Publish PUT=8 exactly as nvkms-dma.c does, then observe
+            // whether the display core channel consumes it (GET=8).
+            // 0.8.8: read-only discriminator for the 0.8.7 not-consumed
+            // result. PUT-after-write proves the PUT write landed; the
+            // 500 ms poll rules out a slow fetch; PUT-after-poll plus the
+            // post-kick PB re-readback show whether the engine touched
+            // anything. No new RPC, no new BAR0 offsets, same PUT write.
             setProperty("NVGspControl-disp-kick-flush-ok",
                         dispKickFlushResponse);
             IOMemoryMap *bar0Map = sharedBar0Map(pci_);
@@ -11000,9 +11669,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             if (!consumed)
                 setProperty("NVGspControl-channel-skipped-reason",
                             "disp-update-not-consumed");
-            // Probe 1, byte-identical phase-69 control except valid=0
-            // on channel 0. Tests whether the closed handler validates
-            // anything at all.
+            // 0.8.9: probe 1 — byte-identical phase-69 control except
+            // valid=0 on channel 0. Tests whether the closed handler
+            // validates anything at all.
             nvgsp::NvDispChannelPushbufferParams probe1{};
             probe1.addressSpace = nvgsp::kAddressSpaceFbmem;
             probe1.physicalAddr = dispPbBackingOffset_;
@@ -11027,9 +11696,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 65;
         } else if (dispHandlerProbe1Returned) {
-            // Probe 2, valid=1 on nonexistent channel instance 7. Tests
-            // instance validation. Always advances: any answered status
-            // is data.
+            // 0.8.9: probe 2 — valid=1 on nonexistent channel instance 7.
+            // Tests instance validation. Always advances: any answered
+            // status is data.
             setProperty("NVGspControl-disp-handler-probe1-ok",
                         dispHandlerProbe1Response);
             nvgsp::NvDispChannelPushbufferParams probe2{};
@@ -11057,8 +11726,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 66;
         } else if (dispHandlerProbe2Returned) {
-            // Record probe 2, re-survey the ch0 PUT/GET window (did
-            // valid=0 change anything?), then teardown as usual.
+            // 0.8.9: record probe 2, re-survey the ch0 PUT/GET window
+            // (did valid=0 change anything?), then teardown as usual.
             setProperty("NVGspControl-disp-handler-probe2-ok",
                         dispHandlerProbe2Response);
             IOMemoryMap *bar0Map = sharedBar0Map(pci_);
@@ -11074,11 +11743,10 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-handler-probe2-get", get, 32);
             setProperty("NVGspControl-disp-handler-probe2-survey-ok",
                         surveyOk);
-            // function-97 channel schedule retry, 16 B {hClient,
-            // hObject=channel, cmd, bEnable=1} as per
-            // rpc_ctrl_gpfifo_schedule_v1A_0A (params v03_00 = only
-            // bEnable). Only one thing changes compared to the
-            // function-76 attempt that gave 0x1f.
+            // 0.9.0: function-97 channel schedule retry — 16B
+            // {hClient, hObject=channel, cmd, bEnable=1} per
+            // rpc_ctrl_gpfifo_schedule_v1A_0A (params v03_00 = bEnable
+            // only). Single variable vs 0.7.1's function-76 0x1f.
             constexpr UInt32 kSched97Client = 0xc0d00001;
             constexpr UInt32 kSched97Channel = 0xc0d0c56f;
             constexpr UInt32 kSched97Cmd = 0xa06f0103;
@@ -11093,9 +11761,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 67;
         } else if (sched97chanReturned) {
-            // channel-97 answered, record, then TSG-level via 97 (cmd
-            // 0xa06c0101 on the RM-assigned TSG handle). Always
-            // advances: any answered status is data.
+            // 0.9.0: channel-97 answered — record, then TSG-level via
+            // 97 (cmd 0xa06c0101 on the RM-assigned TSG handle).
+            // Always advances: any answered status is data.
             setProperty("NVGspControl-sched97chan-ok",
                         sched97chanResponse);
             if (channelTsgHandle_ == 0) {
@@ -11131,16 +11799,15 @@ IOReturn NVGspControl::pollStatusLocked() {
                     badReason = 68;
             }
         } else if (sched97tsgReturned) {
-            // TSG-97 answered: record it, then go to the C372 probe.
-            // (If either schedule got ENABLED by surprise, the channel
-            // just idles on an empty GPFIFO and the recursive free
-            // tears scheduling down normally. No doorbell is rung in
-            // this probe.)
+            // 0.9.0: TSG-97 answered — record, then 0.9.1's C372 probe.
+            // (If either schedule unexpectedly ENABLED, the channel is
+            // idle with an empty GPFIFO; recursive free tears down
+            // scheduling normally. No doorbell is rung in this probe.)
             setProperty("NVGspControl-sched97tsg-ok",
                         sched97tsgResponse);
-            // NVC372_DISPLAY_SW (0xC372) under the device, NULL params
-            // (nvkms-exact: nvEvoAllocRmCtrlObjectC3). Class gate open
-            // (live class list). Any answer advances.
+            // 0.9.1: NVC372_DISPLAY_SW (0xC372) under the device, NULL
+            // params (nvkms-exact: nvEvoAllocRmCtrlObjectC3). Class gate
+            // open (live class list). Any answer advances.
             constexpr UInt32 kClientHandle75 = 0xc0d00001;
             constexpr UInt32 kDeviceHandle75 = 0xc0d00080;
             constexpr UInt32 kSwHandle75 = 0xc0d0c372;
@@ -11157,9 +11824,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 69;
         } else if (dispC372Returned) {
-            // Record the C372 answer, run the post-FWSEC head + PUT/GET
-            // survey (read-only, live-proven offsets), then teardown.
-            // Survey runs even if the alloc refused.
+            // 0.9.1: record the C372 answer, run the post-FWSEC head +
+            // PUT/GET survey (read-only, live-proven offsets), then
+            // teardown. Survey runs even if the alloc refused.
             setProperty("NVGspControl-disp-c372-ok",
                         dispC372Response);
             IOMemoryMap *bar0Map = sharedBar0Map(pci_);
@@ -11188,9 +11855,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-disp-survey-put", put, 32);
             setProperty("NVGspControl-disp-survey-get", get, 32);
             setProperty("NVGspControl-disp-survey-ok", surveyOk);
-            // post-FWSEC GOP surface hash (BAR1+0, first 4 KiB). Match
-            // against the stage-time hash => FWSEC preserved the GOP
-            // surface (frozen splash); mismatch => clobbered.
+            // 0.9.2: post-FWSEC GOP surface hash (BAR1+0, first 4 KiB).
+            // Match against the stage-time hash => FWSEC preserved the
+            // GOP surface (frozen splash); mismatch => clobbered.
             UInt64 gopHashPost = 0;
             bool gopHashPostOk = false;
             IODeviceMemory *bar1Survey =
@@ -11216,7 +11883,7 @@ IOReturn NVGspControl::pollStatusLocked() {
                         gopHashPost, 64);
             setProperty("NVGspControl-gop-surface-hash-post-ok",
                         gopHashPostOk);
-            // post-boot first 64 bytes (forensics vs pre-words).
+            // 0.9.4: post-boot first 64 bytes (forensics vs pre-words).
             UInt64 postWords[8] = {};
             if (gopHashPostOk) {
                 IODeviceMemory *bar1Post =
@@ -11258,9 +11925,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-gop-surface-preserved",
                         gopSurfaceHashPreOk_ && gopHashPostOk &&
                         gopHashPost == gopSurfaceHashPre_);
-            // NV04_DISPLAY_COMMON (0x73) under the device, NULL params
-            // (nvkms-exact: displayCommonHandle). Class gate open (live
-            // class list). Any answer advances.
+            // 0.9.2: NV04_DISPLAY_COMMON (0x73) under the device, NULL
+            // params (nvkms-exact: displayCommonHandle). Class gate
+            // open (live class list). Any answer advances.
             constexpr UInt32 kClientHandle76 = 0xc0d00001;
             constexpr UInt32 kDeviceHandle76 = 0xc0d00080;
             constexpr UInt32 kCommonHandle76 = 0xc0d00073;
@@ -11277,8 +11944,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 70;
         } else if (dispCommonReturned) {
-            // Record the display-common answer, then chain
-            // SYSTEM_GET_SUPPORTED on the 0x73 object (our first RM
+            // 0.9.2: record the display-common answer. 0.9.7: chain
+            // SYSTEM_GET_SUPPORTED on the 0x73 object (first RM
             // display query) instead of tearing down.
             setProperty("NVGspControl-disp-common-ok",
                         dispCommonResponse);
@@ -11296,7 +11963,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 71;
         } else if (dispSysSupportedReturned) {
-            // record supported-mask answer, then GET_NUM_HEADS.
+            // 0.9.7: record supported-mask answer, then GET_NUM_HEADS.
             setProperty("NVGspControl-disp-sys-supported-ok",
                         dispSysSupportedResponse);
             constexpr UInt32 kClientHandle78 = 0xc0d00001;
@@ -11313,7 +11980,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 72;
         } else if (dispSysNumHeadsReturned) {
-            // record head count, then GET_ACTIVE on head0.
+            // 0.9.7: record head count, then GET_ACTIVE on head0.
             setProperty("NVGspControl-disp-sys-num-heads-ok",
                         dispSysNumHeadsResponse);
             constexpr UInt32 kClientHandle79 = 0xc0d00001;
@@ -11330,7 +11997,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 73;
         } else if (dispSysActiveReturned) {
-            // record head0-active answer, then GET_ACTIVE head1.
+            // 0.9.8: record head0-active answer, then GET_ACTIVE head1.
             setProperty("NVGspControl-disp-sys-active-ok",
                         dispSysActiveResponse);
             constexpr UInt32 kClientHandle80 = 0xc0d00001;
@@ -11349,7 +12016,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 74;
         } else if (dispSysActive1Returned) {
-            // record head1-active answer, then GET_ACTIVE head2.
+            // 0.9.8: record head1-active answer, then GET_ACTIVE head2.
             setProperty("NVGspControl-disp-sys-active1-ok",
                         dispSysActive1Response);
             constexpr UInt32 kClientHandle81 = 0xc0d00001;
@@ -11368,7 +12035,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 75;
         } else if (dispSysActive2Returned) {
-            // record head2-active answer, then GET_ACTIVE head3.
+            // 0.9.8: record head2-active answer, then GET_ACTIVE head3.
             setProperty("NVGspControl-disp-sys-active2-ok",
                         dispSysActive2Response);
             constexpr UInt32 kClientHandle82 = 0xc0d00001;
@@ -11387,8 +12054,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 76;
         } else if (dispSysActive3Returned) {
-            // Record head3-active answer, then GET_CONNECT_STATE over
-            // the supported mask (0x7F00) with DEFAULT detect.
+            // 0.9.8: record head3-active answer, then GET_CONNECT_STATE
+            // over the supported mask (0x7F00) with DEFAULT detect.
             setProperty("NVGspControl-disp-sys-active3-ok",
                         dispSysActive3Response);
             constexpr UInt32 kClientHandle83 = 0xc0d00001;
@@ -11407,7 +12074,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 77;
         } else if (dispConnectReturned) {
-            // record connect-state answer, then GET_BOOT_DISPLAYS.
+            // 0.9.8: record connect-state answer, then GET_BOOT_DISPLAYS.
             setProperty("NVGspControl-disp-connect-ok",
                         dispConnectResponse);
             constexpr UInt32 kClientHandle84 = 0xc0d00001;
@@ -11424,7 +12091,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 78;
         } else if (dispBootDisplaysReturned) {
-            // record boot-displays answer, then GET_SCANLINE head0.
+            // 0.9.9: record boot-displays answer, then GET_SCANLINE head0.
             setProperty("NVGspControl-disp-boot-displays-ok",
                         dispBootDisplaysResponse);
             constexpr UInt32 kClientHandle85 = 0xc0d00001;
@@ -11443,7 +12110,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 79;
         } else if (dispScanlineReturned) {
-            // record scanline answer, then GET_VBLANK_COUNTER.
+            // 0.9.9: record scanline answer, then GET_VBLANK_COUNTER.
             setProperty("NVGspControl-disp-scanline-ok",
                         dispScanlineResponse);
             constexpr UInt32 kClientHandle86 = 0xc0d00001;
@@ -11462,7 +12129,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 80;
         } else if (dispVblankReturned) {
-            // record vblank answer, then GET_HEAD_ROUTING_MAP.
+            // 0.9.9: record vblank answer, then GET_HEAD_ROUTING_MAP.
             setProperty("NVGspControl-disp-vblank-ok",
                         dispVblankResponse);
             constexpr UInt32 kClientHandle87 = 0xc0d00001;
@@ -11481,7 +12148,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 81;
         } else if (dispRoutingReturned) {
-            // Record routing-map answer, then C372
+            // 0.10.0: record routing-map answer, then C372
             // GET_ACTIVE_VIEWPORT_POINT_IN window 0.
             setProperty("NVGspControl-disp-routing-ok",
                         dispRoutingResponse);
@@ -11501,8 +12168,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 82;
         } else if (dispViewportReturned) {
-            // Record viewport answer, then DFP_GET_INFO on display
-            // 0x200 via the 0x73 object (nvkms GetDfpInfo).
+            // 0.11.0: record viewport answer, then DFP_GET_INFO on
+            // display 0x200 via the 0x73 object (nvkms GetDfpInfo).
             setProperty("NVGspControl-disp-viewport-ok",
                         dispViewportResponse);
             constexpr UInt32 kClientHandle89 = 0xc0d00001;
@@ -11521,9 +12188,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 83;
         } else if (dispDfpReturned) {
-            // Record the DFP info answer, then do a live DDC EDID read
-            // (COPY_CACHE_NO = flags 0, what nvkms uses; the cached
-            // read gave us an empty cache).
+            // 0.13.0: record DFP info answer, then live DDC EDID read
+            // (COPY_CACHE_NO = flags 0, what nvkms uses; the 0.12.0
+            // cached read returned an empty cache).
             setProperty("NVGspControl-disp-dfp-ok",
                         dispDfpResponse);
             constexpr UInt32 kClientHandle90 = 0xc0d00001;
@@ -11544,7 +12211,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 84;
         } else if (dispEdidReturned) {
-            // record EDID answer, then PCLK_LIMIT on 0x200.
+            // 0.14.0: record EDID answer, then PCLK_LIMIT on 0x200.
             setProperty("NVGspControl-disp-edid-ok",
                         dispEdidResponse);
             constexpr UInt32 kClientHandle91 = 0xc0d00001;
@@ -11563,7 +12230,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 85;
         } else if (dispPclkReturned) {
-            // record pclk answer, then OR_GET_INFO index 0.
+            // 0.14.0: record pclk answer, then OR_GET_INFO index 0.
             setProperty("NVGspControl-disp-pclk-ok",
                         dispPclkResponse);
             constexpr UInt32 kClientHandle92 = 0xc0d00001;
@@ -11584,7 +12251,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 86;
         } else if (dispOrReturned) {
-            // record OR info answer, then SYSTEM_GET_CAPS_V2.
+            // 0.15.0: record OR info answer, then SYSTEM_GET_CAPS_V2.
             setProperty("NVGspControl-disp-or-ok",
                         dispOrResponse);
             constexpr UInt32 kClientHandle93 = 0xc0d00001;
@@ -11601,7 +12268,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 87;
         } else if (dispCapsReturned) {
-            // record caps answer, then VBLANK_ENABLE head0.
+            // 0.15.0: record caps answer, then VBLANK_ENABLE head0.
             setProperty("NVGspControl-disp-caps-ok",
                         dispCapsResponse);
             constexpr UInt32 kClientHandle94 = 0xc0d00001;
@@ -11620,8 +12287,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 88;
         } else if (dispVbEnReturned) {
-            // Record vblank-enable answer, then C372 IS_MODE_POSSIBLE
-            // with a zeroed struct (numHeads=0).
+            // 0.16.0: record vblank-enable answer, then C372
+            // IS_MODE_POSSIBLE with a zeroed struct (numHeads=0).
             setProperty("NVGspControl-disp-vblank-en-ok",
                         dispVbEnResponse);
             constexpr UInt32 kClientHandle95 = 0xc0d00001;
@@ -11638,9 +12305,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 89;
         } else if (dispImpReturned) {
-            // Record empty-validation answer, then IS_MODE_POSSIBLE
-            // with head0 CTA-861 4K60 timing (594 MHz; blank
-            // (4016,2168)-(4400,2250)), windows 0.
+            // 0.17.0: record empty-validation answer, then
+            // IS_MODE_POSSIBLE with head0 CTA-861 4K60 timing
+            // (594 MHz; blank (4016,2168)-(4400,2250)), windows 0.
             setProperty("NVGspControl-disp-imp-ok",
                         dispImpResponse);
             constexpr UInt32 kClientHandle96 = 0xc0d00001;
@@ -11670,8 +12337,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 90;
         } else if (dispModeReturned) {
-            // Record 4K60-validation answer, then GET_CONNECTOR_DATA on
-            // display 0x200 (72B).
+            // 0.18.0: record 4K60-validation answer, then
+            // GET_CONNECTOR_DATA on display 0x200 (72B).
             setProperty("NVGspControl-disp-mode-ok",
                         dispModeResponse);
             constexpr UInt32 kClientHandle97 = 0xc0d00001;
@@ -11690,8 +12357,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 91;
         } else if (dispConnReturned) {
-            // Record connector answer, then MC_GET_ARCH_INFO on the
-            // subdevice (13B).
+            // 0.19.0: record connector answer, then MC_GET_ARCH_INFO
+            // on the subdevice (13B).
             setProperty("NVGspControl-disp-conn-ok",
                         dispConnResponse);
             constexpr UInt32 kClientHandle98 = 0xc0d00001;
@@ -11708,7 +12375,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 92;
         } else if (dispArchReturned) {
-            // record arch answer, then GPU name string.
+            // 0.19.0: record arch answer, then GPU name string.
             setProperty("NVGspControl-disp-arch-ok",
                         dispArchResponse);
             constexpr UInt32 kClientHandle99 = 0xc0d00001;
@@ -11727,8 +12394,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 93;
         } else if (dispNameReturned) {
-            // Record name answer, then FIFO physical channel count on
-            // the subdevice (8B).
+            // 0.20.0: record name answer, then FIFO physical
+            // channel count on the subdevice (8B).
             setProperty("NVGspControl-disp-name-ok",
                         dispNameResponse);
             constexpr UInt32 kClientHandle100 = 0xc0d00001;
@@ -11745,8 +12412,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 94;
         } else if (dispFifoReturned) {
-            // Record FIFO count answer, then allocated channels on
-            // runlist 0 (516B).
+            // 0.21.0: record FIFO count answer, then allocated
+            // channels on runlist 0 (516B).
             setProperty("NVGspControl-disp-fifo-ok",
                         dispFifoResponse);
             constexpr UInt32 kClientHandle101 = 0xc0d00001;
@@ -11765,8 +12432,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 95;
         } else if (dispRunlistReturned) {
-            // Record runlist answer, then BIND the channel to GR
-            // (engineType=1). Empty GPFIFO idles if scheduled.
+            // 0.22.0: record runlist answer, then BIND the channel
+            // to GR (engineType=1). Empty GPFIFO idles if scheduled.
             setProperty("NVGspControl-disp-runlist-ok",
                         dispRunlistResponse);
             constexpr UInt32 kClientHandle102 = 0xc0d00001;
@@ -11785,8 +12452,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 96;
         } else if (dispGrBindReturned) {
-            // Record GR-bind answer, then re-query runlist 0 (same 516B
-            // command) to test post-bind scheduling.
+            // 0.23.0: record GR-bind answer, then re-query runlist 0
+            // (same 516B command) to test post-bind scheduling.
             setProperty("NVGspControl-disp-grbind-ok",
                         dispGrBindResponse);
             constexpr UInt32 kClientHandle103 = 0xc0d00001;
@@ -11805,8 +12472,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 97;
         } else if (dispReRunReturned) {
-            // Record re-query answer, then runlist 0 third sample, then
-            // runlists 1 and 2 (same 516B command).
+            // 0.24.0: record re-query answer, then runlist 0 third
+            // sample, then runlists 1 and 2 (same 516B command).
             setProperty("NVGspControl-disp-rerun-ok",
                         dispReRunResponse);
             constexpr UInt32 kClientHandle104 = 0xc0d00001;
@@ -11825,7 +12492,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 98;
         } else if (dispRl0cReturned) {
-            // record rl0 sample, then runlist 1.
+            // 0.24.0: record rl0 sample, then runlist 1.
             setProperty("NVGspControl-disp-rl0c-ok",
                         dispRl0cResponse);
             constexpr UInt32 kClientHandle105 = 0xc0d00001;
@@ -11844,7 +12511,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 99;
         } else if (dispRl1Returned) {
-            // record rl1 answer, then runlist 2.
+            // 0.24.0: record rl1 answer, then runlist 2.
             setProperty("NVGspControl-disp-rl1-ok",
                         dispRl1Response);
             constexpr UInt32 kClientHandle106 = 0xc0d00001;
@@ -11863,9 +12530,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 100;
         } else if (dispRl2Returned) {
-            // Record rl2 answer, then post-bind GPFIFO_SCHEDULE with
-            // exact 2B params ({bEnable=1, bSkipSubmit=0} per the open
-            // header).
+            // 0.26.0: record rl2 answer, then post-bind
+            // GPFIFO_SCHEDULE with exact 2B params
+            // ({bEnable=1, bSkipSubmit=0} per the open header).
             setProperty("NVGspControl-disp-rl2-ok",
                         dispRl2Response);
             constexpr UInt32 kClientHandle107 = 0xc0d00001;
@@ -11885,7 +12552,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 101;
         } else if (dispSchedReturned) {
-            // record schedule answer, then rl0 re-query.
+            // 0.26.0: record schedule answer, then rl0 re-query.
             setProperty("NVGspControl-disp-sched-ok",
                         dispSchedResponse);
             constexpr UInt32 kClientHandle108 = 0xc0d00001;
@@ -11904,8 +12571,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 102;
         } else if (dispPostReturned) {
-            // Record post-schedule rl0, then rl1 (109) and rl2 (110)
-            // post-schedule samples (same 516B).
+            // 0.27.0: record post-schedule rl0, then rl1 (109)
+            // and rl2 (110) post-schedule samples (same 516B).
             setProperty("NVGspControl-disp-post-ok",
                         dispPostResponse);
             constexpr UInt32 kClientHandle109 = 0xc0d00001;
@@ -11924,7 +12591,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 103;
         } else if (dispPs1Returned) {
-            // record rl1 post-schedule, then rl2.
+            // 0.27.0: record rl1 post-schedule, then rl2.
             setProperty("NVGspControl-disp-ps1-ok",
                         dispPs1Response);
             constexpr UInt32 kClientHandle110 = 0xc0d00001;
@@ -11943,8 +12610,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 104;
         } else if (dispPs2Returned) {
-            // Record rl2 post-schedule, then device info table
-            // (baseIndex 0, numEntries 32, 3212B).
+            // 0.29.0: record rl2 post-schedule, then device info
+            // table (baseIndex 0, numEntries 32, 3212B).
             setProperty("NVGspControl-disp-ps2-ok",
                         dispPs2Response);
             constexpr UInt32 kClientHandle111 = 0xc0d00001;
@@ -11964,8 +12631,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 105;
         } else if (dispDevInfoReturned) {
-            // Record device-info answer, then USERD baseline survey (8x
-            // u64 at the USERD backing base).
+            // 0.31.0: record device-info answer, then USERD
+            // baseline survey (8x u64 at the USERD backing base).
             setProperty("NVGspControl-disp-devinfo-ok",
                         dispDevInfoResponse);
             UInt64 userdW[8]{};
@@ -11995,9 +12662,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             }
             postInitPhase_ = 112;
         } else if (postInitPhase_ == 112) {
-            // Local phases branch on the PERSISTENT phase (poll-local
-            // Returned flags evaporate; reply-driven chain would park).
-            // USERD recorded; survey GPFIFO.
+            // 0.31.1: local phases branch on the PERSISTENT phase
+            // (poll-local Returned flags evaporate; reply-driven
+            // chain would park). USERD recorded; survey GPFIFO.
             UInt64 fifoW[4]{};
             bool fifoOk = false;
             if (gpfifoBackingOffset_ != 0) {
@@ -12025,8 +12692,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             }
             postInitPhase_ = 113;
         } else if (postInitPhase_ == 113) {
-            // GPFIFO recorded; survey RAMFC/instance (8x u64 at
-            // instanceBackingOffset_), then 114.
+            // 0.32.0: GPFIFO recorded; survey RAMFC/instance
+            // (8x u64 at instanceBackingOffset_), then 114.
             UInt64 ramfcW[8]{};
             bool ramfcOk = false;
             if (instanceBackingOffset_ != 0) {
@@ -12054,8 +12721,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             }
             postInitPhase_ = 114;
         } else if (postInitPhase_ == 114) {
-            // RAMFC recorded; DEVICE FIFO_GET_CAPS_V2 (2B) on
-            // 0xc0d00080, then ENGINE_CONTEXT_PROPERTIES.
+            // 0.33.0: RAMFC recorded; DEVICE FIFO_GET_CAPS_V2 (2B)
+            // on 0xc0d00080, then ENGINE_CONTEXT_PROPERTIES.
             constexpr UInt32 kClientHandle115 = 0xc0d00001;
             constexpr UInt32 kObject115 = 0xc0d00080;
             constexpr UInt32 kCommand115 = 0x801713;
@@ -12070,8 +12737,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 106;
         } else if (dispFifoCapsReturned) {
-            // Record FIFO caps, then ENGINE_CONTEXT PROPERTIES GRAPHICS
-            // (engineId 0, 12B).
+            // 0.33.0: record FIFO caps, then ENGINE_CONTEXT
+            // PROPERTIES GRAPHICS (engineId 0, 12B).
             setProperty("NVGspControl-disp-fifocaps-ok",
                         dispFifoCapsResponse);
             constexpr UInt32 kClientHandle116 = 0xc0d00001;
@@ -12090,8 +12757,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 107;
         } else if (dispCtxPropReturned) {
-            // Record ctx-prop answer, then TPC partition GET with our
-            // live TSG handle (no guessing).
+            // 0.34.0: record ctx-prop answer, then TPC partition
+            // GET with our live TSG handle (no guessing).
             setProperty("NVGspControl-disp-ctxprop-ok",
                         dispCtxPropResponse);
             constexpr UInt32 kClientHandle117 = 0xc0d00001;
@@ -12109,9 +12776,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 108;
         } else if (dispTpcReturned) {
-            // Record TPC answer; validate the usermode map by reading
-            // NV_VIRTUAL_FUNCTION_TIME_0/1 (BAR0 0xBB0080/84, ns timer,
-            // must tick), then fresh submit token.
+            // 0.35.0: record TPC answer; validate the usermode map by
+            // reading NV_VIRTUAL_FUNCTION_TIME_0/1 (BAR0 0xBB0080/84,
+            // ns timer, must tick), then fresh submit token.
             setProperty("NVGspControl-disp-tpc-ok",
                         dispTpcResponse);
             IOMemoryMap *bar0Map = sharedBar0Map(pci_);
@@ -12148,11 +12815,11 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 109;
         } else if (dispTokenReturned) {
-            // NOP kick. Only with ticking usermode timer, a live token,
-            // installed GPFIFO PTE and VRAM USERD/GPFIFO. GPFIFO entry0
-            // = 0 (control entry, LENGTH 0, OPCODE NOP: no pushbuffer
-            // fetch), USERD GP_PUT (+0x8C) = 1, then doorbell BAR0
-            // 0xBB0090 = token (UVM-exact sequence).
+            // 0.35.0: NOP kick. Only with ticking usermode timer, a
+            // live token, installed GPFIFO PTE and VRAM USERD/GPFIFO.
+            // GPFIFO entry0 = 0 (control entry, LENGTH 0, OPCODE NOP:
+            // no pushbuffer fetch), USERD GP_PUT (+0x8C) = 1, then
+            // doorbell BAR0 0xBB0090 = token (UVM-exact sequence).
             setProperty("NVGspControl-kick-token-ok", dispTokenResponse);
             const char *skip = nullptr;
             if (!dispTokenResponse) skip = "token-refused";
@@ -12195,8 +12862,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             kickPolls_ = 0;
             postInitPhase_ = 119;
         } else if (postInitPhase_ == 119) {
-            // GP_GET poll (USERD +0x88 low word), max 8 polls, outside
-            // the RPC watchdog range. GET==1: entry consumed.
+            // 0.35.0: GP_GET poll (USERD +0x88 low word), max 8 polls,
+            // outside the RPC watchdog range. GET==1: entry consumed.
             UInt64 getPut = 0;
             PraminPteResult userdRead{};
             const bool readOk = kickRung_ && praminPteAccess(
@@ -12211,13 +12878,13 @@ IOReturn NVGspControl::pollStatusLocked() {
                 setProperty("NVGspControl-kick-polls", kickPolls_, 32);
                 setProperty("NVGspControl-kick-consumed", kickConsumed);
             }
-            // NOP consumed -> pushbuffer kick in the same run. Unused tail
-            // of the 512-entry GPFIFO page (PBDMA reads only GET..PUT
-            // entries): PB at +0x800, semaphore at +0xF00, both reached
-            // through the installed GPFIFO PTE (VA + offset). PB:
-            // INC_METHOD count 5 @SEM_ADDR_LO (0x20050017), addr lo/hi,
-            // payload lo/hi, SEM_EXECUTE = RELEASE, WFI off, 32-bit, no
-            // timestamp (host-only; no GR method).
+            // 0.36.0: NOP consumed -> pushbuffer kick in the same run.
+            // Unused tail of the 512-entry GPFIFO page (PBDMA reads only
+            // GET..PUT entries): PB at +0x800, semaphore at +0xF00, both
+            // reached through the installed GPFIFO PTE (VA + offset).
+            // PB: INC_METHOD count 5 @SEM_ADDR_LO (0x20050017), addr lo/hi,
+            // payload lo/hi, SEM_EXECUTE = RELEASE, WFI off, 32-bit,
+            // no timestamp (host-only; no GR method).
             if (kickConsumed) {
                 const UInt64 pbVa = channelGpFifoVa_ + 0x800;
                 const UInt64 semVa = channelGpFifoVa_ + 0xF00;
@@ -12265,8 +12932,8 @@ IOReturn NVGspControl::pollStatusLocked() {
                 pbPolls_ = 0;
                 if (pbRung_) postInitPhase_ = 120;
             }
-            // Keep polling (no early return: per-poll buffers are freed
-            // at the end of this function).
+            // Keep polling (no early return: per-poll buffers are
+            // freed at the end of this function).
             if (!pbRung_ &&
                 (!kickRung_ || kickConsumed || kickPolls_ >= 8)) {
                 UInt64 original = originalPte_;
@@ -12285,17 +12952,17 @@ IOReturn NVGspControl::pollStatusLocked() {
                     badReason = 38;
             }
         } else if (dispCtxBufReturned && dispCtxBufResponse && fbFreeBase_) {
-            // Take the 42 MiB GR ctx block from the client heap (r2) and
-            // not GSP's ~86 MiB heap (from there the CE channel alloc then
-            // failed with NO_MEMORY). Local phase 217 = "ctx memory ready".
+            // 0.64.0: carve the 42 MiB GR ctx block from the client heap
+            // (r2) instead of GSP's ~86 MiB heap (0.63.0: CE channel alloc
+            // then failed NO_MEMORY). Local phase 217 = "ctx memory ready".
             setProperty("NVGspControl-ctxbuf-ok", dispCtxBufResponse);
             ctxBackingOffset_ = (fbFreeBase_ + 0x1fffff) & ~0x1fffffULL;
             setProperty("NVGspControl-ctxmem-offset", ctxBackingOffset_, 64);
             setProperty("NVGspControl-ctxmem-from-client-heap", true);
             postInitPhase_ = 217;
         } else if (dispCtxBufReturned && dispCtxBufResponse) {
-            // nouveau-r535 ctx set, one 42 MiB contiguous 2 MiB- page
-            // block (2 MiB aligned), layout in kCtxLayout below.
+            // 0.39.0: nouveau-r535 ctx set, one 42 MiB contiguous 2 MiB-
+            // page block (2 MiB aligned), layout in kCtxLayout below.
             setProperty("NVGspControl-ctxbuf-ok", dispCtxBufResponse);
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kSubdeviceHandle = 0xc0d02080;
@@ -12327,9 +12994,9 @@ IOReturn NVGspControl::pollStatusLocked() {
                 badReason = 111;
         } else if (((ctxMemReturned && ctxMemResponse) ||
                     postInitPhase_ == 217) && fbFreeBase_) {
-            // 256 MiB scratch carved directly from the client heap region
-            // (no RPC: GSP's own heap is only ~86 MiB). placed after the
-            // ctx block when that is in r2 too.
+            // 0.62.0: 256 MiB scratch carved directly from the client heap
+            // region (no RPC: GSP's own heap is only ~86 MiB).
+            // 0.64.0: placed after the ctx block when that is in r2 too.
             scratchOffset_ = postInitPhase_ == 217
                 ? ctxBackingOffset_ + 0x2A00000
                 : (fbFreeBase_ + 0x1fffff) & ~0x1fffffULL;
@@ -12339,16 +13006,16 @@ IOReturn NVGspControl::pollStatusLocked() {
         } else if (ctxMemReturned && ctxMemResponse) {
             scratchAlloc();
         } else if (scratchReturned && scratchRetry_) {
-            // retry the scratch alloc at half the size.
+            // 0.60.0: retry the scratch alloc at half the size.
             scratchRetry_ = false;
             scratchTry_ >>= 1;
             setProperty("NVGspControl-scratch-retry-size", scratchTry_, 64);
             scratchAlloc();
         } else if (scratchReturned || postInitPhase_ == 211) {
-            // Map the block with 21 x 2 MiB PTEs in PD0 slots 32..52 (VA
-            // 0x1_0400_0000, 64 MiB aligned for ATTRIBUTE_CB), only if
-            // those slots are empty; then PROMOTE_CTX with the nouveau r535
-            // golden set (9 entries, init where nouveau does).
+            // 0.39.0: map the block with 21 x 2 MiB PTEs in PD0 slots
+            // 32..52 (VA 0x1_0400_0000, 64 MiB aligned for ATTRIBUTE_CB),
+            // only if those slots are empty; then PROMOTE_CTX with the
+            // nouveau r535 golden set (9 entries, init where nouveau does).
             constexpr UInt64 kCtxVa = 0x104000000ULL;
             constexpr UInt32 kFirstSlot = 32, kSlots = 21;
             UInt64 slotBefore = ~0ULL;
@@ -12366,10 +13033,10 @@ IOReturn NVGspControl::pollStatusLocked() {
                 ctxHugeInstalled_ = kSlots;
             setProperty("NVGspControl-ctx-huge-installed",
                         ctxHugeInstalled_, 32);
-            // The FB (GOP scanout) mapping goes in HERE, before the GPU
-            // walks this VAS at all. Installing it after GR had run gave
-            // an Xid 31 PDE fault at 0x1_06A0_0000 (stale walk cache and
-            // no usable TLB invalidate). Same hash gate as before.
+            // 0.44.0: FB (GOP scanout) mapping installed HERE, before the
+            // GPU walks this VAS at all: 0.43.0 installed it after GR ran
+            // and hit Xid 31 PDE fault at 0x1_06A0_0000 (stale walk cache;
+            // no usable TLB invalidate). Same hash gate as 0.43.0.
             if (ctxHugeInstalled_) {
                 UInt64 vramHash = 0;
                 const bool hashOk = praminHashRange(pci_, 0, 4096, &vramHash);
@@ -12387,7 +13054,7 @@ IOReturn NVGspControl::pollStatusLocked() {
                     fbHugeInstalled_ = 18;
                 setProperty("NVGspControl-fb-huge-installed",
                             fbHugeInstalled_, 32);
-                // scratch 256 MiB -> PD0 slots 128..255.
+                // 0.58.0: scratch 256 MiB -> PD0 slots 128..255.
                 UInt64 scSlot = ~0ULL;
                 PraminPteResult scProbe{};
                 if (scratchOffset_ &&
@@ -12401,8 +13068,8 @@ IOReturn NVGspControl::pollStatusLocked() {
                     scratchHuge_ = static_cast<UInt32>(scratchTry_ >> 21);
                 setProperty("NVGspControl-scratch-huge-installed",
                             scratchHuge_, 32);
-                // CE chunk (2 MiB after the scratch) at slot 71, zeroed,
-                // mapped now (before any GPU walk of this range).
+                // 0.63.0: CE chunk (2 MiB after the scratch) at slot 71,
+                // zeroed, mapped now (before any GPU walk of this range).
                 if (scratchHuge_ && fbFreeBase_) {
                     const UInt64 chunk = scratchOffset_ + (UInt64(scratchHuge_) << 21);
                     UInt64 s71 = ~0ULL;
@@ -12418,18 +13085,18 @@ IOReturn NVGspControl::pollStatusLocked() {
                     }
                     setProperty("NVGspControl-ce-chunk", ceChunk_, 64);
                 }
-                // The whole client-visible VRAM [0, fb-free-limit) at GPU VA
-                // kVramVa + phys with 2 MiB PTEs, installed here before any GPU
-                // walk (no usable TLB invalidate: host MEM_OP from our channel =
-                // RC Xid 32). RM uses only PD1[8] (0x1_0000_0000); PD1 entries
-                // cover 512 MiB, so kVramVa = PD1[256..]. The PD0 tables (4 KiB
-                // each) live in our scratch at +0xF800000. Proven from user space
-                // first (nvrun --map-vram, 26 Sep).
+                // 0.101.0 (B0): the whole client-visible VRAM [0, fb-free-limit)
+                // at GPU VA kVramVa + phys with 2 MiB PTEs, installed here before
+                // any GPU walk (no usable TLB invalidate: host MEM_OP from our
+                // channel = RC Xid 32). RM uses only PD1[8] (0x1_0000_0000);
+                // PD1 entries cover 512 MiB, so kVramVa = PD1[256..]. The PD0
+                // tables (4 KiB each) live in our scratch at +0xF800000.
+                // Proven from user space first (nvrun --map-vram, 26 Sep).
                 if (scratchHuge_ && pdbAddress_ && fbFreeLimit_)
                     vramVaTables_ = installVramWindow();
                 setProperty("NVGspControl-vram-va-tables", vramVaTables_, 32);
-                // Shared CPU/GPU window, same timing rule. also after a GPU
-                // reset (new VAS): reuse the chunks.
+                // 0.102.0: shared CPU/GPU window, same timing rule.
+                // 0.104.0: also after a GPU reset (new VAS): reuse the chunks.
                 if (vramVaTables_)
                     shmChunkCount_ = installSharedWindow();
                 setProperty("NVGspControl-shm-chunks", shmChunkCount_, 32);
@@ -12469,6 +13136,19 @@ IOReturn NVGspControl::pollStatusLocked() {
                     {10, 0x2890000, 0x80000, 1, 1},   // PRIV_ACCESS_MAP
                     {11, 0x2910000, 0x80000, 1, 0},   // UNRESTRICTED_PAM
                 };
+                // PROMOTE_CTX requires client-owned initialized buffers to
+                // be cleared before RM initializes them. This carved pool is
+                // reused after reset; old MAIN/PATCH/FECS/PAM contents are not
+                // a valid starting state for a new golden context.
+                bool ctxInitializedCleared = true;
+                for (UInt32 i = 0; i < kEntries; ++i) {
+                    const Ent &c = kCtxLayout[i];
+                    if (c.init && !praminZeroRange(pci_, ctxBackingOffset_ + c.off, c.size)) {
+                        ctxInitializedCleared = false;
+                        break;
+                    }
+                }
+                setProperty("NVGspControl-ctx-initialized-cleared", ctxInitializedCleared);
                 for (UInt32 i = 0; i < kEntries; ++i) {
                     UInt8 *e = pp + 48 + i * 32;
                     const Ent &c = kCtxLayout[i];
@@ -12486,8 +13166,8 @@ IOReturn NVGspControl::pollStatusLocked() {
                     e[30] = c.init;
                     e[31] = c.nm;
                 }
-                const bool sent = init_.enqueueRpc(76, promote,
-                                                   24 + kPromoteBytes);
+                const bool sent = ctxInitializedCleared && init_.enqueueRpc(76, promote,
+                                                                            24 + kPromoteBytes);
                 IOFree(promote, 24 + kPromoteBytes);
                 if (sent)
                     postInitPhase_ = 123;
@@ -12499,8 +13179,8 @@ IOReturn NVGspControl::pollStatusLocked() {
                 ctxTeardown();
             }
         } else if (promoteReturned && promoteResponse) {
-            // ADA_A (0xc997) under the channel, NULL params , nouveau's
-            // golden-context trigger; compute follows (126).
+            // 0.39.0: ADA_A (0xc997) under the channel, NULL params —
+            // nouveau's golden-context trigger; compute follows (126).
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kChannelHandle = 0xc0d0c56f;
             constexpr UInt32 kObjHandle = 0xc0d0c997;
@@ -12516,7 +13196,7 @@ IOReturn NVGspControl::pollStatusLocked() {
                 badReason = 113;
         } else if (grObjReturned && grObjResponse &&
                    postInitPhase_ == 124) {
-            // Golden init done (3D alloc returned OK); now
+            // 0.39.0: golden init done (3D alloc returned OK); now
             // ADA_COMPUTE_A (0xc9c0) on the same channel, NULL params.
             gr3dOk_ = true;
             constexpr UInt32 kClientHandle = 0xc0d00001;
@@ -12533,7 +13213,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 114;
         } else if (grObjReturned && grObjResponse && postInitPhase_ == 126) {
-            // FERMI_TWOD_A (0x902d) on the channel for 2D fill/blit.
+            // 0.57.0: FERMI_TWOD_A (0x902d) on the channel for 2D fill/blit.
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kChannelHandle = 0xc0d0c56f;
             constexpr UInt32 kObjHandle = 0xc0d0902d;
@@ -12549,12 +13229,12 @@ IOReturn NVGspControl::pollStatusLocked() {
                 badReason = 124;
         } else if (twoDReturned) {
             setProperty("NVGspControl-grobj2d-status", twoDStatus, 32);
-            // PB2 at GPFIFO page +0x840 (16 dwords): SET_OBJECT subch 0
-            // = ADA_A 0xc997, subch 1 = ADA_COMPUTE_A 0xc9c0 (the usual
-            // 3D/compute subchannels; binding compute on subch 0 gave a
-            // GR exception, Xid 13 at subch 0 mthd 0). SEM A 0xC0FFEE36
-            // -> +0xF08 without WFI, SEM B 0xC0FFEE37 -> +0xF10 WITH WFI
-            // (proves GR went idle after both binds).
+            // 0.41.0: PB2 at GPFIFO page +0x840 (16 dwords): SET_OBJECT
+            // subch 0 = ADA_A 0xc997, subch 1 = ADA_COMPUTE_A 0xc9c0
+            // (standard 3D/compute subchannels; 0.40.0 bound compute on
+            // subch 0 -> GR exception Xid 13 trapped at subch 0 mthd 0),
+            // SEM A 0xC0FFEE36 -> +0xF08 no WFI, SEM B 0xC0FFEE37 ->
+            // +0xF10 WITH WFI (proves GR idle after both binds).
             const UInt64 pbVa = channelGpFifoVa_ + 0x840;
             const UInt64 semA = channelGpFifoVa_ + 0xF08;
             const UInt64 semB = channelGpFifoVa_ + 0xF10;
@@ -12601,8 +13281,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 ctxTeardown();
         } else if (postInitPhase_ == 125) {
-            // Poll SEM A (+0xF08, no WFI) and SEM B (+0xF10, WFI) plus
-            // the read-only GR/MMU diag dump, <=8 polls.
+            // 0.40.0: poll SEM A (+0xF08, no WFI) and SEM B (+0xF10, WFI)
+            // plus the read-only GR/MMU diag dump, <=8 polls.
             UInt64 sem = 0, semBv = 0, getPut = 0;
             PraminPteResult semRead{}, semReadB{}, userdRead{};
             const bool semOk = praminPteAccess(
@@ -12626,8 +13306,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-gr-userd-after", getPut, 64);
             setProperty("NVGspControl-gr-polls", grPolls_, 32);
             setProperty("NVGspControl-gr-sem-released", released);
-            // GR idle after both binds -> PB3 at +0x8C0 (18 dw): compute
-            // subch 1 inline-to-memory of 16 bytes to +0xF20
+            // 0.42.0: GR idle after both binds -> PB3 at +0x8C0 (18 dw):
+            // compute subch 1 inline-to-memory of 16 bytes to +0xF20
             // (LINE_LENGTH_IN/LINE_COUNT/OFFSET_OUT_UPPER/OFFSET_OUT,
             // LAUNCH_DMA pitch, 4x LOAD_INLINE_DATA non-inc), then SEM C
             // WFI 0xC0FFEE38 -> +0xF18. GP entry3, PUT 4, doorbell.
@@ -12684,7 +13364,7 @@ IOReturn NVGspControl::pollStatusLocked() {
                 ctxTeardown();
             }
         } else if (postInitPhase_ == 127) {
-            // poll SEM C (+0xF18) + the I2M target (+0xF20/+0xF28).
+            // 0.42.0: poll SEM C (+0xF18) + the I2M target (+0xF20/+0xF28).
             UInt64 semC = 0, d0 = 0, d1 = 0;
             PraminPteResult r0{}, r1{}, r2{};
             praminPteAccess(pci_, gpfifoBackingOffset_ + 0xF18, &semC, false,
@@ -12703,13 +13383,13 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-i2m-polls", grPolls_, 32);
             setProperty("NVGspControl-i2m-sem-released", semDone);
             setProperty("NVGspControl-i2m-data-ok", dataOk);
-            // GPU draws on the GOP scanout surface. Gate: PRAMIN hash of
-            // VRAM[0,4K) must equal the pre-GSP BAR1+0 GOP hash (proves
-            // VRAM 0 is the intact scanout surface). Map VRAM [0,36 MiB)
-            // with 18 x 2 MiB PTEs (PD0 slots 53..70, VA 0x1_06A0_0000),
-            // PB4 in the spare ctx block tail (+0x2990000): compute subch 1
-            // I2M 256x8 px, pitch 16384 (4096 px ARGB), red 0xFFFF0000,
-            // then SEM D WFI 0xC0FFEE39 -> +0xF30.
+            // 0.43.0: GPU draws on the GOP scanout surface. Gate: PRAMIN
+            // hash of VRAM[0,4K) must equal the pre-GSP BAR1+0 GOP hash
+            // (proves VRAM 0 is the intact scanout surface). Map VRAM
+            // [0,36 MiB) with 18 x 2 MiB PTEs (PD0 slots 53..70, VA
+            // 0x1_06A0_0000), PB4 in the spare ctx block tail (+0x2990000):
+            // compute subch 1 I2M 256x8 px, pitch 16384 (4096 px ARGB),
+            // red 0xFFFF0000, then SEM D WFI 0xC0FFEE39 -> +0xF30.
             bool fbRung = false;
             if (semDone && dataOk && fbHugeInstalled_ && drawTest_) {
                 constexpr UInt64 kFbVa = 0x106A00000ULL;
@@ -12756,7 +13436,7 @@ IOReturn NVGspControl::pollStatusLocked() {
                 ctxTeardown();
             }
         } else if (postInitPhase_ == 128) {
-            // poll SEM D + read back the first two FB pixels.
+            // 0.43.0: poll SEM D + read back the first two FB pixels.
             UInt64 semD = 0, px = 0;
             PraminPteResult r0{}, r1{};
             praminPteAccess(pci_, gpfifoBackingOffset_ + 0xF30, &semD, false,
@@ -12775,12 +13455,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             }
         } else if (dispCtxBufReturned || ctxMemReturned ||
                    promoteReturned || grObjReturned) {
-            // any refusal in 121-124 -> recorded; teardown.
+            // 0.38.0: any refusal in 121-124 -> recorded; teardown.
             setProperty("NVGspControl-ctxbuf-ok", dispCtxBufResponse);
             ctxTeardown();
         } else if (postInitPhase_ == 120) {
-            // Semaphore poll (+0xF00 == 0xC0FFEE35) + GP_GET (== 2),
-            // max 8 polls, outside the RPC watchdog range.
+            // 0.36.0: semaphore poll (+0xF00 == 0xC0FFEE35) + GP_GET
+            // (== 2), max 8 polls, outside the RPC watchdog range.
             UInt64 sem = 0, getPut = 0;
             PraminPteResult semRead{}, userdRead{};
             const bool semOk = praminPteAccess(
@@ -12836,7 +13516,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             }
         } else if (dispPbProgramReturned && dispPbProgramResponse &&
                    (experimentFlags_ & 2)) {
-            // C77D core channel on physical RM, nouveau r535
+            // 0.51.0: C77D core channel on physical RM, nouveau r535
             // r535_dmac_alloc params: channelInstance 0, offset (PUT) 0,
             // no ctxdma. Parent = NVC770_DISPLAY 0xc0d0c770.
             setProperty("NVGspControl-disp-pb-program-ok", true);
@@ -12856,13 +13536,13 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 122;
         } else if (coreChanReturned) {
-            // If the core channel exists, stage UPDATE (0x00040200, data 0)
-            // at PB offset 0, PUT=8 at 0x680000, poll GET (100 ms).
+            // 0.51.0: if the core channel exists, stage UPDATE (0x00040200,
+            // data 0) at PB offset 0, PUT=8 at 0x680000, poll GET (100 ms).
             bool coreConsumed = false;
             UInt32 putAfter = 0, getAfter = 0, putBefore = 0, getBefore = 0;
             if (coreChanResponse && dispPbBackingOffset_) {
-                // (experiment bit4): the first core UPDATE is nouveau's
-                // corec37d_init + corec37d_update instead of a bare
+                // 0.82.0 (experiment bit4): the first core UPDATE is
+                // nouveau's corec37d_init + corec37d_update instead of a bare
                 // UPDATE(0): WINDOW_SET_CONTROL owner = head(i>>1), format
                 // usage bounds 0x1f, usage bounds 0x7fff px | TAPS_2, then
                 // SET_INTERLOCK_FLAGS 0, SET_WINDOW_INTERLOCK_FLAGS 0 and
@@ -12870,9 +13550,9 @@ IOReturn NVGspControl::pollStatusLocked() {
                 // from boot, so no later core state ever armed.
                 UInt32 init[2 + 8 * 7 + 3 + 2 + 6]{};
                 UInt32 n = 0;
-                // (bit5): nouveau's notifier too, ctxdma at RAMIN+0x2040 over a
-                // 4 KiB notifier at RAMIN+0xF000, RAMHT entry for core (chid 0),
-                // SET_CONTEXT_DMA_NOTIFIER, and SET_NOTIFIER_CONTROL
+                // 0.83.0 (bit5): nouveau's notifier too — ctxdma at RAMIN+0x2040
+                // over a 4 KiB notifier at RAMIN+0xF000, RAMHT entry for core
+                // (chid 0), SET_CONTEXT_DMA_NOTIFIER, and SET_NOTIFIER_CONTROL
                 // (WRITE|NOTIFY) around the UPDATE.
                 const bool ntfy = (experimentFlags_ & 0x30) == 0x30;
                 if (ntfy) {
@@ -12891,11 +13571,11 @@ IOReturn NVGspControl::pollStatusLocked() {
                     setProperty("NVGspControl-corechan-ntfy-setup", w);
                     init[n++] = (1U << 18) | 0x208; init[n++] = kNtfyHandle;
                 }
-                // By default bit4 does a minimal first push, no window owner /
-                // usage bound changes. When we used nouveau's bounds (0x107fff
-                // / 0x1f) instead of the VBIOS ones (0x110f00 / 0x197), window
-                // 0 stopped fetching: no LAST_DATA, black screen. bit6 brings
-                // back the full nouveau window init.
+                // 0.85.0: minimal first push by default for bit4 — no window
+                // owner/usage-bound changes (0.84.0's nouveau bounds 0x107fff /
+                // 0x1f replaced the VBIOS 0x110f00 / 0x197 and window 0 stopped
+                // fetching: no LAST_DATA, black screen). bit6 restores the full
+                // nouveau window init.
                 if ((experimentFlags_ & 0x10) && !(experimentFlags_ & 0x40)) {
                     init[n++] = (2U << 18) | 0x218; init[n++] = 0; init[n++] = 0;
                     init[n++] = (1U << 18) | 0x200; init[n++] = 1;
@@ -12922,7 +13602,7 @@ IOReturn NVGspControl::pollStatusLocked() {
                     Bar0Io bar0{bar0Map};
                     bar0.read(0x00680000, &putBefore);
                     bar0.read(0x00680004, &getBefore);
-                    // let the freshly allocated core settle first.
+                    // 0.84.0: let the freshly allocated core settle first.
                     if (experimentFlags_ & 0x10) IODelay(50000);
                     bar0.write(0x00680000, coreInitWords_ * 4);
                     bar0.read(0x00680000, &putAfter);
@@ -12931,13 +13611,12 @@ IOReturn NVGspControl::pollStatusLocked() {
                         if (getAfter == coreInitWords_ * 4) { coreConsumed = true; break; }
                         IODelay(50);
                     }
-                    // Wait for the init UPDATE to arm (ARMED
+                    // 0.84.0: wait for the init UPDATE to arm (ARMED
                     // SET_INTERLOCK_FLAGS/WINDOW_INTERLOCK_FLAGS 0x688218/1c
-                    // go from the VBIOS 0x10000/1 to our 0/0) before asking
-                    // RM for the window; asking before it armed gave
-                    // NV_ERR_TIMEOUT on the window alloc. If it still hasn't
-                    // armed after 1 s, push interlocks + UPDATE(1) once
-                    // more.
+                    // drop from the VBIOS 0x10000/1 to our 0/0) before RM
+                    // is asked to allocate the window (0.83.0: window alloc
+                    // NV_ERR_TIMEOUT when it had not armed). One re-push of
+                    // interlocks + UPDATE(1) if it has not armed after 1 s.
                     if ((experimentFlags_ & 0x10) && coreConsumed) {
                         UInt32 a0 = ~0U, a1 = ~0U, polls = 0, repush = 0;
                         for (; polls < 4000; ++polls) {
@@ -12983,11 +13662,11 @@ IOReturn NVGspControl::pollStatusLocked() {
                 setProperty("NVGspControl-corechan-ntfy", nw, sizeof(nw));
             }
             corePut_ = coreConsumed ? coreInitWords_ * 4 : 0;
-            // Window flip path (bit2): RAMHT entry + VRAM ctxdma in RAMIN
-            // (nouveau gv100_dmaobj_bind / nvkm_ramht_insert: 0x2000 byte
-            // RAMHT at RAMIN+0, bits 10, context = chid<<25 | client&0x3fff
-            // | inst<<9), window PB at RAMIN+0x8000, then set_pushbuf C67E
-            // instance 0.
+            // 0.54.0: window flip path (bit2): RAMHT entry + VRAM ctxdma in
+            // RAMIN (nouveau gv100_dmaobj_bind / nvkm_ramht_insert: 0x2000
+            // byte RAMHT at RAMIN+0, bits 10, context = chid<<25 |
+            // client&0x3fff | inst<<9), window PB at RAMIN+0x8000, then
+            // set_pushbuf C67E instance 0.
             bool windowStarted = false;
             if ((experimentFlags_ & 4) && coreConsumed) {
                 constexpr UInt32 kIsoHandle = 0xc0d0d001;
@@ -13037,7 +13716,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             if (!windowStarted)
                 dispHealthStart();
         } else if (wndPbReturned && wndPbOk) {
-            // C67E window 0 channel, parent C770, nouveau params.
+            // 0.54.0: C67E window 0 channel, parent C770, nouveau params.
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kDisplayHandle = 0xc0d0c770;
             constexpr UInt32 kWndHandle = 0xc0d0c67e;
@@ -13054,12 +13733,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 dispHealthStart();
         } else if (wndChanReturned && wndChanOk) {
-            // Flip window 0 onto the GOP surface itself (offset 0), where
-            // WindowServer draws through physical-mode BAR1, so the desktop
-            // keeps updating through OUR window channel. A8R8G8B8
-            // 3840x2160, pitch 16384 (PLANAR_STORAGE pitch>>6), ctxdma
-            // 0xc0d0d001, no interlock, UPDATE(1). Method header is
-            // (count<<18)|mthd.
+            // 0.55.0: flip window 0 onto the GOP surface itself (offset 0),
+            // where WindowServer draws through physical-mode BAR1, so the
+            // desktop keeps updating through OUR window channel.
+            // (0.54.0 used +200 lines.) A8R8G8B8 3840x2160,
+            // pitch 16384 (PLANAR_STORAGE pitch>>6), ctxdma 0xc0d0d001,
+            // no interlock, UPDATE(1). Method header (count<<18)|mthd.
             const UInt32 wh = 3840U | (2160U << 16);
             const UInt32 pb[] = {
                 (1U << 18) | 0x308, 0x0,              // PRESENT_CONTROL
@@ -13101,8 +13780,8 @@ IOReturn NVGspControl::pollStatusLocked() {
         } else if (ceUserdReturned && ceBackingOk && postInitPhase_ < 220) {
             ceBackingAlloc(postInitPhase_ + 1);
         } else if (ceUserdReturned) {
-            // CE channel alloc (engine COPY0) with the RPC USERD.
-            // instance + method buffer are RPC memory too.
+            // 0.65.0: CE channel alloc (engine COPY0) with the RPC USERD.
+            // 0.66.0: instance + method buffer are RPC memory too.
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kDeviceHandle = 0xc0d00080;
             constexpr UInt32 kCeChannel = 0xc0d1c56f;
@@ -13115,10 +13794,10 @@ IOReturn NVGspControl::pollStatusLocked() {
                 nvgsp::buildChannelAllocParams(0xc0d090f1, 0xc0d10043,
                     0x108E00000ULL, 512, nvgsp::kEngineTypeCopy0, &chan);
             chan.hObjectError = 0;
-            // CPU-RM (us) owns chid assignment and passes it in the USERD
-            // index/page flags (kernel_channel.c GSP-client path); chid 3
-            // is the GR channel, so the CE channel takes chid 4: PAGE_FIXED
-            // | INDEX_VALUE 4 | PAGE_VALUE 0.
+            // 0.67.0: CPU-RM (us) owns chid assignment and passes it in the
+            // USERD index/page flags (kernel_channel.c GSP-client path);
+            // chid 3 is the GR channel, so the CE channel takes chid 4:
+            // PAGE_FIXED | INDEX_VALUE 4 | PAGE_VALUE 0.
             chan.flags = 0x00200400;
             chan.internalFlags = nvgsp::kChannelInternalFlagsNotifierNone;
             chan.instanceMem = {ceInstOffset_, 4096, 2, 1};
@@ -13141,8 +13820,8 @@ IOReturn NVGspControl::pollStatusLocked() {
                 ctxTeardown();
         } else if (ceReturned && ceOk && postInitPhase_ >= 212 &&
                    postInitPhase_ <= 215) {
-            // CE chain step: bind COPY0 (213), schedule (214), token
-            // (215), then the CE object 0xc7b5 (216).
+            // 0.63.0: CE chain step: bind COPY0 (213), schedule (214),
+            // token (215), then the CE object 0xc7b5 (216).
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kCeChannel = 0xc0d1c56f;
             const UInt32 next = postInitPhase_ + 1;
@@ -13179,13 +13858,14 @@ IOReturn NVGspControl::pollStatusLocked() {
                     ctxTeardown();
             }
         } else if (ceReturned) {
-            // CE object done (216) or a CE step refused -> park.
+            // 0.63.0: CE object done (216) or a CE step refused -> park.
             cePersistent_ = ceOk && postInitPhase_ == 216 && ceToken_;
             setProperty("NVGspControl-ce-persistent", cePersistent_);
-            publishSemVa();
+            syncRingSeqLocked(false, true);              // 0.164.0
+            publishSemVa();                              // 0.128.0
             setProperty("NVGspControl-ce-token", ceToken_, 32);
-            // Request max perf (kperfBoostSet → INTERNAL_PERF_BOOST_ SET_2X
-            // {flags BOOST_TO_MAX, duration INFINITE}) before parking.
+            // 0.68.0: request max perf (kperfBoostSet → INTERNAL_PERF_BOOST_
+            // SET_2X {flags BOOST_TO_MAX, duration INFINITE}) before parking.
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kSubdevice = 0xc0d02080;
             constexpr UInt32 kCmd = 0x20800a9a, kBytes = 8;
@@ -13194,7 +13874,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             __builtin_memcpy(control + 4, &kSubdevice, 4);
             __builtin_memcpy(control + 8, &kCmd, 4);
             __builtin_memcpy(control + 16, &kBytes, 4);
-            // BOOST_TO_MAX with an infinite duration pinned the GPU in
+            // 0.133.0: BOOST_TO_MAX with an infinite duration pinned the GPU in
             // P0 forever (idle ~P0 power). Clearing it lets GSP drop to P8 at
             // idle (like Windows, ~11 W) and GPU Boost still reaches ~2850 MHz
             // under load (measured 27 Sep: 47.7 TFLOPS). nvram nvgsp-boost=1
@@ -13210,7 +13890,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 ctxTeardown();
         } else if (perfReturned && postInitPhase_ == 221) {
-            // then read the current P-state (0x20802068, 4B).
+            // 0.68.0: then read the current P-state (0x20802068, 4B).
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kSubdevice = 0xc0d02080;
             constexpr UInt32 kCmd = 0x20802068, kBytes = 4;
@@ -13224,8 +13904,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 ctxTeardown();
         } else if (perfReturned && postInitPhase_ == 222) {
-            // Interrupt routing table (INTERNAL_INTR_GET_KERNEL_TABLE
-            // 0x20800a5c, 2068B), which stall/non-stall vector each engine
+            // 0.69.0: interrupt routing table (INTERNAL_INTR_GET_KERNEL_TABLE
+            // 0x20800a5c, 2068B) — which stall/non-stall vector each engine
             // (GSP, DISP, FIFO, CE, faults) raises in the CPU interrupt tree.
             constexpr UInt32 kCmd = 0x20800a5c, kBytes = 2068;
             const UInt32 client = internalClient_ ? internalClient_ : 0xc0d00001;
@@ -13248,7 +13928,7 @@ IOReturn NVGspControl::pollStatusLocked() {
                 ctxTeardown();
         } else if (perfReturned && (postInitPhase_ == 223 ||
                                     postInitPhase_ == 224)) {
-            // DP AUX over RM (NV0073_CTRL_CMD_DP_AUXCH_CTRL 0x731341,
+            // 0.77.0: DP AUX over RM (NV0073_CTRL_CMD_DP_AUXCH_CTRL 0x731341,
             // nvkms-rm.c pattern) on display 0x200 (DP_EXT): DPCD 0x000,
             // 0x100, 0x200 (16 B each), then EDID via I2C-over-AUX at 0x50:
             // offset write (MOT) + 16 x 16 B reads (256 B, base + 1 ext).
@@ -13308,7 +13988,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             ctxTeardown();
         } else if (dispHealthReturned && dispHealthOk &&
                    postInitPhase_ >= 203 && postInitPhase_ <= 205) {
-            // 204 GET_ACTIVE (0x73010c, 16B), 205/206 GET_SCANLINE
+            // 0.53.0: 204 GET_ACTIVE (0x73010c, 16B), 205/206 GET_SCANLINE
             // (0x730104, 20B), all head 0 on display common 0xc0d00073.
             const UInt32 next = postInitPhase_ + 1;
             const UInt32 cmd = next == 204 ? 0x73010c : 0x730104;
@@ -13326,13 +14006,13 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 ctxTeardown();
         } else if (dispHealthReturned) {
-            // Health sweep done (or refused), so teardown. But if the
-            // window channel owns the screen, freeing the client switches
-            // the window off and we get a black screen. So keep the client,
-            // display channels, GR context and mappings alive (persistent
-            // client) and finish at phase 33 without any free.
+            // 0.53.0: health sweep finished (or refused) -> teardown.
+            // 0.55.0: if the window channel owns the screen, freeing the
+            // client disables the window (0.51-0.54 black screen). Keep the
+            // client, display channels, GR context and mappings alive
+            // (persistent client) and finish at phase 33 without a free.
             if (wndOwnsScreen_) {
-                // Display owned -> continue into the GR chain
+                // 0.57.0: display owned -> continue into the GR chain
                 // (FIFO/runlist/bind/schedule/golden ctx/objects) and end
                 // persistent there.
                 constexpr UInt32 kClientHandle100 = 0xc0d00001;
@@ -13352,11 +14032,11 @@ IOReturn NVGspControl::pollStatusLocked() {
                 ctxTeardown();
             }
         } else if (dispInstMemReturned || dispInstWriteReturned) {
-            // display probe refused -> teardown (BAR1 still bound).
+            // 0.51.0: display probe refused -> teardown (BAR1 still bound).
             ctxTeardown();
         } else if (dispPbProgramReturned) {
-            // Stage a harmless UPDATE method with zero data. Header: METHOD
-            // opcode, count=1, offset=NVC77D_UPDATE (0x200).
+            // 0.8.7: stage a harmless UPDATE method with zero data. Header:
+            // METHOD opcode, count=1, offset=NVC77D_UPDATE (0x200).
             setProperty("NVGspControl-disp-pb-program-ok",
                         dispPbProgramResponse);
             UInt64 updatePacket = 0x0000000000040200ULL;
@@ -13385,9 +14065,9 @@ IOReturn NVGspControl::pollStatusLocked() {
                     return kIOReturnSuccess;
                 }
             }
-            // Read-only PUT/GET survey at BAR0+0x680000 (+0 PUT, +4
-            // GET) via the existing BAR0 map, then teardown. NO PUT
-            // write in this probe.
+            // Read-only PUT/GET survey at
+            // BAR0+0x680000 (+0 PUT, +4 GET) via the existing BAR0 map,
+            // then teardown. NO PUT write in this probe.
             IOMemoryMap *bar0Map = sharedBar0Map(pci_);
             UInt32 put = 0, get = 0;
             bool surveyOk = false;
@@ -13419,8 +14099,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 38;
         } else if (tsgScheduleReturned) {
-            // Stops at a scheduled TSG: no method is submitted yet.
-            // Teardown is identical on success and refusal.
+            // 0.7.2 stops at a scheduled TSG: no method is submitted
+            // yet. Teardown is identical on success and refusal.
             setProperty("NVGspControl-tsg-schedule-ok", tsgScheduleResponse);
             setProperty("NVGspControl-channel-live", tsgScheduleResponse);
             if (!tsgScheduleResponse)
@@ -13478,9 +14158,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             else
                 badReason = 26;
         } else if (pdeInfoResponse) {
-            // Install ONE fresh Ada PTE mapping the GPFIFO backing VRAM page at
-            // the virtual window (proven PRAMIN path; readback must match).
-            // Fresh VA in a fresh VASpace has no stale TLB entry, so NO
+            // 0.6.2: install ONE fresh Ada PTE mapping the GPFIFO backing VRAM
+            // page at the virtual window (proven PRAMIN path; readback must
+            // match). Fresh VA in a fresh VASpace has no stale TLB entry, so NO
             // invalidate RPC is enqueued (the known phase-39 stall is avoided
             // by construction, not retried). Then allocate the channel.
             constexpr UInt32 kClientHandle = 0xc0d00001;
@@ -13515,9 +14195,9 @@ IOReturn NVGspControl::pollStatusLocked() {
                 constexpr UInt32 kChannelHandle = 0xc0d0c56f;
                 constexpr UInt32 kChannelClass = nvgsp::kAmpereChannelGpfifoA;
                 nvgsp::NvChannelAllocParams chan{};
-                // GR engine (nouveau's r535 golden-init channel uses
-                // engineType 1; a channel allocated on COPY0 hung GSP in
-                // the GR object alloc).
+                // 0.39.0: GR engine (nouveau r535 golden-init channel uses
+                // engineType 1; a COPY0-allocated channel hung GSP in the
+                // 0.38.0 GR object alloc). Was COPY0 since 0.7.7.
                 const bool chanOk = nvgsp::buildChannelAllocParams(
                     0xc0d090f1, 0xc0d00043, virtualOffset_, 512,
                     nvgsp::kEngineTypeGraphics, &chan);
@@ -13864,10 +14544,11 @@ IOReturn NVGspControl::pollStatusLocked() {
         }
     }
     setProperty("NVGspControl-dma-map-lifecycle-complete", dmaMapCompleted_);
-    // LibOS log-heads snapshot is gone. Its 20 KiB of OSData churn on every
-    // poll was exactly where we panicked (double fault in OSData::free
-    // while replacing the property). Those logs were only for debugging
-    // INIT_DONE in the early days; the GSP queue path doesn't care.
+    // 0.6.3: LibOS log-heads snapshot REMOVED. Its 20 KiB per-poll OSData
+    // churn was the exact crash site of the 0.6.2 panic (double fault in
+    // OSData::free while replacing the property). The logs served 0.2.9-era
+    // INIT_DONE diagnosis and are not needed now; the GSP queue path is
+    // unaffected.
     if (deviceInfo) IOFree(deviceInfo, deviceInfoBytes);
     IOFree(staticInfo, kStaticInfoBytes);
     IOFree(records, kMaxRecords * sizeof(nvgsp::GspStatusRecordSummary));
@@ -13915,7 +14596,7 @@ IOReturn NVGspControl::stagePackage(const void *bytes, size_t length) {
     // scattered firmware mapping. On a live system the reverse order can
     // fragment the DMA aperture enough to reject Booter Load's 60 KiB block.
     const bool booterOk = booterParseOk && booter_.stage(booterView, fuseVersion);
-    // Booter Unload for GSP SR (same ucode id 3 / fuse as Load).
+    // 0.100.0: Booter Unload for GSP SR (same ucode id 3 / fuse as Load).
     fuseVersion_ = fuseVersion;
     {
         nvgsp::BooterView unloadView{};
@@ -13931,8 +14612,8 @@ IOReturn NVGspControl::stagePackage(const void *bytes, size_t length) {
     system.bar0 = bar0 ? bar0->getPhysicalAddress() : 0;
     system.bar1 = bar1 ? bar1->getPhysicalAddress() : 0;
     system.bar2 = bar2 ? bar2->getPhysicalAddress() : 0;
-    // Capture the GOP surface hash BEFORE FWSEC runs. BAR1+0 is the
-    // live GOP scan-out surface on a fresh boot; FWSEC/GSP boot may
+    // 0.9.2: capture the GOP surface hash BEFORE FWSEC runs. BAR1+0 is
+    // the live GOP scan-out surface on a fresh boot; FWSEC/GSP boot may
     // clobber it. Compared against the post-boot hash at phase 75.
     gopSurfaceHashPre_ = 0;
     gopSurfaceHashPreOk_ = false;
@@ -13949,7 +14630,7 @@ IOReturn NVGspControl::stagePackage(const void *bytes, size_t length) {
             }
             gopSurfaceHashPre_ = hash;
             gopSurfaceHashPreOk_ = true;
-            // also keep the first 64 bytes for forensics.
+            // 0.9.4: also keep the first 64 bytes for forensics.
             for (unsigned w = 0; w < 8; ++w) {
                 UInt64 word = 0;
                 for (unsigned b = 0; b < 8; ++b)
@@ -13983,9 +14664,9 @@ IOReturn NVGspControl::stagePackage(const void *bytes, size_t length) {
     system.domainBusDevice = (static_cast<UInt64>(pci_->getBusNumber()) << 8) |
                              pci_->getDeviceNumber();
     system.maxUserVa = 0x7fffffffffffULL;
-    // Reserve the low-FB console region so GSP-RM never treats the GOP
-    // scan-out surface as heap/scrub range. 64 MiB covers any GOP mode
-    // up to 5K (our 4K surface is 33 MiB at BAR1+0).
+    // 0.9.3: reserve the low-FB console region so GSP-RM never treats
+    // the GOP scan-out surface as heap/scrub range. 64 MiB covers any
+    // GOP mode up to 5K (our 4K surface is 33 MiB at BAR1+0).
     system.consoleMemSize = 64ULL * 1024 * 1024;
     system.pciDeviceId = pci_->configRead32(kIOPCIConfigVendorID);
     system.pciSubDeviceId = pci_->configRead32(kIOPCIConfigSubSystemVendorID);
@@ -13997,7 +14678,7 @@ IOReturn NVGspControl::stagePackage(const void *bytes, size_t length) {
     system.flrSupported = 0;
     system.bar0Is64Bit = (pci_->configRead32(kIOPCIConfigBaseAddress0) & 6) == 4;
     system.isPrimary = 1;
-    // Optional GSP-RM registry from NVRAM nvgsp-registry
+    // 0.113.0: optional GSP-RM registry from NVRAM nvgsp-registry
     // ("Key=Value;..."), applied on every GSP boot (cold, reset, resume).
     UInt32 regBytes = 0, regEntries = 0;
     UInt8 *reg = static_cast<UInt8 *>(IOMalloc(kRegistryCap));
@@ -14029,8 +14710,8 @@ IOReturn NVGspControl::stagePackage(const void *bytes, size_t length) {
     setProperty("NVGspControl-libos-args-bus", init_.libosArgsBus(), 64);
     staged_ = gspOk && booterOk && initOk;
     setProperty("NVGspControl-staged", staged_);
-    // Retain a post-stage queue snapshot (516 KiB) for the S3 re-boot:
-    // identical bytes incl. page table + pre-queued init RPCs.
+    // 0.99.0: retain a post-stage queue snapshot (516 KiB) for the S3
+    // re-boot: identical bytes incl. page table + pre-queued init RPCs.
     if (staged_ && !queueSnap_ && init_.queueBytes()) {
         queueSnap_ = static_cast<UInt8 *>(IOMalloc(nvgsp::kGspSharedBytes));
         if (queueSnap_)
@@ -14047,17 +14728,15 @@ IOReturn NVGspControl::stagePackage(const void *bytes, size_t length) {
 }
 
 
-// ---- GSP suspend/resume (SR) ----
-// Based on NVIDIA kgspTeardown_TU102 / kgspBootstrap_TU102 (SR_RESUME) +
-// nouveau r535_gsp_fini + r570_fbsr.
-// Suspend: stop channel scheduling, save our own VRAM (display RAMIN),
-// FBSR_INIT (RM saves its non-WPR/reserved VRAM into fbsrBuf_),
-// UNLOADING_GUEST_DRIVER(bInPMTransition, level 3), GSP halts (mbox0
-// 0x80000000), GSP falcon reset, FWSEC-SB, SEC2 Booter Unload with the SR
-// metadata (WPR2 saved into srData_, then torn down).
-// Resume: rmargs in PM-transition mode, SEC2 Booter Load with the SR
-// metadata, FALCON_OS, RISC-V active, INIT_DONE; GSP-RM brings back the
-// queues and its own state.
+// ---- 0.100.0: GSP suspend/resume (SR) -------------------------------------
+// NVIDIA kgspTeardown_TU102 / kgspBootstrap_TU102 (SR_RESUME) + nouveau
+// r535_gsp_fini + r570_fbsr. Suspend: stop channel scheduling, save our own
+// VRAM (display RAMIN), FBSR_INIT (RM saves its non-WPR/reserved VRAM into
+// fbsrBuf_), UNLOADING_GUEST_DRIVER(bInPMTransition, level 3), GSP halts
+// (mbox0 0x80000000), GSP falcon reset, FWSEC-SB, SEC2 Booter Unload with the
+// SR metadata (WPR2 saved into srData_, WPR2 torn down). Resume: rmargs in
+// PM-transition mode, SEC2 Booter Load with the SR metadata, FALCON_OS,
+// RISC-V active, INIT_DONE; GSP-RM restores queues and its own state.
 
 namespace {
 struct GspFwSRMeta {
@@ -14138,6 +14817,7 @@ IOReturn NVGspControl::userRpcLarge(UInt32 function, const UInt8 *payload, UInt3
         ulk();
         return kIOReturnBusy;
     }
+    userRpcActive_ = true;
     userRpcFunction_ = function;
     userRpcOutstanding_ = true;
     userRpcReplyBytes_ = 0;
@@ -14175,6 +14855,7 @@ IOReturn NVGspControl::userRpcLarge(UInt32 function, const UInt8 *payload, UInt3
     userRpcOutstanding_ = false;
     largeReplyOk_ = false;
     if (rpcResult) *rpcResult = done ? userRpcResult_ : ~0U;
+    userRpcActive_ = false;
     ulk();
     return done ? kIOReturnSuccess : kIOReturnTimeout;
 }
@@ -14422,7 +15103,7 @@ IOReturn NVGspControl::srResume() {
     const UInt8 p[1] = {0};
     setProperty("NVGspControl-sr-fifo-on",
                 srCtrl(this, internalClient_, internalSubdevice_, 0x20800ac3, p, 1), 32);
-    // GSP-RM restored its interrupt state; re-arm our MSI vectors.
+    // 0.100.1: GSP-RM restored its interrupt state; re-arm our MSI vectors.
     lk(__LINE__);
     if (wl_ && irq_) wl_->removeEventSource(irq_);
     OSSafeReleaseNULL(irq_);
@@ -14439,22 +15120,54 @@ IOReturn NVGspControl::srResume() {
     return kIOReturnSuccess;
 }
 
-// GPU reset without a machine reboot, e.g. after an RC killed the GR
-// channel. Clean GSP unload (the SR suspend path: FIFO off, FBSR,
+// 0.104.0 (B3): GPU reset without a machine reboot, e.g. after an RC killed
+// the GR channel. Clean GSP unload (the SR suspend path: FIFO off, FBSR,
 // UNLOADING_GUEST_DRIVER, GSP reset, booter unload -> WPR2 down), then the
 // proven cold path: reset kext state, re-stage, full boot (FWSEC FRTS,
 // booter load), chain to phase 33, light modeset. Asynchronous: poll
 // NVGspControl-gr-persistent / -gpu-reset-count.
 IOReturn NVGspControl::gpuReset() {
     if (!lock_ || !pci_ || !resumeCall_ || resumeActive_) return kIOReturnBusy;
+    lk(__LINE__);
+    noteGpuEventLocked("reset start");                   // 0.170.0
+    ulk();
+    resetBusy_ = true;                                   // 0.164.0: before the generation moves
+    // 0.175.0: user-space waits on this property. Leaving the last resume's
+    // false value published makes NotReady fail immediately during reset.
+    setProperty("NVGspControl-reset-busy", true);
+    resetPrivateDiagnostic_ = gpuResets_ == 0 && postResetPrivateDiagnosticByNvram();
+    clientChannelsTeardown();                            // 0.178.10: before the generation moves
     ++gpuResets_;
     setProperty("NVGspControl-gpu-reset-count", gpuResets_, 32);
+    setProperty("NVGspControl-ownchannel-reset-diagnostic", resetPrivateDiagnostic_ && gpuResets_ == 1);
+    setProperty("NVGspControl-ownchannel-reset-fallback", !privateChannelGenerationAllowed());
+    setProperty("NVGspControl-ownchannel-auto", ownChannelAuto());
+    // 0.176.0 (T3): keep the user heap. FBSR in srSuspend covers GSP-RM's VRAM only,
+    // so every client object (WindowServer's layers, app surfaces) came back as
+    // garbage and the desktop stayed black after the reset. Copy them out while the
+    // copy engine still runs, put them back at resume end; S3 does the same.
+    lk(__LINE__);
+    if (!resetVramSaved_) resetVramSaved_ = saveVramLocked(false, true);   // a retry keeps the first copy
+    ulk();
+    setProperty("NVGspControl-reset-vram-saved", resetVramSaved_);
+    setProperty("NVGspControl-reset-vram-bytes", vramSavedBytes_, 64);
     const IOReturn s = srSuspend();
     setProperty("NVGspControl-gpu-reset-unload", static_cast<UInt32>(s), 32);
-    if (s != kIOReturnSuccess) return s;
+    // 0.168.0: an unload that fails (0xe00002ca on the third reset, 1 Oct
+    // 04:57) used to end the recovery with the GPU half down and
+    // WindowServer waiting until the watchdog panicked. The cold path below
+    // re-stages and boots GSP from scratch, as after S3; try it anyway.
+    if (s != kIOReturnSuccess) {
+        ++unloadFailures_;
+        setProperty("NVGspControl-gpu-reset-unload-failures", unloadFailures_, 32);
+    }
     srSuspended_ = false;
     lk(__LINE__);
     sleeping_ = false;
+    grStall_ = RingStall{};                              // 0.164.0: fresh channels
+    ceStall_ = RingStall{};
+    setProperty("NVGspControl-gr-hung", false);
+    setProperty("NVGspControl-ce-hung", false);
     ulk();
     resetForResume();
     resetDriven_ = true;
@@ -14462,11 +15175,11 @@ IOReturn NVGspControl::gpuReset() {
     return kIOReturnSuccess;
 }
 
-// Automatic recovery. After an RC kills our GR channel, and if NVRAM
-// nvgsp-autoreset=1, reset the GPU from a thread call 1 s later (outside
-// lock_; gpuReset is the same path as `nvrun --reset`). Clients from
-// before the reset get kIOReturnOffline (reset generation), so apps see
-// VK_ERROR_DEVICE_LOST and new ones find a working GPU. At most one
+// 0.115.0 (B3): automatic recovery. After an RC kills our GR channel, and
+// if NVRAM nvgsp-autoreset=1, reset the GPU from a thread call 1 s later
+// (outside lock_; gpuReset is the same path as `nvrun --reset`). Clients
+// from before the reset get kIOReturnOffline (reset generation), so apps
+// see VK_ERROR_DEVICE_LOST and new ones find a working GPU. At most one
 // automatic reset per 30 s so a GPU that faults on every boot cannot loop.
 static bool autoResetEnabledByNvram() {
     IORegistryEntry *options = IORegistryEntry::fromPath("/options", gIODTPlane);
@@ -14487,13 +15200,27 @@ void NVGspControl::scheduleAutoResetLocked() {
     UInt64 now = 0, nowNs = 0;
     clock_get_uptime(&now);
     absolutetime_to_nanoseconds(now, &nowNs);
-    if (lastAutoResetNs_ && nowNs - lastAutoResetNs_ < 30ULL * 1000000000ULL) {
+    // 0.164.0: a fault inside the 30 s window used to be dropped, and the
+    // GPU then stayed down for good (a client faulting right after its
+    // recovery). It waits for the window instead; three resets in a row
+    // without two quiet minutes between them and we stop trying.
+    if (lastAutoResetNs_ > nowNs) return;                   // one is already on its way
+    if (lastAutoResetNs_ && nowNs - lastAutoResetNs_ > 120ULL * 1000000000ULL) autoResetStreak_ = 0;
+    UInt64 delayNs = 1000000000ULL;
+    if (autoResetStreak_ >= 3) {
+        // the streak is spent: one more try after two quiet minutes, never
+        // "down until someone reboots"
         setProperty("NVGspControl-autoreset-skipped", ++autoResetsSkipped_, 32);
-        return;
+        delayNs = 120ULL * 1000000000ULL;
+        autoResetStreak_ = 0;
+    } else if (lastAutoResetNs_ && nowNs - lastAutoResetNs_ < 30ULL * 1000000000ULL) {
+        delayNs = 30ULL * 1000000000ULL - (nowNs - lastAutoResetNs_);
     }
-    lastAutoResetNs_ = nowNs;
+    ++autoResetStreak_;
+    lastAutoResetNs_ = nowNs + delayNs;
+    setProperty("NVGspControl-autoreset-streak", autoResetStreak_, 32);
     UInt64 deadline = 0;
-    clock_interval_to_deadline(1, kSecondScale, &deadline);
+    clock_interval_to_deadline(static_cast<UInt32>(delayNs / 1000000ULL), kMillisecondScale, &deadline);
     thread_call_enter_delayed(autoResetCall_, deadline);
 }
 
@@ -14519,3 +15246,633 @@ IOReturn NVGspControl::srCycle() {
 }
 
 #undef super
+
+// 0.178.0 per-client GR channels (T18, docs/GPU-PERCHANNEL-PLAN-20261001.md).
+// Proven first by tools/nvgsp_channel_probe.cpp --compact-ctx (2 Oct): a GR
+// channel on its own FERMI_VASPACE_A whose PD1 points at the production PD0
+// tables for the kernel ranges, with a private 2 MiB MAIN/PATCH context and
+// the stock channel's global buffers. Here PD1[320..383] point at the owner's
+// own arena tables for good, so its GR work never needs an arena switch and
+// does not drain anybody else. CE and video work stays on the shared channels.
+namespace {
+constexpr UInt32 kCcClient = 0xc0d00001, kCcDevice = 0xc0d00080, kCcSubdev = 0xc0d02080;
+constexpr UInt32 kCcHandle = 0xc0d30000;     // | slot << 8 | object
+constexpr UInt32 kCcFirstChid = 9;           // GR 3, CE 4, video 5..7, kce 8
+constexpr UInt64 kCcVramVa = 0x2000000000ULL;
+constexpr UInt64 kCcGlobalVa = 0x104000000ULL;
+constexpr UInt64 kCcRmVaBase = 0x800000000000ULL, kCcRmVaEnd = 0x1000000000000ULL;
+constexpr UInt64 kCcPd3Off = 0x2000, kCcPd2Off = 0x3000, kCcPd1Off = 0x4000;   // in the ring part
+constexpr UInt64 kCcBlockBytes = 0x400000;   // ring part + 2 MiB-aligned context
+constexpr UInt64 kCcRingBytes = 0x80000;     // GPFIFO +0, semaphore +0x1000, PB +0x10000
+constexpr UInt64 kCcPbOff = 0x10000, kCcPbBytes = 0x60000, kCcSemOff = 0x1000;
+enum : UInt32 { kCcVas = 1, kCcVirt = 2, kCcBack0 = 4, kCcChan = 32, kCcSched = 64,
+                kCcPd1 = 128, kCcPdSet = 256, kCcLeaked = 0x80000000 };
+inline UInt64 ccRing(const UInt64 block, const UInt64 ctx) {
+    return ctx - block >= kCcRingBytes ? block : ctx + nvgsp::kGrPrivateBytes;
+}
+}
+
+static bool ctaPreemptByNvram() {
+    IORegistryEntry *options = IORegistryEntry::fromPath("/options", gIODTPlane);
+    bool on = true;
+    if (options) {
+        OSObject *o = options->copyProperty("nvgsp-cta");
+        if (OSData *d = OSDynamicCast(OSData, o))
+            on = !(d->getLength() >= 1 && static_cast<const char *>(d->getBytesNoCopy())[0] == '0');
+        else if (OSString *str = OSDynamicCast(OSString, o))
+            on = !str->isEqualTo("0");
+        OSSafeReleaseNULL(o);
+        options->release();
+    }
+    return on;
+}
+
+// Serialize whole RM channel lifecycles by default, while other GR channels
+// keep executing. Individual RPC serialization does not protect a multi-RPC
+// context allocation/free from another lifecycle transaction interleaving.
+// NVRAM: 0 restores overlap for diagnosis; 1 also drains/pauses GR; 2 is default.
+static UInt32 cchanQuiesceByNvram() {
+    IORegistryEntry *options = IORegistryEntry::fromPath("/options", gIODTPlane);
+    UInt32 mode = 2;
+    if (options) {
+        OSObject *o = options->copyProperty("nvgsp-cchanquiesce");
+        const char *s = nullptr;
+        if (OSData *d = OSDynamicCast(OSData, o)) {
+            if (d->getLength() >= 1) s = static_cast<const char *>(d->getBytesNoCopy());
+        } else if (OSString *str = OSDynamicCast(OSString, o)) s = str->getCStringNoCopy();
+        if (s && s[0] >= '0' && s[0] <= '2') mode = s[0] - '0';
+        OSSafeReleaseNULL(o);
+        options->release();
+    }
+    return mode;
+}
+
+bool NVGspControl::waitChannelMutationLocked() {
+    const UInt32 gen = gpuResets_;
+    for (UInt32 ms = 0; cchanMutationBusy_ && ms < 6000; ++ms) {
+        ulk(); IOSleep(1); lk(__LINE__);
+    }
+    return !cchanMutationBusy_ && gen == gpuResets_;
+}
+
+bool NVGspControl::waitChannelLifecycleLocked() {
+    const UInt32 gen = gpuResets_;
+    for (UInt32 ms = 0; cchanLifecycleBusy_ && ms < 6000; ++ms) {
+        ulk(); IOSleep(1); lk(__LINE__);
+    }
+    return !cchanLifecycleBusy_ && gen == gpuResets_;
+}
+
+bool NVGspControl::drainClientChannelsLocked() {
+    if (!drainEnginesLocked()) return false;
+    for (UInt32 i = 0; i < kMaxClientChannels; ++i) {
+        Ring r{};
+        if (clientRingLocked(&cchan_[i], &r) && !waitRingSem(r, *r.seq, 2000000)) return false;
+    }
+    stampAdvanceLocked();
+    return true;
+}
+
+NVGspControl::ClientChannel *NVGspControl::clientChannelLocked(const void *owner) {
+    if (!owner) return nullptr;
+    for (UInt32 i = 0; i < kMaxClientChannels; ++i)
+        if (cchan_[i].state == 2 && cchan_[i].owner == owner && cchan_[i].gen == gpuResets_)
+            return &cchan_[i];
+    return nullptr;
+}
+
+bool NVGspControl::anyClientChannelLocked() const {
+    for (UInt32 i = 0; i < kMaxClientChannels; ++i)
+        if (cchan_[i].state && !(cchan_[i].made & kCcLeaked)) return true;
+    return false;
+}
+
+// Caller holds lock_. Writes queued GR stamps whose submission has finished,
+// oldest first; stops at the first one still running. A channel that is gone
+// (closed after its work drained) no longer holds the queue up.
+bool NVGspControl::stampAdvanceLocked() {
+    bool moved = false;
+    while (stampQHead_ != stampQTail_ && grPersistent_ && ctxBackingOffset_) {
+        const PendingStamp &q = stampQ_[stampQHead_ % kStampQ];
+        Ring r{};
+        bool have = false;
+        if (q.slot == 0xffff) {
+            have = grRing(&r);
+        } else if (q.slot < kMaxClientChannels && cchan_[q.slot].serial != q.serial) {
+            // The old channel drained/was freed before this slot was reused.
+            // Its completed work must not wait for the new channel's seq.
+        } else if (q.slot < kMaxClientChannels && cchan_[q.slot].state == 1 && cchan_[q.slot].memHandle) {
+            ClientChannel tmp = cchan_[q.slot];   // closing: its ring still tells
+            tmp.state = 2;
+            Ring t{};
+            if (clientRingLocked(&tmp, &t)) { r = t; r.pbOff = &cchan_[q.slot].pbOff; r.seq = &cchan_[q.slot].seq; have = true; }
+        } else if (q.slot < kMaxClientChannels) {
+            have = clientRingLocked(&cchan_[q.slot], &r);
+        }
+        UInt32 v = 0;
+        if (have && (!readRingSem(r, &v) || static_cast<SInt32>(v - q.seq) < 0)) break;
+        const UInt32 value = static_cast<SInt32>(q.value - stampWritten_) > 0 ? q.value : stampWritten_;
+        if (!ringWrite(ctxBackingOffset_ + kStampCtxOff + q.offset, &value, 1)) break;
+        stampWritten_ = value;
+        ++stampQHead_;
+        moved = true;
+    }
+    if (moved) stampDeliverMask_ |= 1U;
+    return moved;
+}
+
+bool NVGspControl::clientRingLocked(ClientChannel *c, Ring *out) {
+    if (!c || c->state != 2) return false;
+    const UInt64 ring = ccRing(c->block, c->ctx);
+    *out = Ring{ring + kCcPbOff, kCcVramVa + ring + kCcPbOff, kCcPbBytes,
+                ring + kCcSemOff, kCcVramVa + ring + kCcSemOff, ring, c->userd,
+                c->token, &c->pbOff, &c->seq};
+    return true;
+}
+
+bool NVGspControl::grRingFor(const void *owner, Ring *out) {
+    ClientChannel *c = clientChannelLocked(owner);
+    return c ? clientRingLocked(c, out) : grRing(out);
+}
+
+// Caller holds lock_. Points PD1[320..383] of the private VAS at the owner's
+// arena tables once they exist (they never move while the arena lives).
+IOReturn NVGspControl::clientArenaLocked(ClientChannel *c) {
+    if (vramFrozen_) {
+        const UInt32 gen = gpuResets_;
+        waitThawLocked();
+        if (gen != gpuResets_ || c->state != 2) return kIOReturnNotReady;
+    }
+    ArenaCtx *a = arenaForLocked(c->owner, false);
+    if (!a || !a->ready) {
+        ++nullArenaRefusals_;
+        setProperty("NVGspControl-null-arena-refusals", nullArenaRefusals_, 32);
+        return kIOReturnNotReady;
+    }
+    if (c->arenaTables == a->map.tables) return kIOReturnSuccess;
+    PraminPteResult r{};
+    bool ok = true;
+    for (UInt32 slot = 0; ok && slot < 64; ++slot) {
+        UInt64 pde = (((a->map.tables + slot * 4096ULL) >> 12) << 8) | 2;
+        ok = praminPteAccess(pci_, c->pd1 + (320 + slot) * 8ULL, &pde, true, true, &r);
+    }
+    c->pd1Written[5] = ~0ULL;   // PD1[320..383]
+    if (!ok) return kIOReturnIOError;
+    c->arenaTables = a->map.tables;
+    return tlbInvalidate();
+}
+
+void NVGspControl::clientChannelsDropLocked() {
+    stampQHead_ = stampQTail_ = 0;   // stamps restart with the new GSP/VAS
+    stampWritten_ = stampQueued_ = 0;
+    for (UInt32 i = 0; i < kMaxClientChannels; ++i) {
+        // a channel RM may still hold keeps its memory (and slot) for good
+        if (cchan_[i].made & kCcLeaked) continue;
+        if (cchan_[i].memHandle) releaseGpuMemLocked(cchan_[i].memHandle - 1);
+        cchan_[i] = ClientChannel{};
+    }
+}
+
+IOReturn NVGspControl::clientChannelOpen(const void *owner, UInt32 *chidOut) {
+    if (!lock_ || !pci_ || !owner || !chidOut) return kIOReturnBadArgument;
+    lk(__LINE__);
+    // The same generation policy gates explicit selector40 and automatic
+    // opens. Normal post-reset fallback cannot be bypassed by a Metal opt-in;
+    // the NVRAM diagnostic is limited to the first global reset.
+    if (!privateChannelGenerationAllowed()) { ulk(); return kIOReturnUnsupported; }
+    if (!waitChannelLifecycleLocked()) { ulk(); return kIOReturnNotReady; }
+    if (!grPersistent_ || postInitPhase_ != 33 || !pdbAddress_ || resetBusy_) { ulk(); return kIOReturnNotReady; }
+    UInt32 slot = kMaxClientChannels;
+    for (UInt32 i = 0; i < kMaxClientChannels; ++i) {
+        if (cchan_[i].state && cchan_[i].owner == owner && cchan_[i].gen == gpuResets_) {
+            const IOReturn r = cchan_[i].state == 2 ? kIOReturnSuccess : kIOReturnBusy;
+            *chidOut = kCcFirstChid + i;
+            ulk();
+            return r;
+        }
+        if (!cchan_[i].state && slot == kMaxClientChannels) slot = i;
+    }
+    if (slot == kMaxClientChannels) { ulk(); return kIOReturnNoResources; }
+    const UInt32 mode = cchanQuiesceByNvram();
+    const bool quiesce = mode == 1;
+    if (quiesce && !drainClientChannelsLocked()) { ulk(); return kIOReturnTimeout; }
+    if (mode) { cchanLifecycleBusy_ = true; cchanMutationBusy_ = quiesce; }
+    ClientChannel &c = cchan_[slot];
+    c = ClientChannel{};
+    c.owner = owner;
+    c.state = 1;
+    c.gen = gpuResets_;
+    c.serial = ++cchanSerial_;
+    UInt64 block = 0;
+    bool ok = memAllocLocked(&cchan_[slot], kCcBlockBytes, 0, &c.memHandle, &block) == kIOReturnSuccess;
+    c.block = block;
+    c.ctx = (block + 0x1fffff) & ~0x1fffffULL;
+    const UInt64 ring = ccRing(c.block, c.ctx);
+    ok = ok && praminZeroRange(pci_, ring, kCcPbOff) &&
+         praminZeroRange(pci_, c.ctx, nvgsp::kGrPrivateBytes);
+    const UInt64 prodPdb = pdbAddress_;
+    ulk();
+
+    constexpr UInt32 kReplyCap = 1024, kReqCap = 1024;
+    UInt8 *reply = static_cast<UInt8 *>(IOMalloc(kReplyCap + kReqCap));
+    UInt8 *req = reply ? reply + kReplyCap : nullptr;
+    ok = ok && reply;
+    const UInt32 h = kCcHandle | (slot << 8), chid = kCcFirstChid + slot;
+    UInt32 stage = 0, status = 0, rb = 0;
+    auto call = [&](UInt32 fn, UInt32 bytes, UInt32 statusAt, UInt32 step) -> bool {
+        UInt32 result = ~0U, st = ~0U;
+        rb = kReplyCap;
+        stage = step;
+        const IOReturn r = userRpc(fn, req, bytes, reply, &rb, &result);
+        if (r == kIOReturnSuccess && rb >= statusAt + 4) __builtin_memcpy(&st, reply + statusAt, 4);
+        status = r != kIOReturnSuccess ? static_cast<UInt32>(r) : result ? result : st;
+        return r == kIOReturnSuccess && result == 0 && st == 0;
+    };
+    auto control = [&](UInt32 hObject, UInt32 cmd, UInt32 bytes) {
+        bzero(req, 24 + bytes);
+        const UInt32 hdr[6] = {kCcClient, hObject, cmd, 0, bytes, 0};
+        __builtin_memcpy(req, hdr, sizeof(hdr));
+        return req + 24;
+    };
+    auto alloc = [&](UInt32 parent, UInt32 handle, UInt32 cls, UInt32 bytes) {
+        bzero(req, 32 + bytes);
+        const UInt32 hdr[8] = {kCcClient, parent, handle, cls, 0, bytes, 0, 0};
+        __builtin_memcpy(req, hdr, sizeof(hdr));
+        return req + 32;
+    };
+    auto put32 = [](UInt8 *p, UInt32 v) { __builtin_memcpy(p, &v, 4); };
+    auto put64 = [](UInt8 *p, UInt64 v) { __builtin_memcpy(p, &v, 8); };
+    // 1: VAS, 2: a 4 KiB virtual range in it (RM then builds the PDB/PD2/PD1
+    // the channel needs; without it the channel ALLOC is INVALID_STATE)
+    if (ok) {
+        // 0.178.14: SHARED_MANAGEMENT. RM manages only [2^47, 2^48) (whole
+        // top-level PDEs) and never walks PD3[0]; our own directory goes in
+        // with RPC 54 SET_PAGE_DIRECTORY (step 5b). In an RM-managed VAS RM
+        // placed its mappings among the PD1 entries we share with production
+        // and wrote into the production PD0 tables (all channels faulted at
+        // VA 0x2046400000, 2 Oct 03:15).
+        UInt8 *p = alloc(kCcDevice, h | 0xf1, 0x90f1, 48);
+        put32(p + 4, 4);                       // NV_VASPACE_ALLOCATION_FLAGS_SHARED_MANAGEMENT
+        put64(p + 8, kCcRmVaEnd); put64(p + 40, kCcRmVaBase);
+        ok = call(103, 32 + 48, 96, 1);
+        if (ok) c.made |= kCcVas;
+    }
+    if (ok) {
+        UInt8 *p = alloc(kCcDevice, h | 0x50, 0x50a0, 128);
+        put32(p, kCcClient); put32(p + 8, 0x08080100); put32(p + 24, 0x00800000);
+        put64(p + 64, 4096); put64(p + 72, 4096); put32(p + 108, h | 0xf1);
+        ok = call(103, 32 + 128, 96, 2);
+        if (ok) c.made |= kCcVirt;
+    }
+    // 3..5: USERD, instance, method buffer
+    for (UInt32 i = 0; ok && i < 3; ++i) {
+        UInt8 *p = alloc(kCcSubdev, h | (0x43 + i), 0x40, 128);
+        const UInt64 bytes = i == 2
+            ? UInt64((methodBufferBytes_ ? methodBufferBytes_ : 20480) + 0xfff) & ~0xfffULL : 4096;
+        put32(p, kCcClient); put32(p + 4, 6); put32(p + 24, 0x10800000); put64(p + 64, bytes);
+        ok = call(103, 32 + 128, 96, 3 + i);
+        if (ok) c.made |= kCcBack0 << i;
+        UInt32 pb = 0;
+        UInt64 off = 0;
+        if (ok && rb >= 112 + 88) {
+            __builtin_memcpy(&pb, reply + 100, 4);
+            if (pb == 128) __builtin_memcpy(&off, reply + 112 + 80, 8);
+        }
+        ok = ok && off;
+        (i == 0 ? c.userd : i == 1 ? c.inst : c.mthd) = off;
+    }
+    if (ok) {
+        lk(__LINE__);
+        ok = praminZeroRange(pci_, c.userd, 4096) && praminZeroRange(pci_, c.inst, 4096);
+        ulk();
+    }
+    // 5b: our page directory (PD3/PD2/PD1 in the ring part). PD1 shares every
+    // production PD1 entry outside the client arenas (same PD0 tables);
+    // PD1[320..383] get the owner's arena tables at its first submission.
+    if (ok) {
+        stage = 5;
+        lk(__LINE__);
+        PraminPteResult r{};
+        UInt64 e3 = 0, e2 = 0;
+        const UInt64 pd3 = ring + kCcPd3Off, pd2 = ring + kCcPd2Off, pd1 = ring + kCcPd1Off;
+        ok = praminZeroRange(pci_, pd3, 0x3000) &&
+             praminPteAccess(pci_, prodPdb, &e3, false, false, &r) && e3 &&
+             praminPteAccess(pci_, ((e3 >> 8) & ((1ULL << 46) - 1)) << 12, &e2, false, false, &r) && e2;
+        const UInt64 prodPd1 = ((e2 >> 8) & ((1ULL << 46) - 1)) << 12;
+        for (UInt32 i = 0; ok && i < 512; ++i) {
+            if (i >= 320 && i < 384) continue;
+            UInt64 v = 0;
+            ok = praminPteAccess(pci_, prodPd1 + i * 8ULL, &v, false, false, &r) &&
+                 (!v || praminPteAccess(pci_, pd1 + i * 8ULL, &v, true, true, &r));
+        }
+        UInt64 d2 = (e2 & 0xff) | ((pd1 >> 12) << 8), d3 = (e3 & 0xff) | ((pd2 >> 12) << 8);
+        ok = ok && praminPteAccess(pci_, pd2, &d2, true, true, &r) &&
+             praminPteAccess(pci_, pd3, &d3, true, true, &r);
+        if (ok) c.pd1 = pd1;
+        ulk();
+        if (ok) {
+            // rpc_set_page_directory_v1E_05 {hClient, hDevice, pasid,
+            // {physAddress, numEntries, flags (vidmem), hVASpace, chId, subDeviceId, pasid}}
+            bzero(req, 48);
+            put32(req, kCcClient); put32(req + 4, kCcDevice);
+            put64(req + 16, pd3); put32(req + 24, 4); put32(req + 32, h | 0xf1);
+            UInt32 result = ~0U;
+            rb = kReplyCap;
+            stage = 5;
+            const IOReturn rr = userRpc(54, req, 48, reply, &rb, &result);
+            ok = rr == kIOReturnSuccess && result == 0;
+            status = rr ? static_cast<UInt32>(rr) : result;
+            if (ok) c.made |= kCcPdSet;
+        }
+        if (!ok && !status) status = 0xffff0005;
+    }
+    // 6: GR channel on the private VAS, 7: bind, 8: schedule, 9: token
+    if (ok) {
+        nvgsp::NvChannelAllocParams chan{};
+        ok = nvgsp::buildChannelAllocParams(h | 0xf1, h | 0x43, kCcVramVa + ring, 512,
+                                            nvgsp::kEngineTypeGraphics, &chan);
+        chan.hObjectError = 0;
+        chan.flags = 0x00200000u | ((chid & 7) << 8) | (((chid >> 3) & 0x1ff) << 12);
+        chan.internalFlags = nvgsp::kChannelInternalFlagsNotifierNone;
+        chan.instanceMem = {c.inst, 4096, 2, 1};
+        chan.ramfcMem = {c.inst, 512, 2, 1};
+        chan.userdMem = {c.userd, 512, 2, 1};
+        chan.mthdbufMem = {c.mthd, methodBufferBytes_ ? methodBufferBytes_ : 20480, 2, 0};
+        UInt8 *p = alloc(kCcDevice, h | 0x6f, nvgsp::kAmpereChannelGpfifoA, sizeof(chan));
+        __builtin_memcpy(p, &chan, sizeof(chan));
+        ok = ok && call(103, 32 + sizeof(chan), 96, 6);
+        if (ok) c.made |= kCcChan;
+    }
+    if (ok) {
+        UInt8 *p = control(h | 0x6f, 0xa06f0104, 4);
+        put32(p, nvgsp::kEngineTypeGraphics);
+        ok = call(76, 28, 92, 7);
+    }
+    if (ok) {
+        control(h | 0x6f, 0xa06f0103, 2)[0] = 1;
+        ok = call(76, 26, 92, 8);
+        if (ok) c.made |= kCcSched;
+    }
+    if (ok) {
+        control(h | 0x6f, 0xc36f0108, 4);
+        ok = call(76, 28, 92, 9) && rb >= 108;
+        if (ok) __builtin_memcpy(&c.token, reply + 104, 4);
+        if (ok && (c.token & 0xffff) != chid) { ok = false; status = 0xffff0009; }
+    }
+    // 10: the channel walks our directory
+    if (ok) {
+        stage = 10;
+        lk(__LINE__);
+        PraminPteResult r{};
+        UInt64 e = 0;
+        ok = praminPteAccess(pci_, c.inst + 0x200, &e, false, false, &r) &&
+             ((e & 0xffffffff00000000ULL) | (e & 0xfffff000ULL)) == ring + kCcPd3Off;
+        // stale translations of an earlier VAS that used this memory
+        ok = ok && tlbInvalidate() == kIOReturnSuccess;
+        ulk();
+        if (!ok) status = 0xffff000a;
+    }
+    // 11: private MAIN/PATCH, shared global buffers
+    if (ok) {
+        UInt8 *p = control(kCcSubdev, 0x2080012b, nvgsp::kGrPromoteBytes);
+        ok = nvgsp::buildGrPromoteCompact(kCcClient, h | 0x6f, c.ctx, kCcVramVa + c.ctx, kCcGlobalVa,
+                                          p, nvgsp::kGrPromoteBytes) &&
+             call(76, 24 + nvgsp::kGrPromoteBytes, 92, 11);
+    }
+    // 11b (0.178.11): compute preemption CTA. The promoted context reports WFI
+    // for both; with several GR channels a long dispatch then holds the
+    // engine until the context-switch timeout (RC 109). NVRAM nvgsp-cta=0 keeps WFI.
+    if (ok && ctaPreemptByNvram()) {
+        UInt8 *p = control(kCcSubdev, 0x20801210, 32);
+        put32(p, 1); put32(p + 4, h | 0x6f); put32(p + 8, 0); put32(p + 12, 1);
+        if (!call(76, 24 + 32, 92, 14)) { setProperty("NVGspControl-cchan-cta-fail", status, 32); status = 0; }
+    }
+    // 12: ADA_A, ADA_COMPUTE_A, FERMI_TWOD_A (freed with the channel)
+    static const UInt32 kCcClasses[3] = {0xc997, 0xc9c0, 0x902d};
+    for (UInt32 i = 0; ok && i < 3; ++i) {
+        alloc(h | 0x6f, h | (kCcClasses[i] & 0xff), kCcClasses[i], 0);
+        ok = call(103, 32, 96, 12);
+        if (!ok) {   // 0.178.16: which class, raw RPC result and RM status, reply size
+            UInt32 st = ~0U, res = ~0U, priv = ~0U;   // entry header 48 + RPC header {.., result +16, private +20}
+            if (rb >= 100) __builtin_memcpy(&st, reply + 96, 4);
+            if (rb >= 72) { __builtin_memcpy(&res, reply + 64, 4); __builtin_memcpy(&priv, reply + 68, 4); }
+            UInt32 v[5] = {kCcClasses[i], res, priv, st, rb};
+            setProperty("NVGspControl-cchan-obj-fail", v, sizeof(v));
+        }
+    }
+    // 13: first work: bind subchannels 0/1 and fence (proves execution)
+    lk(__LINE__);
+    if (ok && c.gen != gpuResets_) { ok = false; status = 0xffff000c; }
+    if (ok && c.closeAsked) { ok = false; status = 0xffff000f; }
+    // 0.178.10: work this client sent to the shared channels before (a
+    // retried open) must finish before its GR work moves here
+    if (ok && !drainEnginesLocked()) { ok = false; status = 0xffff000e; }
+    if (ok) {
+        c.state = 2;
+        Ring rg{};
+        UInt64 ns = 0;
+            // compute shared/local memory windows as NVMTL sets them: a batch
+        // that starts with a draw never sets them before its first launch,
+        // and a fresh context has them overlapping (SKEDCHECK17, RC 13)
+        static const UInt32 kInit[10] = {0x20010000, 0xc997, 0x20012000, 0xc9c0,
+                                         0x200220a8, 0, 0xfe000000, 0x200221ec, 0, 0xff000000};
+        stage = 13;
+        ok = clientRingLocked(&c, &rg) && submitRing(rg, kInit, 10, &ns) == kIOReturnSuccess;
+        if (!ok) { c.state = 1; status = 0xffff000d; }
+    }
+    ulk();
+    if (!ok) {
+        // Undo in reverse; the channel takes its objects and context with
+        // it. A free that does not answer leaves the slot (and its memory)
+        // held until the next reset rather than reusing live backing.
+        const UInt32 failStage = stage, failStatus = status;
+        bool clean = true;
+        if (c.made & kCcSched) {
+            control(h | 0x6f, 0xa06f0103, 2)[0] = 0;
+            clean = call(76, 26, 92, 20);
+        }
+        const UInt32 frees[6][2] = {{kCcChan, kCcDevice}, {kCcBack0 << 2, kCcSubdev},
+                                    {kCcBack0 << 1, kCcSubdev}, {kCcBack0, kCcSubdev},
+                                    {kCcVirt, kCcDevice}, {kCcVas, kCcDevice}};
+        const UInt32 objs[6] = {0x6f, 0x45, 0x44, 0x43, 0x50, 0xf1};
+        for (UInt32 i = 0; clean && i < 6; ++i) {
+            if (!(c.made & frees[i][0])) continue;
+            if (frees[i][0] == kCcVirt && (c.made & kCcPdSet)) {
+                // RPC 79 UNSET_PAGE_DIRECTORY: RM takes the directory back
+                // before the VAS goes (rpc_unset_page_directory_v1E_05)
+                bzero(req, 24);
+                put32(req, kCcClient); put32(req + 4, kCcDevice); put32(req + 8, h | 0xf1);
+                UInt32 result = ~0U;
+                rb = kReplyCap;
+                clean = userRpc(79, req, 24, reply, &rb, &result) == kIOReturnSuccess && result == 0;
+                if (!clean) break;
+            }
+            const UInt32 f[4] = {kCcClient, frees[i][1], h | objs[i], 0};
+            bzero(req, 16);
+            __builtin_memcpy(req, f, sizeof(f));
+            clean = call(10, 16, 92, 21);
+        }
+        lk(__LINE__);
+        if (c.gen == gpuResets_) {
+            if (clean) {
+                if (c.memHandle) releaseGpuMemLocked(c.memHandle - 1);
+                c = ClientChannel{};
+            } else {
+                c.made |= kCcLeaked;
+                c.owner = nullptr;
+            }
+        }
+        ++cchanFails_;
+        setProperty("NVGspControl-cchan-fails", cchanFails_, 32);
+        setProperty("NVGspControl-cchan-last-fail", (UInt64(failStage) << 32) | failStatus, 64);
+        ulk();
+    } else {
+        lk(__LINE__);
+        ++cchanOpens_;
+        setProperty("NVGspControl-cchan-opens", cchanOpens_, 32);
+        ulk();
+    }
+    if (reply) IOFree(reply, kReplyCap + kReqCap);
+    if (mode) { lk(__LINE__); cchanMutationBusy_ = cchanLifecycleBusy_ = false; ulk(); }
+    *chidOut = chid;
+    return ok ? kIOReturnSuccess : kIOReturnIOError;
+}
+
+// Frees a client channel's RM objects (channel with its context/objects,
+// backings, virtual range, VAS) and puts its PD1 entries back. Runs without
+// lock_. false: a free did not answer; the caller keeps the memory.
+bool NVGspControl::clientChannelFreeRm(UInt32 slot, UInt32 made, UInt32 *failOut) {
+    UInt8 req[32]{}, reply[256]{};
+    const UInt32 h = kCcHandle | (slot << 8);
+    UInt32 step = 0;
+    auto rpcOk = [&](UInt32 fn, UInt32 bytes, UInt32 statusAt) {
+        UInt32 rb = sizeof(reply), result = ~0U, st = ~0U;
+        const IOReturn r = userRpc(fn, req, bytes, reply, &rb, &result);
+        if (r == kIOReturnSuccess && rb >= statusAt + 4) __builtin_memcpy(&st, reply + statusAt, 4);
+        const bool good = r == kIOReturnSuccess && result == 0 && st == 0;
+        if (!good && failOut) *failOut = (step << 24) | ((r ? static_cast<UInt32>(r) : result ? result : st) & 0xffffff);
+        return good;
+    };
+    bool clean = true;
+    if (made & kCcSched) {
+        const UInt32 hdr[6] = {kCcClient, h | 0x6f, 0xa06f0103, 0, 2, 0};
+        __builtin_memcpy(req, hdr, sizeof(hdr));
+        step = 1;
+        clean = rpcOk(76, 26, 92);
+    }
+    const UInt32 objs[6] = {0x6f, 0x45, 0x44, 0x43, 0x50, 0xf1};
+    const UInt32 need[6] = {kCcChan, kCcBack0 << 2, kCcBack0 << 1, kCcBack0, kCcVirt, kCcVas};
+    for (UInt32 i = 0; clean && i < 6; ++i) {
+        step = 2 + i;
+        if (!(made & need[i])) continue;
+        if (objs[i] == 0x50 && (made & kCcPdSet)) {   // 0.178.14: directory back to RM first
+            const UInt32 u[3] = {kCcClient, kCcDevice, h | 0xf1};
+            bzero(req, sizeof(req));
+            __builtin_memcpy(req, u, sizeof(u));
+            UInt32 rb = sizeof(reply), result = ~0U;
+            const IOReturn r = userRpc(79, req, 24, reply, &rb, &result);
+            clean = r == kIOReturnSuccess && result == 0;
+            if (!clean) { if (failOut) *failOut = (0x79u << 24) | ((r ? static_cast<UInt32>(r) : result) & 0xffffff); break; }
+        }
+        const UInt32 f[4] = {kCcClient, objs[i] >= 0x43 && objs[i] <= 0x45 ? kCcSubdev : kCcDevice,
+                             h | objs[i], 0};
+        bzero(req, sizeof(req));
+        __builtin_memcpy(req, f, sizeof(f));
+        clean = rpcOk(10, 16, 92);
+    }
+    return clean;
+}
+
+void NVGspControl::clientChannelClose(const void *owner) {
+    if (!lock_ || !owner) return;
+    lk(__LINE__);
+    if (!waitChannelLifecycleLocked()) { ulk(); return; }
+    ClientChannel *c = clientChannelLocked(owner);
+    if (!c) {
+        // 0.178.16: an open still running for this owner frees the channel
+        // itself when it finishes (it used to stay live with no owner)
+        for (UInt32 i = 0; i < kMaxClientChannels; ++i)
+            if (cchan_[i].state == 1 && cchan_[i].owner == owner && !(cchan_[i].made & kCcLeaked))
+                cchan_[i].closeAsked = true;
+        ulk();
+        return;
+    }
+    const UInt32 mode = cchanQuiesceByNvram();
+    const bool quiesce = mode == 1;
+    if (quiesce) {
+        const bool drained = drainClientChannelsLocked();
+        setProperty("NVGspControl-cchan-quiesce-drained", drained);
+    }
+    if (mode) { cchanLifecycleBusy_ = true; cchanMutationBusy_ = quiesce; }
+    Ring rg{};
+    clientRingLocked(c, &rg);
+    c->state = 1;   // no new submissions
+    const UInt32 slot = static_cast<UInt32>(c - cchan_), gen = c->gen, want = c->seq;
+    bool idle = false;
+    for (UInt32 ms = 0; ms < 2000 && gen == gpuResets_; ++ms) {
+        UInt32 v = 0;
+        if (readRingSem(rg, &v) && static_cast<SInt32>(v - want) >= 0) { idle = true; break; }
+        ulk();
+        IOSleep(1);
+        lk(__LINE__);
+    }
+    setProperty("NVGspControl-cchan-close-idle", idle);
+    const ClientChannel snap = *c;
+    ulk();
+    if (gen != gpuResets_) {
+        if (mode) { lk(__LINE__); cchanMutationBusy_ = cchanLifecycleBusy_ = false; ulk(); }
+        return;   // the reset took it down
+    }
+    UInt32 fail = 0;
+    const bool clean = clientChannelFreeRm(slot, snap.made, &fail);
+    lk(__LINE__);
+    if (gen == gpuResets_) {
+        ClientChannel &cc = cchan_[slot];
+        if (clean) {
+            if (cc.memHandle) releaseGpuMemLocked(cc.memHandle - 1);
+            cc = ClientChannel{};
+        } else {
+            cc.made |= kCcLeaked;
+            cc.owner = nullptr;
+            setProperty("NVGspControl-cchan-leaked-slot", slot, 32);
+            setProperty("NVGspControl-cchan-close-fail", fail, 32);
+        }
+    }
+    if (mode) cchanMutationBusy_ = cchanLifecycleBusy_ = false;
+    ulk();
+}
+
+// 0.178.10: before a reset. FBSR suspend/resume keeps RM objects, so a channel
+// left in RM came back after the reset pointing at memory we had released:
+// its context restore timed out (RC 109) again and again and new channels
+// collided with its handles (0x19). Free them in RM first; stop at the first
+// free that does not answer (GSP hung) and keep those slots' memory.
+void NVGspControl::clientChannelsTeardown() {
+    if (!lock_) return;
+    bool gspOk = true;
+    UInt32 freed = 0;
+    for (UInt32 slot = 0; slot < kMaxClientChannels; ++slot) {
+        lk(__LINE__);
+        ClientChannel &c = cchan_[slot];
+        if (c.state != 2) { ulk(); continue; }
+        c.state = 1;
+        const ClientChannel snap = c;
+        ulk();
+        UInt32 fail = 0;
+        const bool clean = gspOk &&
+            clientChannelFreeRm(slot, snap.made, &fail);
+        gspOk = clean;
+        lk(__LINE__);
+        if (clean) {
+            if (c.memHandle) releaseGpuMemLocked(c.memHandle - 1);
+            c = ClientChannel{};
+            ++freed;
+        } else {
+            c.made |= kCcLeaked;
+            c.owner = nullptr;
+            setProperty("NVGspControl-cchan-reset-fail", fail, 32);
+        }
+        ulk();
+    }
+    setProperty("NVGspControl-cchan-reset-freed", freed, 32);
+}

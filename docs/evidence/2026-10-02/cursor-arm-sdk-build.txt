@@ -1,0 +1,6 @@
+0.178.29
+1cbb4b82bf22581f0b2bcf15377254162cbf2b4e63532b1f8d5d36bd88b1fb65  ~/nvbuild-lut-017828/build/kext-NVGspControl-20261002T120921Z-3569/NVGspControl.kext/Contents/MacOS/NVGspControl
+NVGspControl::pollStatusLocked stack frame: 6408 bytes (<8192 required)
+963511b95a90dddc6a8ac7efe73a636f56c2eff71e61a70eb816e76b147a05ac  ~/nvbuild-lut-017828/drivers/NVGspControl/NVGspControl.cpp
+f175df77b295655c649ca73da65911fb3c3fe50a260c38cff6c0ddbdecfdf60b  ~/nvbuild-lut-017828/drivers/NVGspControl/NVGspControl.hpp
+1189511e9455ad8ff7c5a843235a4382ee73405e15420c81ed3496b9c3fca607  ~/nvbuild-lut-017828/drivers/NVGspControl/Info.plist

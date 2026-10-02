@@ -8,8 +8,7 @@ static uint32_t rd(const uint8_t *p) { uint32_t v; std::memcpy(&v, p, 4); return
 int main() {
     uint8_t buf[4096];
     uint32_t bytes = 0, n = 0;
-    // empty spec: just the 8-byte header (what the kext used to send before
-    // registry support)
+    // Empty spec: just the 8-byte header (what the kext sent before 0.113.0).
     assert(nvgsp::buildRegistry("", 0, buf, sizeof(buf), &bytes, &n));
     assert(bytes == 8 && n == 0 && rd(buf) == 8 && rd(buf + 4) == 0);
 

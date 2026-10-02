@@ -1,0 +1,11 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Pix { uint v[]; };
+layout(push_constant) uniform Push { Pix surf; } p;
+void main() {
+    uvec2 xy = gl_GlobalInvocationID.xy;
+    if (xy.x >= 3840u || xy.y >= 2160u) return;
+    uint r = xy.x * 255u / 3839u, g = xy.y * 255u / 2159u, b = ((xy.x / 240u + xy.y / 240u) & 1u) * 255u;
+    p.surf.v[xy.y * 4096u + xy.x] = 0xff000000u | (r << 16) | (g << 8) | b;
+}

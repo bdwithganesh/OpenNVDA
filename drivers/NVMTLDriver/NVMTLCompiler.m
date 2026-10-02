@@ -1,4 +1,4 @@
-// See NVMTLCompiler.h. What we handle right now:
+// See NVMTLCompiler.h. v1 subsets:
 //
 // compute: kernel void name(device [const] T *buf [[buffer(N)]], ...,
 //          uint tid [[thread_position_in_grid]]) { body }
@@ -9,10 +9,13 @@
 // fragment: fragment float4 name(...) { ... return float4(r,g,b,a); }
 //          with constant floats; stage_in params accepted and ignored.
 //          Parsed, not compiled (fixed raster consumes the color).
+#include <os/log.h>
+#import "NVMTLLog.h"
 #import "NVMTLCompiler.h"
 #import "NVMTLTexHw.h"
 #include <CommonCrypto/CommonDigest.h>
 #include <sys/stat.h>
+#include <os/lock.h>
 #include <dlfcn.h>
 
 @implementation NVMTLKernel
@@ -27,7 +30,7 @@
 #define NAKC_PATH "/usr/local/libexec/nakc"
 #define GLSLANG_PATH "/usr/local/libexec/glslangValidator"
 
-// nakc in-process. Sandboxed clients (WindowServer, apps) may not
+// 0.6.2: nakc in-process. Sandboxed clients (WindowServer, apps) may not
 // launch /usr/local/libexec/nakc; libnakc.dylib in our bundle's Resources
 // is the same compiler with main() renamed nakc_main.
 #include <fcntl.h>
@@ -70,7 +73,7 @@ static NSString *runTool(NSString *path, NSArray<NSString *> *args, int *statusO
         char **argv = calloc(args.count + 2, sizeof(char *));
         argv[0] = strdup("nakc");
         for (NSUInteger i = 0; i < args.count; i++) argv[i + 1] = strdup(args[i].UTF8String);
-        // its stderr goes to a file for the call, so a failure in a
+        // 0.6.12: its stderr goes to a file for the call, so a failure in a
         // sandboxed process says why (the process's stderr is often /dev/null)
         NSString *errPath = [nvCacheDir() stringByAppendingFormat:@"/.nakc-err.%d", getpid()];
         [lock lock];
@@ -175,13 +178,13 @@ static NSArray *typeInfo(NSString *t) {
 // Compiled kernels are kept in /var/tmp/nvmtl-cache, keyed by the GLSL text
 // plus the nakc binary's size and mtime, so a compiler update drops them.
 // glslang + nakc cost ~200 ms per kernel, which every new process paid before.
-// /var/tmp/nvmtl-cache, or the process's own temp dir when that is
+// 0.6.2: /var/tmp/nvmtl-cache, or the process's own temp dir when that is
 // not writable (sandboxed clients: WindowServer, apps)
 static NSString *nvCacheDir(void) {
     static NSString *dir;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        // access() only looks at the mode bits; a sandbox (the
+        // 0.6.12: access() only looks at the mode bits; a sandbox (the
         // WebKit GPU process) may still refuse the write. Try one for real.
         BOOL (^writable)(NSString *) = ^BOOL(NSString *d) {
             NSString *probe = [d stringByAppendingFormat:@"/.probe.%d", getpid()];
@@ -220,7 +223,7 @@ static NSData *compileNak(NSString *name, NSString *glsl) {
         NSData *hit = [NSData dataWithContentsOfFile:cp];
         if (hit.length >= 64 && *(const uint32_t *)hit.bytes == 0x314b414e) return hit;
     }
-    char tmp[1024];   // next to the cache, /tmp is closed to some sandboxes
+    char tmp[1024];   // 0.6.12: next to the cache, /tmp is closed to some sandboxes
     snprintf(tmp, sizeof tmp, "%s/tmp.XXXXXX", nvCacheDir().fileSystemRepresentation);
     if (!mkdtemp(tmp)) return nil;
     NSString *base = [@(tmp) stringByAppendingPathComponent:name];
@@ -617,7 +620,7 @@ NSDictionary<NSString *, NVMTLKernel *> *nvCompileKernels(NSString *source) {
         }
         tb = glslCtors(tb);
         if (isVertex) {
-            // the launch rounds up to 256; threads past the draw must not read
+            // 0.3.3: the launch rounds up to 256; threads past the draw must not read
             // vertex buffers (they end in their own pages now, no staging copy)
             [g appendString:@"if (gl_GlobalInvocationID.x >= pc.vcount) return;\nV4Buf OUT = V4Buf(pc.out_);\n"];
             tb = subIdent(tb, tid, @"(gl_GlobalInvocationID.x + pc.vstart)");
@@ -665,7 +668,7 @@ NSDictionary<NSString *, NVMTLKernel *> *nvCompileKernels(NSString *source) {
     return kernels;
 }
 
-// the fragment body fused into a compute rasterizer, one launch per
+// 0.3.0: the fragment body fused into a compute rasterizer, one launch per
 // triangle over its screen bbox. Push layout: the kernel resource block
 // (buffers, textures, samplers - same order as compute kernels) then
 //   uint64 vout, rt; uint rtP, rtW, rtH, rtF; uint i0, i1, i2, S, pos;
@@ -813,7 +816,7 @@ static NVMTLKernel *compileFragmentRaster(NSString *name, NSString *params, NSSt
                     @"uint i0; uint i1; uint i2; uint S; uint pos;\n"
                     @"uint bx; uint by; uint bw; uint bh; vec4 vp; uint blend;\n"
                     @"uint64_t dz; uint dzP; uint dzMode;\n"
-                    // this triangle's vertex slots (3 x S vec4, S <= 8). The
+                    // 0.3.6: this triangle's vertex slots (3 x S vec4, S <= 8). The
                     // vout buffer is host memory: reading it per pixel was ~190 MB of
                     // PCIe traffic per full-screen triangle.
                     @"vec4 tv[24];\n} pc;\n"];
@@ -943,7 +946,7 @@ NSString *nvSaveMetallib(NSData *lib) {
     return p;
 }
 
-// a single function's AIR bitcode (no metallib around it)
+// 0.6.5: a single function's AIR bitcode (no metallib around it)
 NSString *nvSaveAir(NSData *bc) {
     if (bc.length < 8) return nil;
     (void)nvCacheDir();
@@ -959,6 +962,37 @@ static void nvReadTessParams(NVMTLKernel *k, NSString *nakPath) {
     unsigned d = 0, sp = 0, pr = 0;
     if (ts && sscanf(ts.UTF8String, "domain %u spacing %u prims %u", &d, &sp, &pr) == 3)
         k.tessParams = d | sp << 4 | pr << 8;
+}
+
+// 0.8.23: the vertex shader that draws a mesh stage's output (nakc --mesh-gen); mesh = the mesh kernel's info
+NVMTLKernel *nvCompileMeshGen(NSArray<NSNumber *> *mesh) {
+    struct stat nst;
+    if (!nvCompilerStat(&nst) || mesh.count < 9) return nil;
+    NSArray *args = @[mesh[5], mesh[3], mesh[4], mesh[8], mesh[6], mesh[7]];   // nvdata maxV maxP vpp vstride gstride
+    NSString *key = [NSString stringWithFormat:@"meshgen|%@|%lld.%ld", [args componentsJoinedByString:@","],
+                     (long long)nst.st_size, (long)nst.st_mtimespec.tv_sec];
+    NSString *nakPath = [NSString stringWithFormat:@"%@/%@.nak", nvCacheDir(),
+                         sha256Hex([key dataUsingEncoding:NSUTF8StringEncoding], 16)];
+    NSData *nak = [NSData dataWithContentsOfFile:nakPath];
+    if (!nak) {
+        (void)nvCacheDir();
+        int st = 0;
+        NSMutableArray *a = [@[@"--mesh-gen", nakPath] mutableCopy];
+        for (NSNumber *n in args) [a addObject:n.stringValue];
+        NSString *o = runTool(@NAKC_PATH, a, &st);
+        if (st) { NSLog(@"NVMTLCompiler: mesh vs failed: %@", o); return nil; }
+        nak = [NSData dataWithContentsOfFile:nakPath];
+    }
+    const uint32_t *h = nak.bytes;
+    if (nak.length < 64 || h[0] != 0x314b414e || nak.length < 64 + h[10] * 4 + h[1]) {
+        NSLog(@"NVMTLCompiler: mesh vs bad output"); return nil;
+    }
+    NVMTLKernel *k = [NVMTLKernel new];
+    k.name = @"mesh_vs";
+    k.regs = h[2]; k.slm = h[3]; k.smem = h[4]; k.barriers = h[8];
+    k.code = [nak subdataWithRange:NSMakeRange(64, h[10] * 4 + h[1])];
+    k.stage = 1; k.nbuf = 1; k.hwTex = YES;
+    return k;
 }
 
 NVMTLKernel *nvCompileTessGen(NSString *kind, NSArray<NSNumber *> *locs, uint32_t cps, uint32_t domain) {
@@ -991,6 +1025,52 @@ NVMTLKernel *nvCompileTessGen(NSString *kind, NSArray<NSNumber *> *locs, uint32_
     return k;
 }
 
+// 0.8.15: the argument list of a [[visible]] function (nakc --visible), what
+// -[MTLFunction arguments] reports: "varg <kind> <dataType> <elem/texType>
+// <isConstant> <access> <texDataType> <name> <typeName>" lines, each struct
+// followed by its "vmem" field lines, and one "vret" (same fields) for the
+// return type; nil when nakc cannot read it
+NSArray<NSString *> *nvVisibleArguments(NSString *libPath, NSString *name) {
+    if (!libPath || !name) return nil;
+    NSString *out = [NSString stringWithFormat:@"%@/%@.varg5", nvCacheDir(),
+                     sha256Hex([[NSString stringWithFormat:@"%@|%@", libPath, name] dataUsingEncoding:NSUTF8StringEncoding], 16)];
+    NSString *text = [NSString stringWithContentsOfFile:out encoding:NSUTF8StringEncoding error:nil];
+    if (!text) {
+        int st = 0;
+        NSString *o = runTool(@NAKC_PATH, @[@"--visible", libPath, name, out], &st);
+        if (st) { NSLog(@"NVMTLCompiler: %@ (visible arguments) failed: %@", name, o); return nil; }
+        text = [NSString stringWithContentsOfFile:out encoding:NSUTF8StringEncoding error:nil];
+    }
+    NSMutableArray *lines = [NSMutableArray new];
+    for (NSString *l in [text componentsSeparatedByString:@"\n"])
+        if ([l hasPrefix:@"varg "] || [l hasPrefix:@"vmem "] || [l hasPrefix:@"vret "]) [lines addObject:l];
+    return lines;
+}
+
+// 0.8.24: kernels built in this process, by the same key as the disk cache.
+// SecurityAgent re-created the same pipelines ~40 times a minute: each time the
+// .nak was read again and uploaded to a new heap slot (never freed), and a
+// failed kernel ran nakc again. One object per key now; NSNull = failed.
+static NSMutableDictionary<NSString *, id> *gAirKernels;
+static os_unfair_lock gAirKernelsLock = OS_UNFAIR_LOCK_INIT;
+static id airKernelGet(NSString *key) {
+    os_unfair_lock_lock(&gAirKernelsLock);
+    id k = gAirKernels[key];
+    os_unfair_lock_unlock(&gAirKernelsLock);
+    return k;
+}
+static NVMTLKernel *airKernelPut(NSString *key, NVMTLKernel *k) {
+    os_unfair_lock_lock(&gAirKernelsLock);
+    if (!gAirKernels) gAirKernels = [NSMutableDictionary new];
+    id have = gAirKernels[key];                  // two threads built it: keep the first
+    if (!have) gAirKernels[key] = k ? k : (id)[NSNull null];
+    os_unfair_lock_unlock(&gAirKernelsLock);
+    if (have) return [have isKindOfClass:[NVMTLKernel class]] ? have : nil;
+    return k;
+}
+static NVMTLKernel *nvCompileAirUncached(NSString *key, NSString *libPath, NSString *name, uint32_t x, uint32_t y,
+                                         uint32_t z, NSArray<NSString *> *extra);
+
 NVMTLKernel *nvCompileAir(NSString *libPath, NSString *name, uint32_t x, uint32_t y, uint32_t z,
                           NSArray<NSString *> *extra) {
     struct stat nst;
@@ -999,12 +1079,25 @@ NVMTLKernel *nvCompileAir(NSString *libPath, NSString *name, uint32_t x, uint32_
     NSString *key = [NSString stringWithFormat:@"air|%@|%@|%u,%u,%u|%@|%lld.%ld", libPath.lastPathComponent,
                      name, x, y, z, [extra componentsJoinedByString:@","],
                      (long long)nst.st_size, (long)nst.st_mtimespec.tv_sec];
+    id have = airKernelGet(key);
+    if (have) return [have isKindOfClass:[NVMTLKernel class]] ? have : nil;
+    return airKernelPut(key, nvCompileAirUncached(key, libPath, name, x, y, z, extra));
+}
+
+static NVMTLKernel *nvCompileAirUncached(NSString *key, NSString *libPath, NSString *name, uint32_t x, uint32_t y,
+                                         uint32_t z, NSArray<NSString *> *extra) {
     NSString *base = [NSString stringWithFormat:@"%@/%@", nvCacheDir(),
                       sha256Hex([key dataUsingEncoding:NSUTF8StringEncoding], 16)];
     NSString *nakPath = [base stringByAppendingString:@".nak"];
     NSData *nak = [NSData dataWithContentsOfFile:nakPath];
     NSString *abi = [NSString stringWithContentsOfFile:[nakPath stringByAppendingString:@".abi"]
                                               encoding:NSUTF8StringEncoding error:nil];
+    // 0.8.17: the exact nakc command, so a faulting kernel can be rebuilt
+    // and read on another machine (hit or miss, the cache hides it otherwise)
+    if (getenv("NVMTL_TRACE"))
+        os_log(OS_LOG_DEFAULT, "NVMTL_TRACE air %{public}s: nakc --air %{public}s %{public}s %{public}s %u %u %u %{public}s (%{public}s)",
+               name.UTF8String, libPath.UTF8String, name.UTF8String, nakPath.UTF8String, x, y, z,
+               [extra componentsJoinedByString:@" "].UTF8String, nak && abi ? "cached" : "new");
     if (!nak || !abi) {
         int st = 0;
         NSArray *args = [@[@"--air", libPath, name, nakPath,
@@ -1012,7 +1105,18 @@ NVMTLKernel *nvCompileAir(NSString *libPath, NSString *name, uint32_t x, uint32_
                            [NSString stringWithFormat:@"%u", y],
                            [NSString stringWithFormat:@"%u", z]] arrayByAddingObjectsFromArray:extra ? extra : @[]];
         NSString *o = runTool(@NAKC_PATH, args, &st);
-        if (st) { NSLog(@"NVMTLCompiler: %@ (AIR) failed: %@", name, o); return nil; }
+        if (st) {
+            // 0.8.24: with the exact command, so an empty message can be reproduced with nakc
+            os_log(OS_LOG_DEFAULT, "NVMTLCompiler: %{public}s (AIR) failed (status %d): %{public}s [nakc %{public}s]",
+                   name.UTF8String, st, o.UTF8String, [args componentsJoinedByString:@" "].UTF8String);
+            return nil;
+        }
+        // 0.8.15: nakc's notes (unlinked visible functions ...) are worth seeing
+        for (NSString *l in [o componentsSeparatedByString:@"\n"])
+            if ([l containsString:@"note:"])
+                os_log(OS_LOG_DEFAULT, "NVMTLCompiler: %{public}s: %{public}s (link args: %{public}s)", name.UTF8String, l.UTF8String,
+                       [[extra filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"SELF BEGINSWITH 'link='"]]
+                           componentsJoinedByString:@" "].UTF8String);
         nak = [NSData dataWithContentsOfFile:nakPath];
         abi = [NSString stringWithContentsOfFile:[nakPath stringByAppendingString:@".abi"]
                                         encoding:NSUTF8StringEncoding error:nil];
@@ -1025,6 +1129,7 @@ NVMTLKernel *nvCompileAir(NSString *libPath, NSString *name, uint32_t x, uint32_
     k.name = name; k.regs = h[2]; k.slm = h[3]; k.smem = h[4]; k.barriers = h[8];
     // vertex/fragment: the 0x80-byte SPH stays in front of the code
     const uint32_t sph = h[10] * 4;
+    k.sampleShading = h[9] == 4 && h[11] != 0;
     if (nak.length < 64 + sph + h[1]) { NSLog(@"NVMTLCompiler: %@ (AIR) short .nak", name); return nil; }
     k.code = [nak subdataWithRange:NSMakeRange(64, sph + h[1])];
     k.airLib = libPath;
@@ -1039,6 +1144,14 @@ NVMTLKernel *nvCompileAir(NSString *libPath, NSString *name, uint32_t x, uint32_
         if (w.count >= 2 && [w[0] isEqual:@"ntex"]) k.ntex = (uint32_t)[w[1] intValue];
         if (w.count >= 2 && [w[0] isEqual:@"stage"]) k.stage = (uint32_t)[w[1] intValue];
         if (w.count >= 2 && [w[0] isEqual:@"io"]) k.io = [line substringFromIndex:3];
+        if ((w.count >= 13 && [w[0] isEqual:@"refl"]) || (w.count >= 6 && [w[0] isEqual:@"reflm"]) ||
+            (w.count >= 7 && [w[0] isEqual:@"refli"]))
+            k.refl = [(k.refl ?: @[]) arrayByAddingObject:line];
+        if (w.count >= 10 && [w[0] isEqual:@"mesh"]) {
+            NSMutableArray *a = [NSMutableArray new];
+            for (NSUInteger i = 1; i < 10; i++) [a addObject:@([w[i] intValue])];
+            k.mesh = a;
+        }
         if (w.count >= 3 && [w[0] isEqual:@"tess"]) { k.tessDomain = (uint32_t)[w[1] intValue]; k.tessCps = (uint32_t)[w[2] intValue]; }
         if (w.count >= 2 && [w[0] isEqual:@"nsamp"]) k.nsamp = (uint32_t)[w[1] intValue];
         if (w.count >= 3 && [w[0] isEqual:@"csamp"]) {
@@ -1047,6 +1160,10 @@ NVMTLKernel *nvCompileAir(NSString *libPath, NSString *name, uint32_t x, uint32_
             [tsc appendBytes:&idx length:4];
         }
         if (w.count >= 3 && [w[0] isEqual:@"cdata"]) { cdOff = (uint32_t)[w[1] intValue]; cdBytes = (uint32_t)[w[2] intValue]; }
+        if (w.count >= 3 && [w[0] isEqual:@"rtread"]) {
+            k.rtReadDword = (uint32_t)[w[1] intValue] / 4;
+            k.rtReadMask = (uint32_t)strtoul([w[2] UTF8String], NULL, 16);
+        }
     }
     k.nconstSamp = (uint32_t)(tsc.length / 4);
     k.constTsc = tsc;

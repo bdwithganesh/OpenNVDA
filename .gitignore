@@ -3,3 +3,12 @@ research/full-metal-rnd/_dl/
 __pycache__/
 .DS_Store
 drivers/NVGspCore/NVGspBooterUnloadBlob.hpp
+
+/build/
+/work/
+*.o
+*.su
+*.dylib
+*.metallib
+*.kext/
+*.bundle/

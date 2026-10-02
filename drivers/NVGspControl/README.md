@@ -1,37 +1,13 @@
 # NVGspControl
 
-The heart of the stack. This kext takes the RTX 4080 from "the firmware drew a boot picture" to "GSP-RM
-is running and we can allocate memory, create channels and program the display".
+This kext owns GSP boot, RM messages, GPU memory, channels, interrupts and the display engine. NVDisplay and NVAccelerator call it through platform functions; user-space tools use NVGspControlUserClient.
 
-## Rough flow at boot
+The usual boot path resizes BAR1 when requested, parses the local firmware inputs, runs FWSEC/SEC2, starts GSP-RM, creates the RM resources and brings the display up to phase 33. Firmware is NVIDIA's and is not included. Generate `NVGspBooterUnloadBlob.hpp` from your own matching file with `tools/gen_booter_unload.py` before compiling.
 
-1. Resize BAR1 (if `nvgsp-rebar` is set) before anyone maps it, and move the console along with it
-2. Parse the VBIOS, run FWSEC-FRTS, then boot GSP through the SEC2 booter
-3. Bring RM up over the message queues (the "chain": a list of RPCs and control calls, each one a phase)
-4. Allocate the client/device/subdevice, our VA space, GR / CE / display channels
-5. Take over the display from the GOP without a flash, then park at phase 33 and serve clients
+Published control source is 0.178.29. The SDK build and actual-source host checks pass, but installed control on the recorded Tahoe runs is 0.178.27. Keep that difference in mind when using [the evidence](../../docs/evidence/2026-10-02/README.md).
 
-After that it handles MSI interrupts (GSP, display vblank, GR non-stall), RC / MMU fault events, hotplug,
-hardware cursor, DPMS, GPU reset, and S3 sleep/wake with GSP suspend/resume.
+The cursor path now requires an exact idle ASSY+ARM match before accepting image/show/hide state, with bounded failure cleanup. Reserved capacity is retained. The diagnostic normal pipeline accepts an enabled cursor state, but cursor bitmap output still has no proof and enabled CRC capture stalls. Software routing stays in place.
 
-Userspace talks to it through `NVGspControlUserClient` (memory objects, VA binds, submits, fences,
-present), which is what `nvk-macos` and the tools in `macos-lab-tools/nvrun` use. NVDisplay and
-NVAccelerator talk to it in-kernel through `callPlatformFunction`, so there's no link dependency.
+Shared-channel recovery has an earlier checked result. Private post-reset recovery still failed with RC109; sleep/wake, all-day use and per-queue isolation remain unqualified. The presence of those code paths does not mean they are release-ready.
 
-## NVRAM knobs
-
-| Variable | Meaning |
-|---|---|
-| `nvgsp-rebar` | BAR1 size in GiB (e.g. `16`). Unset or `0` = leave BAR1 as macOS set it |
-| `nvgsp-rebar-boot` | set by the kext as a boot guard; if a resize crashed, the next boot skips it |
-| `nvgsp-sr` | `0` / `off` disables GSP suspend/resume on sleep (falls back to a cold GSP boot on wake) |
-| `nvgsp-autoreset` | `1` = reset the GPU automatically after a channel RC |
-| `nvgsp-registry` | extra GSP-RM registry keys, packed into `SET_REGISTRY` |
-
-Boot-arg `nvgspdraw` is a debugging switch for the early display takeover, you normally don't need it.
-
-## Tests
-
-`tests/` has host checks for the pure logic in `NVGspCore` (ABI sizes, boot staging, arena maps, the
-VRAM heap, chain wait policy and so on). Most build with plain `clang++ -std=gnu++17 -I <workspace>`.
-The firmware-parsing ones take the firmware file as argument.
+Hardware-free checks run with `sh tests/run_host_checks.sh` from the repo root. The older relocated pure-core tests remain in this folder's `tests/` directory. Firmware parsing tests need your own firmware input and are not part of the default host check run.

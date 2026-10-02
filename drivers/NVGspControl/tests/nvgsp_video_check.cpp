@@ -16,7 +16,7 @@ int main() {
     assert(d->engineType == 0x13 && d->objClass == 0xc9b0 && d->engDesc == (0x8f99e1u << 8));
     assert(e->engineType == 0x1b && e->objClass == 0xc9b7 && e->engDesc == (0xe97b6cu << 8));
     assert(o->engineType == 0x33 && o->objClass == 0xc9fa && o->engDesc == (0xdd7babu << 8));
-    // Handles unique across engines and distinct from the CE (0xc0d1....) ones
+    // handles unique across engines and distinct from the CE (0xc0d1....) ones
     uint32_t hs[3][6];
     for (uint32_t i = 0; i < 3; ++i) {
         const VideoEngineDesc &v = *videoEngine(i);
@@ -74,7 +74,7 @@ int main() {
            rd64(pr + 64) == 0x4000 && rd(pr + 72) == 4 && pr[76] == 0 && pr[77] == 0 &&
            pr[78] == 1 && pr[79] == 0);
     for (uint32_t i = 80; i < kPromoteCtxBytes; ++i) assert(pr[i] == 0);
-    // variants
+    // 0.117.0 variants
     assert(buildFalconPromote(0x13, 0xc0d00001, 5, 0xc0d2006f, 0x40100000ULL, 0x2040100000ULL,
                               0x4000, pr, sizeof(pr), kPromoteRmExternal));
     assert(rd(pr + 4) == 0xc0d00001 && rd(pr + 8) == 5 && rd64(pr + 24) == 0 &&
@@ -86,7 +86,7 @@ int main() {
            rd(pr + 16) == 0xc0d2006f && rd64(pr + 24) == 0 && rd64(pr + 32) == 0 &&
            rd(pr + 40) == 1 && rd64(pr + 56) == 0x2040100000ULL && pr[78] == 1 && pr[79] == 0);
     assert(!buildFalconPromote(0x13, 1, 5, 2, 0x100, 0x100, 64, pr, sizeof(pr), 3));
-    // VA bind promote (UVM layout)
+    // 0.121.0: VA bind promote (UVM layout)
     assert(!buildFalconPromoteVa(0x13, 1, 2, 0, pr, sizeof(pr)));
     assert(!buildFalconPromoteVa(0x13, 1, 2, 0x100080, pr, sizeof(pr)));
     assert(buildFalconPromoteVa(0x13, 0xc0d00001, 0xc0d2006f, 0x2040100000ULL, pr, sizeof(pr)));

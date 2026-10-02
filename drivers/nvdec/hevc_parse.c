@@ -1,7 +1,5 @@
-/*
- * HEVC syntax parser (see hevc_parse.h). Written from ITU-T H.265 (syntax), 7.4
- * (semantics, including the 7.4.8 RPS derivation), Tables 7-5/7-6.
- */
+/* V1: HEVC syntax parser (see hevc_parse.h). Written from ITU-T H.265
+ * 7.3 (syntax), 7.4 (semantics, incl. 7.4.8 RPS derivation), Tables 7-5/7-6. */
 #include "hevc_parse.h"
 
 #include <string.h>
@@ -29,7 +27,7 @@ static const uint8_t kInter8[64] = {
     20, 20, 20, 20, 20, 20, 24, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 28,
     28, 28, 28, 28, 28, 33, 33, 33, 33, 33, 41, 41, 41, 41, 54, 54, 54, 71, 71, 91};
 
-/* 6.5.3 up-right diagonal scan: scan position -> raster index */
+/* 6.5.3 up-right diagonal scan: scan position -> raster index in an n x n block */
 static void diag_scan(int n, uint8_t *pos) {
     int i = 0, x = 0, y = 0;
     while (i < n * n) {
@@ -106,7 +104,7 @@ static int parse_scaling(h264_bits *b, hevc_scaling *s) {
 
 /* ------------------------------------------------------------------- RPS */
 
-/* 7.3.7 st_ref_pic_set(idx) + 7.4.8 derivation; `sets` holds 0..idx-1 */
+/* 7.3.7 st_ref_pic_set(idx) + 7.4.8 derivation; `sets` holds 0..idx-1. */
 static int parse_st_rps(h264_bits *b, int idx, int num_sets, const hevc_st_rps *sets,
                         hevc_st_rps *out) {
     memset(out, 0, sizeof(*out));

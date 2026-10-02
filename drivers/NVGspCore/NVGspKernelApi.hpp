@@ -1,11 +1,11 @@
 // In-kernel API between NVAccelerator (Aux KC) and NVGspControl (Boot KC),
 // reached with IOService::callPlatformFunction so neither links the other.
-// 
+// 0.152.0 (native N1):
 //   "nvgsp-stamp-region"   p1 = UInt64[3] out {VRAM/BAR1 offset, GPU VA, bytes},
 //                          p2 = IOMemoryDescriptor ** out (retained BAR1 view) or null
 //   "nvgsp-stamp-register" p1 = NVGspStampFn, p2 = ref (p1 null: unregister)
 //   "nvgsp-submit-stamp"   p1 = NVGspKernelSubmit *
-// 
+// 0.154.0 (native N4):
 //   "nvgsp-flip-copy"      p1 = NVGspFlipCopy *: a flipped surface to scan-out
 //                          on the kernel copy engine, after pending GR work
 #pragma once

@@ -1,18 +1,20 @@
 #pragma once
 
-// Video engine channels on AD103: NVDEC0 (NVC9B0), NVENC0 (NVC9B7), OFA0 (NVC9FA).
-// Host-only helpers (no IOKit, no hardware): the kext uses them to bring a channel up
-// on first use, and the host test checks every layout.
+// V1 (0.116.0): video engine channels on AD103 — NVDEC0 (NVC9B0), NVENC0
+// (NVC9B7), OFA0 (NVC9FA). Host-only helpers (no IOKit, no hardware):
+// the kext uses them to bring a channel up on first use, the host test
+// checks every layout.
 //
 // Sources (MIT, NVIDIA open-gpu-kernel-modules 570.144):
 //   class/cl2080_notification.h  NV2080_ENGINE_TYPE_{BSP 0x13, MSENC 0x1b, OFA 0x33}
-//   g_eng_desc_nvoc.h            ENG_NVDEC/ENG_NVENC/ENG_OFA = classId << 8 | inst
-// (OBJBSP 0x8f99e1, OBJMSENC 0xe97b6c, OBJOFA 0xdd7bab)
-//   ctrl2080gpu.h                GET_CONSTRUCTED_FALCON_INFO 0x208001b0, PROMOTE_CTX
-// 0x2080012b
-//   nvos.h                       NV_BSP/MSENC/OFA_ALLOCATION_PARAMETERS
-//   kernel_falcon.c              as a GSP client, CPU-RM allocates the falcon context
-// buffer (ctxBufferSize, 256 B aligned) and promotes it before the engine object.
+//   g_eng_desc_nvoc.h             ENG_NVDEC/ENG_NVENC/ENG_OFA = classId << 8 | inst
+//                                 (OBJBSP 0x8f99e1, OBJMSENC 0xe97b6c, OBJOFA 0xdd7bab)
+//   ctrl2080gpu.h                 GET_CONSTRUCTED_FALCON_INFO 0x208001b0,
+//                                 PROMOTE_CTX 0x2080012b
+//   nvos.h                        NV_BSP/MSENC/OFA_ALLOCATION_PARAMETERS
+//   kernel_falcon.c               GSP client = CPU-RM allocates the falcon
+//                                 context buffer (ctxBufferSize, 256 B aligned)
+//                                 and promotes it before the engine object.
 #include <stddef.h>
 #include <stdint.h>
 
@@ -85,17 +87,17 @@ inline bool falconCtxBytes(const uint8_t *params, uint32_t bytes, uint32_t engDe
 
 // NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS for a falcon context: {engineType,
 // hClient, ChID, hChanClient, hObject, hVirtMemory, virtAddress, size,
-// entryCount, entries[16] x {gpuPhysAddr, gpuVirtAddr, size, physAttr, u16
-// bufferId, u8 bInitialize, u8 bNonmapped}}, with one entry (bufferId 0,
+// entryCount, entries[16] x {gpuPhysAddr, gpuVirtAddr, size, physAttr,
+// u16 bufferId, u8 bInitialize, u8 bNonmapped}}, one entry (bufferId 0,
 // physAttr VIDMEM | GPU_CACHEABLE_NO = 0x4, initialize).
-// On hardware the "full" layout got NV_ERR_INVALID_STATE, so the kext tries
-// them in this order:
-//   kPromoteRmExternal  what RM's kflcn sends for a VAS owned outside RM
-// (ours): hClient/ChID/size set, physical entry only, bNonmapped = 1, no VA
-// (kernel_falcon.c)
-//   kPromoteGrStyle     same layout as our working GR promote (nouveau):
-// top-level ids/size 0, entry with phys + VA
-//   kPromoteFull        everything filled in
+// 0.117.0 live (0.116.0): the "full" layout was refused with
+// NV_ERR_INVALID_STATE, so the kext tries the layouts in this order:
+//   kPromoteRmExternal  what RM's kflcn sends for an externally owned VAS
+//                       (ours): hClient/ChID/size set, physical entry only,
+//                       bNonmapped = 1, no VA (kernel_falcon.c);
+//   kPromoteGrStyle     the layout of our working GR promote (nouveau):
+//                       top-level ids/size 0, entry with phys + VA;
+//   kPromoteFull        everything filled (the 0.116.0 layout).
 enum PromoteVariant : uint32_t {
     kPromoteRmExternal = 0,
     kPromoteGrStyle = 1,
@@ -137,12 +139,12 @@ inline bool buildFalconPromote(uint32_t engineType, uint32_t hClient, uint32_t c
     return true;
 }
 
-// Second promote for a VAS owned outside RM (NVIDIA
+// 0.121.0: second promote of an externally owned VAS (NVIDIA
 // nvGpuOpsBindChannelResources, nv_gpu_ops.c): after the physical-only
-// promote, bind the context VA with {engineType, hChanClient, hObject,
-// entryCount 1, entry.gpuVirtAddr} and the rest 0 (bufferId only for GR).
-// Without it the engine object alloc failed with NV_ERR_OBJECT_NOT_FOUND
-// (no VA for the context in the channel's VAS).
+// promote, the context VA is bound with {engineType, hChanClient, hObject,
+// entryCount 1, entry.gpuVirtAddr} and everything else 0 (bufferId only
+// for GR). Live 0.120.0: without it the engine object alloc failed with
+// NV_ERR_OBJECT_NOT_FOUND (no VA for the context in the channel's VAS).
 inline bool buildFalconPromoteVa(uint32_t engineType, uint32_t hClient, uint32_t hChannel,
                                  uint64_t va, uint8_t *out, uint32_t outBytes) {
     if (!out || outBytes < kPromoteCtxBytes || !va || va % kFalconCtxAlign) return false;
@@ -157,16 +159,17 @@ inline bool buildFalconPromoteVa(uint32_t engineType, uint32_t hClient, uint32_t
 }
 
 // NV_BSP / NV_MSENC / NV_OFA_ALLOCATION_PARAMETERS: {size, prohibit
-// multiple instances, engineInstance}, identical 12-byte layouts.
+// multiple instances, engineInstance} — identical 12-byte layouts.
 inline void buildVideoObjectParams(uint32_t engineInstance, uint8_t out[12]) {
     const uint32_t v[3] = {12, 0, engineInstance};
     __builtin_memcpy(out, v, 12);
 }
 
 // Chunk layout of one video channel (2 MiB VRAM, GPU VA = VRAM window + phys):
-// +0x000000 GPFIFO (512 entries) +0x001000 fence semaphore +0x010000 tail
-// pushbuffer (64 KiB, kext-appended fence methods) +0x100000 falcon context
-// buffer (<= 1 MiB; larger = chunk grows, context at +0x200000)
+//   +0x000000 GPFIFO (512 entries)   +0x001000 fence semaphore
+//   +0x010000 tail pushbuffer (64 KiB, kext-appended fence methods)
+//   +0x100000 falcon context buffer (<= 1 MiB; larger = chunk grows,
+//             context at +0x200000)
 constexpr uint64_t kVideoGpfifoOff = 0x0;
 constexpr uint64_t kVideoSemOff = 0x1000;
 constexpr uint64_t kVideoPbOff = 0x10000;

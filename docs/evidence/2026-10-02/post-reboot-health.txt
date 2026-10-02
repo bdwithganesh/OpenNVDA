@@ -1,0 +1,166 @@
+Fri Oct  2 20:49:41 IST 2026
+kern.boottime: { sec = 1790945497, usec = 410472 } Fri Oct  2 18:21:37 2026
+736
+metal_3d_test rc=0 0s :: metal_3d_test: PASS (0 failed)
+metal_adv_test rc=0 0s :: metal_adv_test: PASS (0 failed)
+metal_air_test rc=0 0s :: metal_air_test: PASS (0 failed)
+metal_aniso_test rc=0 0s :: metal_aniso_test: PASS
+metal_argbuf_tier2_test rc=0 0s :: metal_argbuf_tier2_test: PASS
+metal_async_test rc=0 1s :: metal_async_test: PASS (status 4)
+metal_bary_test rc=0 0s :: metal_bary_test: PASS
+metal_batch_test rc=0 0s :: metal_batch_test: PASS (0 failed)
+metal_big_iosurface_test rc=0 1s :: metal_big_iosurface_test: PASS
+metal_blurchain_test rc=0 0s :: metal_blurchain_test: PASS (green 0.400, status 4)
+metal_ci_test rc=0 0s :: metal_ci_test: PASS (status 4)
+metal_coherence_test rc=0 1s :: metal_coherence_test: PASS
+metal_counter_test rc=0 0s :: metal_counter_test: PASS
+metal_cull_test rc=0 0s :: 
+metal_depth_test rc=0 0s :: metal_depth_test: PASS (0 failed)
+metal_event_test rc=0 0s :: metal_event_test: PASS (0 failed)
+metal_feature_test rc=0 1s :: metal_feature_test: PASS (0 failed)
+metal_fnptr_test rc=0 0s :: metal_fnptr_test: PASS
+metal_gather_test rc=0 0s :: metal_gather_test: PASS (0 failed)
+metal_heap_churn_test rc=0 1s :: metal_heap_churn_test on NVIDIA GeForce RTX 4080: PASS (available 4194304 -> 4194304, texture 720896 bytes)
+metal_icb_test rc=0 0s :: metal_icb_test: PASS (0 wrong)
+metal_iosurface_stride_test rc=0 0s :: metal_iosurface_stride_test: PASS
+metal_layered_test rc=0 0s :: metal_layered_test: PASS
+metal_linked_globals_test rc=0 0s :: metal_linked_globals_test: PASS (0 wrong)
+metal_linked_test rc=0 0s :: metal_linked_test: PASS (0 wrong)
+metal_managed_test rc=0 1s :: metal_managed_test: PASS (0 failed)
+metal_mix_test rc=0 0s :: metal_mix_test: PASS (0 wrong, status 4)
+metal_nofrag_test rc=0 0s :: metal_nofrag_test: PASS
+metal_priv_test rc=0 0s :: metal_priv_test: PASS (0 failed)
+metal_render_test rc=0 1s :: metal_render_test: PASS (0 failed)
+metal_shadow_map_test rc=0 0s :: metal_shadow_map_test: PASS
+metal_shadow_test rc=0 0s :: metal_shadow_test ShadowHorizontalBlurFragment: PASS status 4, centre 00000000 edge 00000000 corner 00000000
+metal_simd_test rc=0 0s :: metal_simd_test: PASS (0 failed)
+metal_srgb_test rc=0 0s :: metal_srgb_test: PASS
+metal_stagein_test rc=0 0s :: metal_stagein_test: PASS (0 wrong)
+metal_stencil_implicit_test rc=0 1s :: 
+metal_sync_test rc=0 1s :: metal_sync_test: PASS (0 failed)
+metal_tess_test rc=0 0s :: metal_tess_test: PASS (0 failed)
+metal_tex_test rc=0 0s :: metal_tex_test: PASS (0 failed)
+DONE failures=0
+suite_exit=0
+device: NVIDIA GeForce RTX 4080
+Depth16:
+  aspect blit phase0 PASS (0 wrong)
+  depth phase0 PASS (0/27 wrong, first=0.125002)
+  depth compare phase0 PASS (0/27 wrong, first=0)
+  depth PCF phase0 PASS (0/27 wrong, first=0)
+  aspect blit phase1 PASS (0 wrong)
+  depth phase1 PASS (0/27 wrong, first=0.250004)
+  depth compare phase1 PASS (0/27 wrong, first=0)
+  depth PCF phase1 PASS (0/27 wrong, first=0)
+  aspect blit phase2 PASS (0 wrong)
+  depth phase2 PASS (0/27 wrong, first=0.250004)
+  depth compare phase2 PASS (0/27 wrong, first=0)
+  depth PCF phase2 PASS (0/27 wrong, first=0)
+  depth texture copy phase2 PASS (0/27 wrong, first=0.250004)
+Depth32:
+  aspect blit phase0 PASS (0 wrong)
+  depth phase0 PASS (0/27 wrong, first=0.125)
+  depth compare phase0 PASS (0/27 wrong, first=0)
+  depth PCF phase0 PASS (0/27 wrong, first=0)
+  aspect blit phase1 PASS (0 wrong)
+  depth phase1 PASS (0/27 wrong, first=0.25)
+  depth compare phase1 PASS (0/27 wrong, first=0)
+  depth PCF phase1 PASS (0/27 wrong, first=0)
+  aspect blit phase2 PASS (0 wrong)
+  depth phase2 PASS (0/27 wrong, first=0.25)
+  depth compare phase2 PASS (0/27 wrong, first=0)
+  depth PCF phase2 PASS (0/27 wrong, first=0)
+  depth texture copy phase2 PASS (0/27 wrong, first=0.25)
+Depth32S8:
+  aspect blit phase0 PASS (0 wrong)
+  depth phase0 PASS (0/27 wrong, first=0.125)
+  depth compare phase0 PASS (0/27 wrong, first=0)
+  depth PCF phase0 PASS (0/27 wrong, first=0)
+  stencil early phase0 PASS (0/27 wrong, first=37)
+  stencil late/nested phase0 PASS (0/27 wrong, first=37)
+  depth upload preserves stencil PASS (0 wrong)
+  aspect blit phase1 PASS (0 wrong)
+  depth phase1 PASS (0/27 wrong, first=0.25)
+  depth compare phase1 PASS (0/27 wrong, first=0)
+  depth PCF phase1 PASS (0/27 wrong, first=0)
+  stencil early phase1 PASS (0/27 wrong, first=38)
+  stencil late/nested phase1 PASS (0/27 wrong, first=38)
+  aspect blit phase2 PASS (0 wrong)
+  depth phase2 PASS (0/27 wrong, first=0.25)
+  depth compare phase2 PASS (0/27 wrong, first=0)
+  depth PCF phase2 PASS (0/27 wrong, first=0)
+  stencil early phase2 PASS (0/27 wrong, first=38)
+  stencil late/nested phase2 PASS (0/27 wrong, first=38)
+  depth texture copy phase2 PASS (0/27 wrong, first=0.25)
+  stencil texture copy phase2 PASS (0/27 wrong, first=38)
+Stencil8:
+  aspect blit phase0 PASS (0 wrong)
+  stencil early phase0 PASS (0/27 wrong, first=37)
+  aspect blit phase1 PASS (0 wrong)
+  stencil early phase1 PASS (0/27 wrong, first=38)
+  aspect blit phase2 PASS (0 wrong)
+  stencil early phase2 PASS (0/27 wrong, first=38)
+  stencil texture copy phase2 PASS (0/27 wrong, first=38)
+Depth24S8:
+  aspect blit phase0 PASS (0 wrong)
+  depth phase0 PASS (0/27 wrong, first=0.125)
+  depth compare phase0 PASS (0/27 wrong, first=0)
+  depth PCF phase0 PASS (0/27 wrong, first=0)
+  stencil early phase0 PASS (0/27 wrong, first=37)
+  stencil late/nested phase0 PASS (0/27 wrong, first=37)
+  depth upload preserves stencil PASS (0 wrong)
+  aspect blit phase1 PASS (0 wrong)
+  depth phase1 PASS (0/27 wrong, first=0.25)
+  depth compare phase1 PASS (0/27 wrong, first=0)
+  depth PCF phase1 PASS (0/27 wrong, first=0)
+  stencil early phase1 PASS (0/27 wrong, first=38)
+  stencil late/nested phase1 PASS (0/27 wrong, first=38)
+  aspect blit phase2 PASS (0 wrong)
+  depth phase2 PASS (0/27 wrong, first=0.25)
+  depth compare phase2 PASS (0/27 wrong, first=0)
+  depth PCF phase2 PASS (0/27 wrong, first=0)
+  stencil early phase2 PASS (0/27 wrong, first=38)
+  stencil late/nested phase2 PASS (0/27 wrong, first=38)
+  depth texture copy phase2 PASS (0/27 wrong, first=0.25)
+  stencil texture copy phase2 PASS (0/27 wrong, first=38)
+metal_depth_stencil_view_test: PASS (75 checks, 0 failures)
+depth_exit=0
+  |   "NVGspControl-post-init-phase" = 33
+  |   "NVGspControl-status-os-errors" = 0
+snapshot exception=00000080 data=00000000 code=00000000 method=0200 type=0 pending=00000000 error=00000000 core=200b0000 PUT=14 GET=14
+snapshot usage ASSY=00001110 ARMED=00001110
+snapshot cursor+00 ASSY=00000000 ARMED=00000000
+snapshot cursor+04 ASSY=00000000 ARMED=00000000
+snapshot cursor+08 ASSY=00000000 ARMED=00000000
+snapshot cursor+0c ASSY=00000000 ARMED=00000000
+snapshot cursor+10 ASSY=00000000 ARMED=00000000
+snapshot cursor+14 ASSY=000000e9 ARMED=000000e9
+snapshot cursor+18 ASSY=000002ff ARMED=000002ff
+snapshot OLUT+00 ASSY=00000000 ARMED=00000000
+snapshot OLUT+04 ASSY=cccccccc ARMED=cccccccc
+snapshot OLUT+08 ASSY=00000000 ARMED=00000000
+snapshot OLUT+0c ASSY=00000000 ARMED=00000000
+snapshot OCSC+00 ASSY=00000000 ARMED=00000000
+snapshot OCSC+04 ASSY=00000000 ARMED=00000000
+snapshot OCSC+08 ASSY=00000000 ARMED=00000000
+snapshot OCSC+0c ASSY=00000000 ARMED=00000000
+snapshot OCSC+10 ASSY=00000000 ARMED=00000000
+snapshot OCSC+14 ASSY=00000000 ARMED=00000000
+snapshot OCSC+18 ASSY=00000000 ARMED=00000000
+snapshot OCSC+1c ASSY=00000000 ARMED=00000000
+snapshot OCSC+20 ASSY=00000000 ARMED=00000000
+snapshot OCSC+24 ASSY=00000000 ARMED=00000000
+snapshot OCSC+28 ASSY=00000000 ARMED=00000000
+snapshot OCSC+2c ASSY=00000000 ARMED=00000000
+snapshot OCSC+30 ASSY=00000000 ARMED=00000000
+snapshot hash[123]=c0d0d001/02400001
+snapshot cursor-object+00=00000000
+snapshot cursor-object+04=00000000
+snapshot cursor-object+08=00000000
+snapshot cursor-object+0c=00000000
+snapshot cursor-object+10=00000000
+snapshot cursor-object+14=00000000
+snapshot cursor-object+18=00000000
+snapshot cursor-object+1c=00000000
+snapshot CRC ASSY=00000000/00000000 ARM=00000000/00000000
+snapshot CRC object=00000000 begin=0 limit=ff

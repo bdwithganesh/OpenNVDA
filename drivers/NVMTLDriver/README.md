@@ -1,25 +1,7 @@
 # NVMTLDriver
 
-The user half of Metal: `NVMTLDriver.bundle`, which Metal.framework loads for any accelerator whose
-`MetalPluginName` points to it (that's NVAccelerator).
+This is the user-space Metal bundle loaded for NVAccelerator. Current source and installed bundle are 0.8.69. WindowServer uses it on the Tahoe test machine; [the current receipts](../../docs/evidence/2026-10-02/README.md) show the desktop and focused Metal/depth checks.
 
-What works right now, checked on the real card with `metal_test` (stages 1 to 11):
+The bundle handles buffers, texture views, render/compute pipelines, command buffers, blits and synchronization. AIR goes through the local nakc/NAK compiler rather than a system NVIDIA compiler. That path is still incomplete: Geekbench 7 Background Blur hits an unsupported AIR typed load. Passing the focused suite does not mean every Metal feature or MPS app works.
 
-- buffers (alloc, CPU map, free)
-- command queues and command buffers
-- blit fill and copy on the copy engine
-- compute, through a small MetalSL subset that we turn into GLSL, then SPIR-V, then NAK
-- a basic triangle render into a texture or an IOSurface, RGBA8 and BGRA8, indexed draws too
-- fences and shared events
-
-`metal_present` puts a Metal render on the actual screen, and `metal_bench` gave about 9.6 GFLOPS
-SGEMM, 4.1 GB/s copy and 2.5 GB/s fill (all through a 1 MiB staging buffer, so slow).
-
-Still missing: proper fixed-function 3D, a real shader compiler, texture sampling,
-`newLibraryWithData` (AIR), and WindowServer using us for the desktop. Also WindowServer won't load
-the bundle anyway since it's not a platform binary.
-
-The compute path needs the shader tools (glslangValidator, nakc) in `/usr/local/libexec` on the
-machine.
-
-Build with `sh build.sh [out dir]` (plain clang, the bundle lands in `build/` by default).
+Build with `sh build.sh [out dir]`. The compiler source and Mesa build patches are in `../../tools/nakc`; `libnakc.dylib` is supplied locally at build/install time. Installation into the test system and system snapshot is separate from compilation. No ready-to-install bundle is shipped here.

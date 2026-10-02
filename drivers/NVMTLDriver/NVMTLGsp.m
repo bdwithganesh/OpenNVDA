@@ -1,4 +1,5 @@
 // See NVMTLGsp.h.
+#import "NVMTLLog.h"
 #import "NVMTLGsp.h"
 #import "NVMTLTexHw.h"
 #import <IOKit/IOKitLib.h>
@@ -12,14 +13,29 @@
 #include <unistd.h>
 #import <Metal/Metal.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #define NVGSP_ARENA_BASE 0x2800000000ULL
-#define NVGSP_STAGE_BYTES (22 << 20)     // + 4 MiB GR batch at 2 MiB; 0.8.0: + 8 x 2 MiB native slabs at 6 MiB
+#define NVGSP_STAGE_BYTES (22 << 20)     // 0.6.13: + 4 MiB GR batch at 2 MiB; 0.8.0: + 8 x 2 MiB native slabs at 6 MiB
 
 // NVGspControl user-client selectors (NVGspControlUserClient.cpp).
-enum { kSelExecSeg = 21, kSelMemAlloc = 22, kSelMemFree = 23, kSelVaBindObj = 24, kSelCeWait = 29 };
+enum { kSelExecSeg = 21, kSelMemAlloc = 22, kSelMemFree = 23, kSelVaBindObj = 24, kSelCeWait = 29, kSelMemAdopt = 38 };
 
 // NV906F DMA_INCR method header: (1<<29)|(count<<16)|(subch<<13)|(mthd>>2).
+// map type of a memory object: 0x1000 | handle up to 0xfff (every kext),
+// 0x40000000 | handle above (NVGspControl >= 0.162.0 has 16383 handles)
+// how long a fence wait may take before the launch counts as failed (us);
+// NVMTL_FENCE_US for long kernels while debugging
+static uint64_t nvFenceUs(void) {
+    static uint64_t us;
+    if (!us) { const char *e = getenv("NVMTL_FENCE_US"); us = e && atoll(e) > 0 ? (uint64_t)atoll(e) : 2000000; }
+    return us;
+}
+
+static inline uint32_t nvMapType(uint32_t handle) {
+    return handle < 0x1000 ? 0x1000u | handle : 0x40000000u | handle;
+}
+
 static inline uint32_t mthd(unsigned sub, uint32_t m, unsigned count) {
     return (1u << 29) | ((count & 0x1fff) << 16) | ((sub & 7) << 13) | ((m >> 2) & 0xfff);
 }
@@ -31,17 +47,18 @@ static inline uint32_t mthd(unsigned sub, uint32_t m, unsigned count) {
 #define B5_LAUNCH_PITCH_COPY (0x001u | 0x200u | 0x004u | 0x080u | 0x100u) // PIPELINED|MULTI|FLUSH|PITCH|PITCH
 #define CE_CHUNK (1 << 17) // 128 KiB, as NVK
 
-static io_connect_t gConn = IO_OBJECT_NULL;
+static _Atomic(io_connect_t) gConn = IO_OBJECT_NULL;
 static uint8_t *gCpu = NULL;
 static uint64_t gVa = 0;
 static uint32_t gHandle = 0;
 
-// one submitter at a time. The staging object (QMD, cbuf, method
+// 0.6.13: one submitter at a time. The staging object (QMD, cbuf, method
 // streams, DATA) is one per process, and WindowServer commits from several
 // threads; two commits at once overwrote each other's launches. Recursive:
 // nvExecuteOps holds it for a whole command buffer and the helpers take it
 // again.
 static pthread_mutex_t gGpuMtx;
+static pthread_once_t gGpuOnce = PTHREAD_ONCE_INIT;
 static void gpuMtxInit(void) {
     pthread_mutexattr_t a;
     pthread_mutexattr_init(&a);
@@ -49,38 +66,83 @@ static void gpuMtxInit(void) {
     pthread_mutex_init(&gGpuMtx, &a);
 }
 void nvGpuLock(void) {
-    static pthread_once_t once = PTHREAD_ONCE_INIT;
-    pthread_once(&once, gpuMtxInit);
+    pthread_once(&gGpuOnce, gpuMtxInit);
     pthread_mutex_lock(&gGpuMtx);
 }
 void nvGpuUnlock(void) { pthread_mutex_unlock(&gGpuMtx); }
 static inline void gpuUnlockAtExit(int *p) { (void)p; nvGpuUnlock(); }
 #define NV_GPU_LOCKED nvGpuLock(); int nvLk_ __attribute__((cleanup(gpuUnlockAtExit), unused)) = 0
 
+// 0.8.17: GPU work that failed on this thread (submit refused, fence never
+// came). The command buffer whose commit saw it reports an error instead of
+// "completed" (a kernel that never ran came back as success after a reset).
+static _Thread_local uint32_t tFailures, tFailKind;
+void nvNoteGpuFailure(uint32_t kind) { tFailures++; if (kind > tFailKind) tFailKind = kind; }
+uint32_t nvGpuFailureCount(void) { return tFailures; }
+uint32_t nvGpuFailureKind(void) { return tFailKind; }
+void nvGpuFailureReset(void) { tFailKind = 0; }
+
 static bool nvGspRecover(io_connect_t dead);
+static _Atomic uint64_t gRecoverySerial, gGeneration;
+static _Thread_local uint32_t tEncoding;
+void nvGspEncodingBegin(void) { tEncoding++; }
+void nvGspEncodingEnd(void) { if (tEncoding) tEncoding--; }
+uint64_t nvGspRecoverySerial(void) { return atomic_load(&gRecoverySerial); }
+uint64_t nvGspGeneration(void) { return atomic_load(&gGeneration); }
+static uint32_t gPostResetLog;                    // 0.8.27, see nvPostResetNote
+// 0.8.28: is NVGspControl in a reset (its "reset-busy" property)
+static bool nvResetBusy(void) {
+    static io_service_t g;
+    if (!g) g = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVGspControl"));
+    if (!g) return false;
+    CFTypeRef r = IORegistryEntryCreateCFProperty(g, CFSTR("NVGspControl-reset-busy"), kCFAllocatorDefault, 0);
+    const bool busy = r == kCFBooleanTrue;
+    if (r) CFRelease(r);
+    return busy;
+}
 static kern_return_t callOn(io_connect_t c, uint32_t sel, const uint64_t *in, uint32_t inN,
                             uint64_t *out, uint32_t *outN, const void *sIn, size_t sInN) {
     return IOConnectCallMethod(c, sel, in, inN, sIn, sInN, out, outN, NULL, NULL);
+}
+bool nvGspGenerationMatches(uint64_t generation) {
+    uint64_t current = 0;
+    uint32_t count = 1;
+    // A terminal-status callback must never wait on the encoding mutex or
+    // reopen: encoding can itself be waiting for that callback's slab.
+    return callOn(atomic_load(&gConn), 37, NULL, 0, &current, &count, NULL, 0) == KERN_SUCCESS &&
+           count == 1 && current == generation;
 }
 static bool callMethod(uint32_t sel, const uint64_t *in, uint32_t inN,
                        uint64_t *out, uint32_t *outN, const void *sIn, size_t sInN) {
     const io_connect_t c = gConn;
     kern_return_t kr = callOn(c, sel, in, inN, out, outN, sIn, sInN);
-    // after a GPU reset the kext refuses a client from before it
+    // 0.8.28: NotReady while a GPU reset runs (kext 0.164.0 refuses binds and
+    // submits then). Failing them left IOSurface textures without a GPU VA:
+    // WindowServer drew with them after the reset, GR exception, another
+    // reset, every 30 s (1 Oct 08:03). Wait for the reset (bounded), then the
+    // Offline path below reopens.
+    for (uint32_t w = 0; kr == kIOReturnNotReady && w < 400 && nvResetBusy(); w++) {
+        usleep(20000);
+        kr = callOn(gConn, sel, in, inN, out, outN, sIn, sInN);
+    }
+    // 0.6.12: after a GPU reset the kext refuses a client from before it
     // (kIOReturnOffline) for good; open a new one, put every object back at
     // its VA and go on, instead of failing every draw until WindowServer
     // restarts
-    if (kr == kIOReturnOffline && nvGspRecover(c))
-        kr = callOn(gConn, sel, in, inN, out, outN, sIn, sInN);
+    if (kr == kIOReturnOffline && !tEncoding && nvGspRecover(c)) {
+        // The old staging bytes disappeared with the connection. Rebinding
+        // resources does not make an already-encoded method stream replayable.
+        if (sel != kSelExecSeg) kr = callOn(gConn, sel, in, inN, out, outN, sIn, sInN);
+    }
     if (kr != KERN_SUCCESS) {
-        // say why; rate limited so a stuck engine can't flood the log
+        // 0.6.8: say why; rate limited so a stuck engine can't flood the log
         static uint32_t nlog;
         if (nlog++ < 64 || !(nlog & 1023)) NSLog(@"NVMTLGsp: selector %u -> 0x%x (#%u)", sel, kr, nlog);
     }
     return kr == KERN_SUCCESS;
 }
 
-// through the accelerator first (connect type 'NVGP'): the same
+// 0.6.8: through the accelerator first (connect type 'NVGP'): the same
 // client, but reachable from any sandbox that allows Metal. NVGspControl
 // directly is the fallback for older kexts.
 static io_connect_t nvGspOpen(void) {
@@ -99,6 +161,23 @@ static io_connect_t nvGspOpen(void) {
     return IO_OBJECT_NULL;
 }
 
+// 0.8.68: own GR channel + VAS for this process (kext 0.178.0, selector 40),
+// opt-in by NVMTL_OWN_CHANNEL=1 or /Library/Preferences/nvmtl-ownchannel.
+// GR work then never waits for another process's arena switch. Refusal
+// (older kext, no free slot) keeps the shared channel.
+static void nvGspOwnChannel(io_connect_t c) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_OWN_CHANNEL");
+        on = e ? atoi(e) != 0 : access("/Library/Preferences/nvmtl-ownchannel", F_OK) == 0;
+    }
+    if (!on) return;
+    uint64_t in[1] = {1}, out[1] = {0};
+    uint32_t outN = 1;
+    const kern_return_t kr = callOn(c, 40, in, 1, out, &outN, NULL, 0);
+    NSLog(@"NVMTLGsp: own GR channel kr 0x%x chid %llu", kr, out[0]);
+}
+
 // 6 MiB SYS object (2 MiB-aligned contiguous chunks, bindable) at gVa,
 // mapped into the task
 static bool nvGspStaging(io_connect_t c, uint32_t *handle, uint8_t **cpu) {
@@ -113,7 +192,7 @@ static bool nvGspStaging(io_connect_t c, uint32_t *handle, uint8_t **cpu) {
     }
     mach_vm_address_t addr = 0;
     mach_vm_size_t size = 0;
-    if (IOConnectMapMemory(c, 0x1000u | (uint32_t)out[0], mach_task_self(), &addr, &size,
+    if (IOConnectMapMemory(c, nvMapType((uint32_t)out[0]), mach_task_self(), &addr, &size,
                            kIOMapAnywhere) != KERN_SUCCESS || !addr || size < NVGSP_STAGE_BYTES) {
         NSLog(@"NVMTLGsp: map staging failed"); return false;
     }
@@ -123,13 +202,37 @@ static bool nvGspStaging(io_connect_t c, uint32_t *handle, uint8_t **cpu) {
 }
 
 bool nvGspEnsure(void) {
+    NV_GPU_LOCKED;
     if (gCpu) return true;
-    gConn = nvGspOpen();
-    if (!gConn) return false;
-    gVa = NVGSP_ARENA_BASE; // our arena is fresh; take page 0
-    if (!nvGspStaging(gConn, &gHandle, &gCpu)) return false;
+    const io_connect_t c = nvGspOpen();
+    if (!c) return false;
+    uint32_t handle = 0;
+    uint8_t *cpu = NULL;
+    if (!nvGspStaging(c, &handle, &cpu)) {
+        // A reset/memory failure during first use must not leak a client
+        // and its partial objects on every later allocation attempt.
+        IOServiceClose(c);
+        return false;
+    }
+    // Publish only a fully initialized client; another initializer cannot
+    // overwrite a live connection while this thread builds its staging.
+    nvGspOwnChannel(c);
+    gConn = c; gHandle = handle; gCpu = cpu;
+    gVa = NVGSP_ARENA_BASE;
     NSLog(@"NVMTLGsp: staging va 0x%llx cpu %p handle %u", gVa, gCpu, gHandle);
     return true;
+}
+
+// 0.8.31: pure generation probe. Native encoding can otherwise reuse all
+// resources after a reset and never hit a scalar bind that returns Offline.
+bool nvGspValidate(void) {
+    NV_GPU_LOCKED;
+    if (!nvGspEnsure()) return false;
+    uint64_t generation = 0;
+    uint32_t count = 1;
+    const bool ok = callMethod(37, NULL, 0, &generation, &count, NULL, 0);
+    if (ok) atomic_store(&gGeneration, generation);
+    return ok;
 }
 
 // ---------------------------------------------------------------- GPU heap
@@ -139,13 +242,13 @@ bool nvGspEnsure(void) {
 #define NVGSP_USER_VA_BASE 0x2C00000000ULL
 #define NVGSP_USER_VA_END  0x2F00000000ULL      // NVK's replay range starts here
 enum { kSelUserMemBind = 33, kMaxUserBufs = 4096 };
-typedef struct { uint8_t *cpu; uint64_t va, size; uint32_t handle; } NVUserBuf;
+typedef struct { uint8_t *cpu; uint64_t va, size; uint32_t handle, bindFlags; } NVUserBuf;
 static NVUserBuf gBufs[kMaxUserBufs];
 static unsigned gNBufs;
 static uint64_t gUserVa = NVGSP_USER_VA_BASE;
 static os_unfair_lock gHeapLock = OS_UNFAIR_LOCK_INIT;
 
-// user VA is handed back on free. It used to only grow, and
+// 0.6.8: user VA is handed back on free. It used to only grow, and
 // WindowServer (a buffer or surface view every frame) ran through the 12 GiB
 // in a minute or two; after that new buffers had no GPU address, shaders got
 // 0 and the GR exception + GPU reset showed as a black flash.
@@ -181,7 +284,7 @@ static void userVaGiveLocked(uint64_t va, uint64_t len) {
     if (gNUFree < 4096) gUFree[gNUFree++] = (NVUSpan){va, len};
 }
 
-// the last user VA ranges handed back, to name an MMU fault after a
+// 0.8.5: the last user VA ranges handed back, to name an MMU fault after a
 // GPU reset: a range freed moments ago means work outlived its memory, a
 // live range means the wrong VA arena was installed
 typedef struct { uint64_t va, len, when; uint32_t kind; } NVFreed;
@@ -201,7 +304,9 @@ static uint64_t regU64(io_service_t s, CFStringRef key) {
 static void nvExplainFault(void) {
     io_service_t g = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVGspControl"));
     if (!g) return;
-    const uint64_t va = (regU64(g, CFSTR("NVGspControl-rc-mmu-fault-hi")) << 32) | regU64(g, CFSTR("NVGspControl-rc-mmu-fault-lo"));
+    // 32-bit properties come back as signed numbers: keep 32 bits of each
+    const uint64_t va = ((regU64(g, CFSTR("NVGspControl-rc-mmu-fault-hi")) & 0xffffffffull) << 32) |
+                        (regU64(g, CFSTR("NVGspControl-rc-mmu-fault-lo")) & 0xffffffffull);
     IOObjectRelease(g);
     if (!va) return;
     mach_timebase_info_data_t tb; mach_timebase_info(&tb);
@@ -234,12 +339,14 @@ static void nvHeapFull(uint64_t len) {
 }
 // Unbind (the kext frees the object, unwires the pages and flushes the TLB),
 // then the VA may go to the next buffer.
-static void nvHeapReleaseVa(NVUserBuf u, uint64_t h) {
-    callMethod(kSelMemFree, &h, 1, NULL, NULL, NULL, 0);
-    os_unfair_lock_lock(&gHeapLock);
-    noteFreed(u.va, u.size, (u.handle & 0x40000000u) ? 1 : 0);
-    userVaGiveLocked(u.va, u.size);
-    os_unfair_lock_unlock(&gHeapLock);
+// Caller holds gHeapLock, which also protects the connection/handle swap
+// in recovery. Never reopen and replay an old handle in a new namespace.
+static void nvHeapReleaseVaLocked(NVUserBuf u, uint64_t h) {
+    const kern_return_t kr = callOn(gConn, kSelMemFree, &h, 1, NULL, NULL, NULL, 0);
+    if (kr == KERN_SUCCESS || kr == kIOReturnOffline) {
+        noteFreed(u.va, u.size, (u.handle & 0x40000000u) ? 1 : 0);
+        userVaGiveLocked(u.va, u.size);
+    }
 }
 
 // NVMTL_HEAP=2: big-page variant. Kext SYS objects (2 MiB contiguous
@@ -258,20 +365,32 @@ static bool heapAllocChunks(uint64_t bytes, void **cpu, uint64_t *va) {
     mach_vm_address_t addr = 0;
     mach_vm_size_t msz = 0;
     if (!room || !callMethod(kSelVaBindObj, bnd, 3, NULL, NULL, NULL, 0) ||
-        IOConnectMapMemory(gConn, 0x1000u | handle, mach_task_self(), &addr, &msz, kIOMapAnywhere) != KERN_SUCCESS) {
+        IOConnectMapMemory(gConn, nvMapType(handle), mach_task_self(), &addr, &msz, kIOMapAnywhere) != KERN_SUCCESS) {
         uint64_t h = handle;
         callMethod(kSelMemFree, &h, 1, NULL, NULL, NULL, 0);
         os_unfair_lock_lock(&gHeapLock); userVaGiveLocked(v, len); os_unfair_lock_unlock(&gHeapLock);
         return false;
     }
     os_unfair_lock_lock(&gHeapLock);
-    gBufs[gNBufs++] = (NVUserBuf){(uint8_t *)(uintptr_t)addr, v, len, handle | 0x80000000u};
+    gBufs[gNBufs++] = (NVUserBuf){(uint8_t *)(uintptr_t)addr, v, len, handle | 0x80000000u, 0};
     os_unfair_lock_unlock(&gHeapLock);
     *cpu = (void *)(uintptr_t)addr; *va = v;
     return true;
 }
 
-bool nvHeapAlloc(uint64_t bytes, void **cpu, uint64_t *va) {
+static bool heapAllocFlags(uint64_t bytes, void **cpu, uint64_t *va, uint32_t flags);
+bool nvHeapAlloc(uint64_t bytes, void **cpu, uint64_t *va) { return heapAllocFlags(bytes, cpu, va, 0); }
+// 0.8.16: Metal Shared buffers: system memory the GPU L2 may cache (kext
+// 0.163.0 flag 0x200; it invalidates / syncs around every submission).
+// Uncached, every GPU read was a PCIe round trip: 2 GB/s against 227 GB/s,
+// 2.5 s per Vision convolution. NVMTL_SYSMEM_VOL=1 goes back to uncached.
+bool nvHeapAllocShared(uint64_t bytes, void **cpu, uint64_t *va) {
+    static int vol = -1;
+    if (vol < 0) vol = getenv("NVMTL_SYSMEM_VOL") != NULL;
+    return heapAllocFlags(bytes, cpu, va, vol ? 0 : 0x200);
+}
+static bool heapAllocFlags(uint64_t bytes, void **cpu, uint64_t *va, uint32_t flags) {
+    NV_GPU_LOCKED;
     if (!bytes || !nvGspEnsure()) return false;
     const char *m = getenv("NVMTL_HEAP");
     if (m && m[0] == '2') return heapAllocChunks(bytes, cpu, va);
@@ -282,7 +401,7 @@ bool nvHeapAlloc(uint64_t bytes, void **cpu, uint64_t *va) {
     const uint64_t v = gNBufs < kMaxUserBufs ? userVaTakeLocked(len, 0x10000) : 0;
     const bool room = v != 0;
     os_unfair_lock_unlock(&gHeapLock);
-    uint64_t in[4] = {addr, len, v, 0}, out[1] = {0};
+    uint64_t in[4] = {addr, len, v, flags}, out[1] = {0};
     uint32_t outN = 1;
     if (!room || !callMethod(kSelUserMemBind, in, 4, out, &outN, NULL, 0) || !out[0]) {
         if (!room) nvHeapFull(len);
@@ -291,7 +410,7 @@ bool nvHeapAlloc(uint64_t bytes, void **cpu, uint64_t *va) {
         return false;
     }
     os_unfair_lock_lock(&gHeapLock);
-    gBufs[gNBufs++] = (NVUserBuf){(uint8_t *)(uintptr_t)addr, v, len, (uint32_t)out[0]};
+    gBufs[gNBufs++] = (NVUserBuf){(uint8_t *)(uintptr_t)addr, v, len, (uint32_t)out[0], flags};
     os_unfair_lock_unlock(&gHeapLock);
     *cpu = (void *)(uintptr_t)addr;
     *va = v;
@@ -304,14 +423,14 @@ void nvHeapFree(void *cpu, uint64_t bytes) {
     os_unfair_lock_lock(&gHeapLock);
     for (unsigned i = 0; i < gNBufs; i++)
         if (gBufs[i].cpu == cpu && !(gBufs[i].handle & 0x40000000u)) {   // never a wrapped surface
-            u = gBufs[i]; gBufs[i] = gBufs[--gNBufs]; break;
+            u = gBufs[i]; gBufs[i] = gBufs[--gNBufs];
+            nvHeapReleaseVaLocked(u, u.handle & 0x7fffffffu); break;
         }
     os_unfair_lock_unlock(&gHeapLock);
     if (!u.cpu) return;
     uint64_t h = u.handle & 0x7fffffffu;
-    nvHeapReleaseVa(u, h);
     if (u.handle & 0x80000000u) {                               // kext SYS object
-        IOConnectUnmapMemory(gConn, 0x1000u | (uint32_t)h, mach_task_self(), (mach_vm_address_t)(uintptr_t)u.cpu);
+        IOConnectUnmapMemory(gConn, nvMapType((uint32_t)h), mach_task_self(), (mach_vm_address_t)(uintptr_t)u.cpu);
         return;
     }
     mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)(uintptr_t)u.cpu, u.size);
@@ -319,6 +438,7 @@ void nvHeapFree(void *cpu, uint64_t bytes) {
 
 // handle bit 30: wrapped foreign memory (unbind only, the owner frees it)
 bool nvHeapWrap(void *cpu, uint64_t bytes, uint64_t *va) {
+    NV_GPU_LOCKED;
     if (!cpu || !bytes || ((uintptr_t)cpu & 0xfff) || !nvGspEnsure()) return false;
     const uint64_t len = (bytes + 0xfff) & ~0xfffULL;
     os_unfair_lock_lock(&gHeapLock);
@@ -333,13 +453,13 @@ bool nvHeapWrap(void *cpu, uint64_t bytes, uint64_t *va) {
         return false;
     }
     os_unfair_lock_lock(&gHeapLock);
-    gBufs[gNBufs++] = (NVUserBuf){(uint8_t *)cpu, v, len, (uint32_t)out[0] | 0x40000000u};
+    gBufs[gNBufs++] = (NVUserBuf){(uint8_t *)cpu, v, len, (uint32_t)out[0] | 0x40000000u, 0};
     os_unfair_lock_unlock(&gHeapLock);
     *va = v;
     return true;
 }
 
-// by address AND GPU VA. CoreAnimation makes several textures on
+// 0.6.11: by address AND GPU VA. CoreAnimation makes several textures on
 // one IOSurface; each wrap has its own VA over the same pages, and taking
 // the first entry with that CPU address unbound another texture's VA while
 // the GPU still used it (MMU fault, PTE invalid, GPU reset at login).
@@ -348,11 +468,11 @@ void nvHeapUnwrap(void *cpu, uint64_t va) {
     os_unfair_lock_lock(&gHeapLock);
     for (unsigned i = 0; i < gNBufs; i++)
         if (gBufs[i].cpu == cpu && gBufs[i].va == va && (gBufs[i].handle & 0x40000000u)) {
-            u = gBufs[i]; gBufs[i] = gBufs[--gNBufs]; break;
+            u = gBufs[i]; gBufs[i] = gBufs[--gNBufs];
+            nvHeapReleaseVaLocked(u, u.handle & 0x3fffffffu); break;
         }
     os_unfair_lock_unlock(&gHeapLock);
     if (!u.cpu) return;
-    nvHeapReleaseVa(u, u.handle & 0x3fffffffu);
 }
 
 uint64_t nvHeapVa(const void *cpu, uint64_t bytes) {
@@ -376,7 +496,7 @@ static NVRange gVFree[2048];
 static unsigned gNVFree;
 static uint64_t gVramVa = NVGSP_VRAM_VA_BASE;
 
-// kext objects, kept so a GPU reset can put them back
+// 0.6.12: kext objects, kept so a GPU reset can put them back
 typedef struct { uint64_t va, size; uint32_t handle; } NVChunk;
 static NVChunk gVChunk[256];                 // VRAM heap chunks
 static unsigned gNVChunk;
@@ -402,50 +522,95 @@ static bool vramGrow(uint64_t need) {
     return true;
 }
 
-// block-linear surfaces get their own kext object, bound with the
+// 0.5.1: block-linear surfaces get their own kext object, bound with the
 // PTE kind the layout needs, in a VA range of their own
 #define NVGSP_BL_VA_BASE 0x2880000000ULL
 #define NVGSP_BL_VA_END  0x2A00000000ULL
 static uint64_t gBlVa = NVGSP_BL_VA_BASE;
+static NVRange gBlFree[2048];
+static unsigned gNBlFree;
+
+// 0.8.34: a lifetime bump pointer exhausted the 6 GiB arena after only
+// 3072 tiny, already-released surfaces. All spans are 2 MiB aligned.
+// Caller holds gHeapLock; frees coalesce before another allocation.
+static uint64_t kindVaTakeLocked(uint64_t len) {
+    for (unsigned i = 0; i < gNBlFree; i++) {
+        if (gBlFree[i].size < len) continue;
+        const uint64_t v = gBlFree[i].va;
+        if (gBlFree[i].size == len) gBlFree[i] = gBlFree[--gNBlFree];
+        else { gBlFree[i].va += len; gBlFree[i].size -= len; }
+        return v;
+    }
+    if (len > NVGSP_BL_VA_END - gBlVa) return 0;
+    const uint64_t v = gBlVa;
+    gBlVa += len;
+    return v;
+}
+static void kindVaGiveLocked(uint64_t va, uint64_t len) {
+    for (unsigned i = 0; i < gNBlFree; i++) {
+        if (gBlFree[i].va + gBlFree[i].size == va) {
+            va = gBlFree[i].va; len += gBlFree[i].size;
+            gBlFree[i] = gBlFree[--gNBlFree]; i = (unsigned)-1;
+        } else if (va + len == gBlFree[i].va) {
+            len += gBlFree[i].size;
+            gBlFree[i] = gBlFree[--gNBlFree]; i = (unsigned)-1;
+        }
+    }
+    if (va + len == gBlVa) gBlVa = va;
+    else if (gNBlFree < 2048) gBlFree[gNBlFree++] = (NVRange){va, len};
+}
 
 bool nvVramAllocKind(uint64_t bytes, uint32_t kind, uint64_t *va, uint32_t *handle) {
-    if (!bytes || !nvGspEnsure()) return false;
+    NV_GPU_LOCKED;
+    if (!bytes || bytes > NVGSP_BL_VA_END - NVGSP_BL_VA_BASE || !nvGspValidate()) return false;
     const uint64_t len = (bytes + 0x1fffff) & ~0x1fffffULL;
+    os_unfair_lock_lock(&gHeapLock);
+    // Every successful allocation must be tracked for free and recovery.
+    const uint64_t v = gNKObj < 1024 ? kindVaTakeLocked(len) : 0;
+    os_unfair_lock_unlock(&gHeapLock);
+    if (!v) return false;
+    const io_connect_t c = gConn;
     uint64_t in[2] = {len, 0}, out[2] = {0, 0};
     uint32_t outN = 2;
-    if (!callMethod(kSelMemAlloc, in, 2, out, &outN, NULL, 0) || !out[0]) return false;
-    os_unfair_lock_lock(&gHeapLock);
-    const uint64_t v = gBlVa;
-    const bool room = v + len <= NVGSP_BL_VA_END;
-    if (room) gBlVa += len;
-    os_unfair_lock_unlock(&gHeapLock);
+    bool ok = callOn(c, kSelMemAlloc, in, 2, out, &outN, NULL, 0) == KERN_SUCCESS && out[0];
     uint64_t b[3] = {out[0], v, kind & 0xff};
-    if (!room || !callMethod(kSelVaBindObj, b, 3, NULL, NULL, NULL, 0)) {
+    if (ok) ok = callOn(c, kSelVaBindObj, b, 3, NULL, NULL, NULL, 0) == KERN_SUCCESS;
+    if (!ok) {
         uint64_t h = out[0];
-        callMethod(kSelMemFree, &h, 1, NULL, NULL, NULL, 0);
+        const kern_return_t kr = h ? callOn(c, kSelMemFree, &h, 1, NULL, NULL, NULL, 0) : KERN_SUCCESS;
+        if (kr == KERN_SUCCESS || kr == kIOReturnOffline) {
+            os_unfair_lock_lock(&gHeapLock); kindVaGiveLocked(v, len); os_unfair_lock_unlock(&gHeapLock);
+        }
         return false;
     }
-    *va = v;
-    *handle = (uint32_t)out[0];
+    // Caller-visible IDs survive reset; they are never raw kext handles.
+    static uint32_t nextId = 0x40000000u;
     os_unfair_lock_lock(&gHeapLock);
-    if (gNKObj < 1024) gKObj[gNKObj++] = (NVKindObj){v, len, kind, (uint32_t)out[0], (uint32_t)out[0]};
+    const uint32_t id = ++nextId ? nextId : ++nextId;
+    gKObj[gNKObj++] = (NVKindObj){v, len, kind, (uint32_t)out[0], id};
     os_unfair_lock_unlock(&gHeapLock);
+    *va = v; *handle = id;
     return true;
 }
 
-// callers keep the handle they got first (id); after a reset the kext
-// object behind it is a new one
 void nvVramFreeKind(uint32_t handle) {
     if (!handle) return;
-    uint64_t h = handle;
+    // Do not take the encoding mutex in a completion handler. Holding the
+    // heap lock across the pure free prevents recovery swapping namespaces.
     os_unfair_lock_lock(&gHeapLock);
-    for (unsigned i = 0; i < gNKObj; i++)
-        if (gKObj[i].id == handle) { h = gKObj[i].handle; gKObj[i] = gKObj[--gNKObj]; break; }
+    for (unsigned i = 0; i < gNKObj; i++) {
+        if (gKObj[i].id != handle) continue;
+        const NVKindObj u = gKObj[i];
+        uint64_t h = u.handle;
+        const kern_return_t kr = callOn(gConn, kSelMemFree, &h, 1, NULL, NULL, NULL, 0);
+        gKObj[i] = gKObj[--gNKObj];
+        if (kr == KERN_SUCCESS || kr == kIOReturnOffline) kindVaGiveLocked(u.va, u.size);
+        break;
+    }
     os_unfair_lock_unlock(&gHeapLock);
-    callMethod(kSelMemFree, &h, 1, NULL, NULL, NULL, 0);   // unbinds too; the VA is not reused
 }
 
-// is a VRAM-range VA inside a live allocation (fault dumps)
+// 0.8.12: is a VRAM-range VA inside a live allocation (fault dumps)
 static const char *nvVramState(uint64_t p) {
     const char *r = "not in any VRAM chunk or surface";
     os_unfair_lock_lock(&gHeapLock);
@@ -463,7 +628,7 @@ out:
     return r;
 }
 
-// any VA of ours: heap buffer, VRAM, block-linear, or nothing
+// 0.8.13: any VA of ours: heap buffer, VRAM, block-linear, or nothing
 const char *nvVaState(uint64_t p) {
     if (p >= NVGSP_USER_VA_BASE && p < NVGSP_USER_VA_END) {
         bool live = false;
@@ -478,11 +643,17 @@ const char *nvVaState(uint64_t p) {
 
 static void nvSlabsReleaseAll(void);
 static bool nvGspRecover(io_connect_t dead) {
+    // Allocation callers may hold gHeapLock. Never block on gGpuMtx from
+    // there: an encoder can hold it while looking up a heap VA. Defer that
+    // caller's recovery if encoding is in progress on another thread.
+    pthread_once(&gGpuOnce, gpuMtxInit);
+    if (pthread_mutex_trylock(&gGpuMtx) != 0) return false;
+    int recoverLk __attribute__((cleanup(gpuUnlockAtExit), unused)) = 0;
     static os_unfair_lock rl = OS_UNFAIR_LOCK_INIT;
     static uint32_t n;
     os_unfair_lock_lock(&rl);
     if (gConn != dead) { os_unfair_lock_unlock(&rl); return true; }   // another thread did it
-    // a GPU that stays down must not turn every call into a reopen
+    // 0.8.13: a GPU that stays down must not turn every call into a reopen
     // attempt (a Vision client spun through 2180 of them in 6 minutes):
     // back off 100 ms, doubling to 5 s, and fail fast in between
     static uint64_t nextTry;
@@ -493,6 +664,7 @@ static bool nvGspRecover(io_connect_t dead) {
     uint32_t sh = 0;
     uint8_t *scpu = NULL;
     bool ok = c && nvGspStaging(c, &sh, &scpu);
+    if (ok) nvGspOwnChannel(c);
     unsigned nb = 0, nv = 0, nk = 0;
     // the caller may hold the heap lock (vramGrow under nvVramAlloc): then
     // this call fails and the next one recovers
@@ -501,52 +673,75 @@ static bool nvGspRecover(io_connect_t dead) {
         os_unfair_lock_unlock(&rl);
         return false;
     }
+    // Commit new handles only after every rebind succeeds. A failed late
+    // bind used to leave a mixture of old/new client handle namespaces,
+    // so a resource freed before the next retry could free the wrong object.
+    const unsigned total = gNBufs + gNVChunk + gNKObj;
+    uint32_t *handles = calloc(total ? total : 1, sizeof(uint32_t));
+    if (!handles) ok = false;
     for (unsigned i = 0; ok && i < gNBufs; i++) {          // process pages: bind them again
         NVUserBuf *u = &gBufs[i];
         if (u->handle & 0x80000000u) continue;              // NVMTL_HEAP=2 objects are not kept
-        uint64_t in[4] = {(uint64_t)(uintptr_t)u->cpu, u->size, u->va, 0}, out[1] = {0};
+        uint64_t in[4] = {(uint64_t)(uintptr_t)u->cpu, u->size, u->va, u->bindFlags}, out[1] = {0};
         uint32_t outN = 1;
         if (callOn(c, kSelUserMemBind, in, 4, out, &outN, NULL, 0) || !out[0]) { ok = false; break; }
-        u->handle = (uint32_t)out[0] | (u->handle & 0x40000000u);
+        handles[i] = (uint32_t)out[0] | (u->handle & 0x40000000u);
         nb++;
     }
-    for (unsigned i = 0; ok && i < gNVChunk; i++) {        // VRAM: new memory, same VA
+    unsigned adopted = 0;
+    for (unsigned i = 0; ok && i < gNVChunk; i++) {        // VRAM: same memory if the kext kept it, same VA
         uint64_t in[2] = {gVChunk[i].size, 0}, out[2] = {0, 0};
         uint32_t outN = 2;
-        if (callOn(c, kSelMemAlloc, in, 2, out, &outN, NULL, 0) || !out[0]) { ok = false; break; }
+        // 0.8.52: take the old object over (kext 0.177: its contents were saved and put back)
+        uint64_t ah[1] = {gVChunk[i].handle};
+        if (!callOn(c, kSelMemAdopt, ah, 1, out, &outN, NULL, 0) && out[0]) adopted++;
+        else if ((outN = 2, out[0] = 0, callOn(c, kSelMemAlloc, in, 2, out, &outN, NULL, 0)) || !out[0]) { ok = false; break; }
         uint64_t b[3] = {out[0], gVChunk[i].va, 0};
         if (callOn(c, kSelVaBindObj, b, 3, NULL, NULL, NULL, 0)) { ok = false; break; }
-        gVChunk[i].handle = (uint32_t)out[0];
+        handles[gNBufs + i] = (uint32_t)out[0];
         nv++;
     }
     for (unsigned i = 0; ok && i < gNKObj; i++) {
         uint64_t in[2] = {gKObj[i].size, 0}, out[2] = {0, 0};
         uint32_t outN = 2;
-        if (callOn(c, kSelMemAlloc, in, 2, out, &outN, NULL, 0) || !out[0]) { ok = false; break; }
+        uint64_t ah[1] = {gKObj[i].handle};
+        if (!callOn(c, kSelMemAdopt, ah, 1, out, &outN, NULL, 0) && out[0]) adopted++;
+        else if ((outN = 2, out[0] = 0, callOn(c, kSelMemAlloc, in, 2, out, &outN, NULL, 0)) || !out[0]) { ok = false; break; }
         uint64_t b[3] = {out[0], gKObj[i].va, gKObj[i].kind & 0xff};
         if (callOn(c, kSelVaBindObj, b, 3, NULL, NULL, NULL, 0)) { ok = false; break; }
-        gKObj[i].handle = (uint32_t)out[0];
+        handles[gNBufs + gNVChunk + i] = (uint32_t)out[0];
         nk++;
     }
     if (ok) {
+        for (unsigned i = 0; i < gNBufs; i++)
+            if (!(gBufs[i].handle & 0x80000000u)) gBufs[i].handle = handles[i];
+        for (unsigned i = 0; i < gNVChunk; i++) gVChunk[i].handle = handles[gNBufs + i];
+        for (unsigned i = 0; i < gNKObj; i++) gKObj[i].handle = handles[gNBufs + gNVChunk + i];
         gConn = c; gHandle = sh; gCpu = scpu;
+        gRecoverySerial++;
         IOServiceClose(dead);                               // the old client's objects go
     }
+    free(handles);
     os_unfair_lock_unlock(&gHeapLock);
     if (!ok && c) IOServiceClose(c);
     ++n;
     if (ok || fails < 5 || !(fails % 100))
-        NSLog(@"NVMTLGsp: GPU reset: %s (recovery %u: %u buffers, %u VRAM chunks, %u surfaces; VRAM contents are gone)",
-              ok ? "reopened" : "could not reopen", n, nb, nv, nk);
-    if (ok) { fails = 0; nextTry = 0; }
+        NSLog(@"NVMTLGsp: GPU reset: %s (recovery %u: %u buffers, %u VRAM chunks, %u surfaces, %u kept with contents)",
+              ok ? "reopened" : "could not reopen", n, nb, nv, nk, adopted);
+    if (ok) { fails = 0; nextTry = 0; gPostResetLog = 20; }
+    // 0.8.29: VRAM contents are gone, so the command buffer that saw the
+    // reset reports an error. WindowServer then flushes its display space
+    // ("to aid GPU restart recovery") and redraws layers it kept in VRAM;
+    // with 0.8.28 nothing failed and the lock-screen clock stayed black.
+    if (ok) nvNoteGpuFailure(1);
     else {
         mach_timebase_info_data_t tb; mach_timebase_info(&tb);
         const uint64_t ms = fails < 6 ? 100ull << fails : 5000;
         nextTry = mach_absolute_time() + ms * 1000000ull * tb.denom / tb.numer;
         fails++;
     }
-    nvExplainFault();
-    // command buffers out with the old connection never complete
+    nvExplainFault();   // 0.8.5
+    // 0.8.6: command buffers out with the old connection never complete
     // through it; their slabs are ours again (NVAccelerator completes them)
     nvSlabsReleaseAll();
     os_unfair_lock_unlock(&rl);
@@ -574,15 +769,20 @@ bool nvVramAlloc(uint64_t bytes, uint64_t *va) {
 }
 
 void nvVramFree(uint64_t va, uint64_t bytes) {
-    const uint64_t len = (bytes + 0xffff) & ~0xffffULL;
+    uint64_t len = (bytes + 0xffff) & ~0xffffULL;
     os_unfair_lock_lock(&gHeapLock);
-    // merge with a neighbour when possible, else append
-    bool merged = false;
-    for (unsigned i = 0; i < gNVFree && !merged; i++) {
-        if (gVFree[i].va + gVFree[i].size == va) { gVFree[i].size += len; merged = true; }
-        else if (va + len == gVFree[i].va) { gVFree[i].va = va; gVFree[i].size += len; merged = true; }
+    // 0.8.38: a freed bridge must absorb BOTH neighbours. Merging only
+    // once left a fully freed 64 MiB chunk split into two unusable spans.
+    for (unsigned i = 0; i < gNVFree; i++) {
+        if (gVFree[i].va + gVFree[i].size == va) {
+            va = gVFree[i].va; len += gVFree[i].size;
+            gVFree[i] = gVFree[--gNVFree]; i = (unsigned)-1;
+        } else if (va + len == gVFree[i].va) {
+            len += gVFree[i].size;
+            gVFree[i] = gVFree[--gNVFree]; i = (unsigned)-1;
+        }
     }
-    if (!merged && gNVFree < 2048) gVFree[gNVFree++] = (NVRange){va, len};
+    if (gNVFree < 2048) gVFree[gNVFree++] = (NVRange){va, len};
     os_unfair_lock_unlock(&gHeapLock);
 }
 
@@ -594,18 +794,18 @@ uint64_t nvStageVa(void) { return gVa; }
 // Submit w words from the push area on the CE and wait for them.
 static bool ceSubmit(uint32_t w) {
     nvGrFlush();                                   // queued launches first, in order
-    nvNativeDrain();                               // and native GR work (other ring)
+    nvNativeDrain();                               // 0.8.0: and native GR work (other ring)
     struct { uint64_t va; uint32_t dw; uint32_t pad; } seg = {gVa + NVGSP_STAGE_PUSH, w, 0};
     uint64_t in[1] = {1}; // engine 1 = CE
     uint64_t out[1] = {0};
     uint32_t outN = 1;
     if (!callMethod(kSelExecSeg, in, 1, out, &outN, &seg, sizeof(seg)) || !out[0]) {
-        NSLog(@"NVMTLGsp: execSegments failed"); return false;
+        NSLog(@"NVMTLGsp: execSegments failed"); nvNoteGpuFailure(1); return false;
     }
-    uint64_t wi[2] = {out[0], 2000000}, wo[1] = {0};
+    uint64_t wi[2] = {out[0], nvFenceUs()}, wo[1] = {0};
     outN = 1;
     if (!callMethod(kSelCeWait, wi, 2, wo, &outN, NULL, 0)) {
-        NSLog(@"NVMTLGsp: ceFenceWait failed"); return false;
+        NSLog(@"NVMTLGsp: ceFenceWait failed"); nvNoteGpuFailure(2); return false;
     }
     return true;
 }
@@ -724,7 +924,7 @@ static bool slmEnsure(uint32_t perLane) {
     uint64_t warp = ((uint64_t)((perLane + 15) & ~15u) * 32 + 0x1ff) & ~0x1ffULL;
     if (warp <= gSlmPerWarp) return true;
     nvGrFlush();                                    // queued launches still use the old area
-    nvNativeDrain();                                // and command buffers still out with it
+    nvNativeDrain();                                // 0.8.7: and command buffers still out with it
     if (warp < 0x2000) warp = 0x2000;               // 256 B per lane at least, fewer regrows
     const uint64_t tpc = (warp * 48 * 2 + 0x7fff) & ~0x7fffULL;
     const uint64_t size = (tpc * NVSLM_TPCS + 0x1ffff) & ~0x1ffffULL;
@@ -776,11 +976,11 @@ static void qmdShared(uint32_t *qs, uint32_t smem, const uint32_t *block, uint32
     qset(qs, 759, 736, (slm + 15) & ~15u);                  /* SHADER_LOCAL_MEMORY_LOW_SIZE */
 }
 
-// / 0.8.12: what a stage's constant buffer pointers point at. A
+// 0.8.9 / 0.8.12: what a stage's constant buffer pointers point at. A
 // launch that never ends or faults reads through one of these; print the
 // first words of every user-arena pointer that lands in a live buffer, and
 // say which do not (a freed or never-bound VA is the MMU fault).
-static char gLastLabel[128];                     // the launch now being built
+static char gLastLabel[128];                     // 0.8.12: the launch now being built
 static char gLastTex[480];
 void nvGrNoteTextures(const char *what) { snprintf(gLastTex, sizeof gLastTex, "%s", what); }
 static const char *nvVramState(uint64_t p);
@@ -813,20 +1013,33 @@ static void nvDumpPointers(const char *stage, const uint32_t *push, uint32_t pus
     }
 }
 
+static bool grQueue(bool force, const uint32_t *code, uint32_t codeWords, uint32_t regs, uint32_t slm,
+                    uint32_t smem, uint32_t barriers, const uint32_t *push, uint32_t npush,
+                    const uint32_t grid[3], const uint32_t block[3]);
+// 0.8.14: why the last nvGrLaunch / nvGrQueue said no (for the caller's log)
+const char *nvGrWhy = "";
+
 bool nvGrLaunch(const uint32_t *code, uint32_t codeWords, uint32_t regs, uint32_t slm,
                 uint32_t smem, uint32_t barriers,
                 const uint32_t *push, uint32_t npush,
                 const uint32_t grid[3], const uint32_t block[3]) {
     NV_GPU_LOCKED;
     nvGrFlush();
-    if (!gCpu || !codeWords || codeWords * 4 + 1024 > 0x10000) return false;
-    if (!grid[0] || !block[0] || !slmEnsure(slm)) return false;
+    if (!gCpu) { nvGrWhy = "no GPU mapping"; return false; }
+    if (!codeWords) { nvGrWhy = "no code"; return false; }
+    // 0.8.14: kernels over the 63 KiB code slot (Vision/Espresso
+    // cnnConvArray_32x32_128 is 114 KiB) go through the batch area as a
+    // one-launch batch, flushed (and waited on) here
+    if (codeWords * 4 + 1024 > 0x10000)
+        return grQueue(true, code, codeWords, regs, slm, smem, barriers, push, npush, grid, block) && nvGrFlush();
+    if (!grid[0] || !block[0]) { nvGrWhy = "empty grid"; return false; }
+    if (!slmEnsure(slm)) { nvGrWhy = "scratch (slm) allocation"; return false; }
     // Code (+1 KiB zero pad, as nvrun), cbuf, QMD.
     uint8_t *cd = gCpu + NVGSP_GR_CODE;
     memcpy(cd, code, codeWords * 4);
     memset(cd + codeWords * 4, 0, 1024);
     uint32_t cb[256] = {0};
-    if (npush > 256) return false;
+    if (npush > 256) { nvGrWhy = "push block over 1 KiB"; return false; }
     memcpy(cb, push, npush * 4);
     uint32_t cbw = (npush + 3) & ~3u;
     if (cbw < 4) cbw = 4;
@@ -872,15 +1085,15 @@ bool nvGrLaunch(const uint32_t *code, uint32_t codeWords, uint32_t regs, uint32_
     uint32_t outN = 1;
     const uint64_t ta = mach_absolute_time();
     if (!callMethod(kSelExecSeg, in, 1, out, &outN, &seg, sizeof(seg)) || !out[0]) {
-        NSLog(@"NVMTLGsp: GR execSegments failed"); return false;
+        NSLog(@"NVMTLGsp: GR execSegments failed"); nvNoteGpuFailure(1); return false;
     }
     const uint64_t tb0 = mach_absolute_time();
-    uint64_t wi[2] = {out[0], 2000000}, wo[1] = {0};
+    uint64_t wi[2] = {out[0], nvFenceUs()}, wo[1] = {0};
     outN = 1;
     if (IOConnectCallMethod(gConn, 18, wi, 2, NULL, 0, wo, &outN, NULL, NULL)) {
-        NSLog(@"NVMTLGsp: GR fenceWait failed");
+        NSLog(@"NVMTLGsp: GR fenceWait failed"); nvNoteGpuFailure(2);
         static uint32_t dumps;
-        if (dumps++ < 4) {   // name the launch that never finished
+        if (dumps++ < 4) {   // 0.8.12: name the launch that never finished
             NSLog(@"NVMTLGsp: faulting launch %s: grid %ux%ux%u block %ux%ux%u, %u regs, slm %u, smem %u, %u push words",
                   gLastLabel, grid[0], grid[1], grid[2], block[0], block[1], block[2], regs, slm, smem, npush);
             NSLog(@"NVMTLGsp:   cs textures:%s", gLastTex);
@@ -897,7 +1110,7 @@ bool nvGrLaunch(const uint32_t *code, uint32_t codeWords, uint32_t regs, uint32_
     return true;
 }
 
-// batched compute. Every nvGrLaunch is a kernel round trip
+// 0.6.13: batched compute. Every nvGrLaunch is a kernel round trip
 // (execSegments + fence wait, ~30 us each, 13 us of it the submit alone),
 // so a command buffer of 1000 small dispatches took 30 ms. Between
 // nvGrBatchBegin/End, nvGrQueue appends the launch to one method stream in
@@ -906,24 +1119,38 @@ bool nvGrLaunch(const uint32_t *code, uint32_t codeWords, uint32_t regs, uint32_
 // order is kept with WAIT_FOR_IDLE + shader cache invalidates between
 // launches. Anything that submits on its own, or reads memory on the CPU,
 // flushes first.
-// the batch goes to one of two places. The shared area at 2 MiB
+// 0.8.0: the batch goes to one of two places. The shared area at 2 MiB
 // (4 MiB, 512 KiB of methods) for batches we submit and wait for; or a
 // native slab at 6 MiB + 2 MiB * n (256 KiB of methods) that belongs to a
-// command buffer until the family completes it (asynchronous commit).
+// command buffer until the family completes it (N2, asynchronous commit).
 #define NVB_SLABS 8
 #define NVB_SLAB_BYTES (2u << 20)
 static uint32_t NVB_BYTES = 4u << 20, NVB_PUSH_MAX = 512u << 10;
 static int gBSlab = -1;                            // slab the open batch lives in, -1 shared area
 static bool nvNativeDrainShared;                    // the shared area is out with a command buffer
 static uint32_t gSlabBusy;                          // bit n: slab n owned by a command buffer
+static uint64_t gSlabLease[NVB_SLABS + 1];          // protected by gSlabMtx
 static pthread_mutex_t gSlabMtx = PTHREAD_MUTEX_INITIALIZER;   // never the GPU lock: completion
 static pthread_cond_t gSlabCond = PTHREAD_COND_INITIALIZER;    // handlers take only this one
-// what each command buffer that owns a slab carries, so a stuck one
+// 0.8.7: what each command buffer that owns a slab carries, so a stuck one
 // can be named: launch labels (kernel / draw shaders), stream VA and size
 static char gSlabLabels[NVB_SLABS + 1][512];
 static uint64_t gSlabVa[NVB_SLABS + 1];
 static uint32_t gSlabWords[NVB_SLABS + 1];
 static char gBLabels[512];                       // the open batch
+// 0.8.27: the first submissions after a GPU reset recovery, by label, to
+// find what faults right after it (1 Oct: WindowServer at VA 0, every reset)
+static void nvPostResetNote(const char *path, uint32_t n, uint32_t words, uint64_t va) {
+    static int fromFile = -1;                     // /Library/Preferences/nvmtl-submitlog: the first 200 too
+    if (fromFile < 0) {
+        fromFile = access("/Library/Preferences/nvmtl-submitlog", F_OK) == 0;
+        if (fromFile) gPostResetLog += 200;
+    }
+    if (!gPostResetLog) return;
+    gPostResetLog--;
+    NSLog(@"NVMTLGsp: after reset, %s submit: %u launches, %u words at 0x%llx: %s", path, n, words,
+          (unsigned long long)va, gBLabels[0] ? gBLabels : "(no label)");
+}
 void nvGrLabel(const char *what) {
     snprintf(gLastLabel, sizeof gLastLabel, "%s", what);
     const size_t n = strlen(gBLabels);
@@ -931,6 +1158,7 @@ void nvGrLabel(const char *what) {
 }
 static void nvSlabsReleaseAll(void) {
     pthread_mutex_lock(&gSlabMtx);
+    for (int i = 0; i <= NVB_SLABS; i++) gSlabLease[i]++;
     gSlabBusy = 0;
     pthread_cond_broadcast(&gSlabCond);
     pthread_mutex_unlock(&gSlabMtx);
@@ -944,10 +1172,11 @@ static void nvSlabsReleaseAll(void) {
 static uint32_t gBPush, gBData, gBN, gBDepth;
 static struct { const void *code; uint32_t words; uint64_t va; } gBCode[32];
 static uint32_t gBNCode;
+static bool gBComputeSeen;   // 0.8.69: compute class + windows set in this batch
 
 void nvGrBatchBegin(void) { nvGpuLock(); gBDepth++; }
 
-// the native path (N1/N2) is on by default when the accelerator
+// 0.8.1: the native path (N1/N2) is on by default when the accelerator
 // runs it (NVAccelerator-native in the registry). Off with NVMTL_NATIVE=0,
 // or for every process (WindowServer too) with the file
 // /Library/Preferences/nvmtl-native-off.
@@ -969,7 +1198,7 @@ bool nvNativeEnabled(void) {
     return on;
 }
 
-// wait until every command buffer that owns a slab has
+// 0.8.0 (native N2): wait until every command buffer that owns a slab has
 // completed. Anything that reaches the GPU another way (copy engine) or
 // reads memory on the CPU calls this first; GR work is ordered by its ring.
 void nvNativeDrain(void) {
@@ -992,10 +1221,18 @@ void nvNativeDrain(void) {
     pthread_mutex_unlock(&gSlabMtx);
 }
 void nvGrSync(void) { nvGrFlush(); nvNativeDrain(); }
-// batching is opt-in (NVMTL_BATCH=1) or comes with the native path
+// 0.6.16: batching was opt-in (a mediaanalysisd GPU reset at login, 28 Sep).
+// 0.8.21: on by default: a command buffer's dispatches go out as one
+// submission instead of a submit + fence wait each (25 -> 7 us a dispatch,
+// metal_overhead_bench); suite and Core Image match with it. NVMTL_BATCH=0
+// turns it off. Draws still batch only with NVMTL_DRAWBATCH=1 (below).
 bool nvBatchOn(void) {
     static int on = -1;
-    if (on < 0) on = getenv("NVMTL_BATCH") != NULL || nvNativeEnabled();
+    if (on < 0) {
+        const char *e = getenv("NVMTL_BATCH");
+        on = e ? atoi(e) != 0 : 1;
+        if (nvNativeEnabled()) on = 1;
+    }
     return on;
 }
 
@@ -1023,44 +1260,62 @@ void nvGrBatchEndNative(void) {
     if (gBDepth) gBDepth--;
     nvGpuUnlock();
 }
-// end a batch whose launches went to the family (nvGrFlushNative);
+// 0.7.0: end a batch whose launches went to the family (nvGrFlushNative);
 // the GPU lock stays held until nvGrNativeDone + nvGpuUnlock
 void nvGrBatchEnd(void) {
     if (gBDepth && !--gBDepth) { nvGrFlush(); if (gBSlab >= 0) batchToSharedArea(); }
     nvGpuUnlock();
 }
 
-// hand the queued launches to the family instead of
+// 0.7.0 (native N1 test): hand the queued launches to the family instead of
 // submitting them ourselves. One vendor kernel command (type 0x10000, as
 // AppleParavirtCommandQueue's ExecIndirect) goes into the command buffer's
 // segment; NVAccelerator's queue submits it with a stamp and the family
 // completes the command buffer when the GPU releases that stamp. Returns
 // false (nothing written) when there is nothing queued or no room, and the
 // caller flushes the old way.
-// + the tag of our NVGP client (selector 'NVT'), so the kernel runs
+// 0.8.2: + the tag of our NVGP client (selector 'NVT'), so the kernel runs
 // it in this connection's VA arena even when the process has several
 typedef struct { uint32_t type, size, engine, n, tag, reserved; uint64_t va; uint32_t dwords, flags; } NVExecKCmd;
 static uint32_t connTag(void) {
-    static io_connect_t forConn;
-    static uint32_t tag;
-    if (forConn != gConn) {
-        uint64_t out[1] = {0};
-        uint32_t n = 1;
-        tag = IOConnectCallScalarMethod(gConn, 0x4E5654, NULL, 0, out, &n) == KERN_SUCCESS ? (uint32_t)out[0] : 0;
-        forConn = gConn;
-        if (!tag) NSLog(@"NVMTLGsp: no client tag, native submission off for this connection");
-    }
-    return tag;
+    uint64_t out[1] = {0};
+    uint32_t n = 1;
+    // Do not reopen here: commands have already been encoded in the old
+    // staging mapping. Fail this buffer; the next commit's preflight reopens.
+    const kern_return_t kr = callOn(gConn, 0x4E5654, NULL, 0, out, &n, NULL, 0);
+    if (kr != KERN_SUCCESS) nvNoteGpuFailure(1);
+    return kr == KERN_SUCCESS ? (uint32_t)out[0] : 0;
 }
+// 0.8.22: batched draws of one render pass run back to back; the ROP flush
+// and wait-for-idle come once, when the pass is left (next pass, a compute
+// launch, or the end of the batch), not after every draw.
+static uint32_t gB3DPass;
+static bool gB3DDirty;
+static uint32_t nv3DFlushWords(uint32_t *pb, uint32_t c) {
+    const uint64_t sva = gVa + NVGSP_GR_SEM;
+    static uint32_t seq;
+    pb[c++] = 0x20000000u | (4u << 16) | (0u << 13) | (0x1b00u >> 2);   // SEMAPHORE_A..D, subch 0 (3D)
+    pb[c++] = (uint32_t)(sva >> 32); pb[c++] = (uint32_t)sva; pb[c++] = ++seq;
+    pb[c++] = (1u << 4) | (15u << 12) | (1u << 28);                     // RELEASE after writes, ALL, ONE_WORD (flushes)
+    pb[c++] = (0x4u << 29) | (0u << 13) | (0x110u >> 2);                // IMMD WAIT_FOR_IDLE
+    gB3DDirty = false;
+    return c;
+}
+
 bool nvGrFlushNative(id cb) {
     NV_GPU_LOCKED;
     if (!gBN) return false;
+    if (gB3DDirty) gBPush = nv3DFlushWords((uint32_t *)gBCpu, gBPush);   // 0.8.22
     // The family only runs kernel commands inside a segment
     // (IOAccelCommandQueue::processCommandBuffer walks the segment list):
     // MTLIOAccelCommandBufferStorageBeginSegment takes the kernel command
     // pointer the segment starts at, EndSegment closes it at the current one.
     const uint32_t tag = connTag();
-    if (!tag) return false;
+    if (!tag) {
+        gBPush = gBData = gBN = gBNCode = 0; gBComputeSeen = false;
+        gBLabels[0] = 0;
+        return false;  // no fallback replay of old-generation staging
+    }
     SEL sel = NSSelectorFromString(@"_reserveKernelCommandBufferSpace:");
     SEL get = NSSelectorFromString(@"getCurrentKernelCommandBufferPointer:end:");
     SEL beg = NSSelectorFromString(@"beginSegment:"), end = NSSelectorFromString(@"endCurrentSegment");
@@ -1082,25 +1337,31 @@ bool nvGrFlushNative(id cb) {
     static int trace = -1;
     if (trace < 0) trace = getenv("NVMTL_TRACE") != NULL;
     if (trace) NSLog(@"NVMTL_TRACE native: %u launches, %u words in kernel command %p, slab %d", gBN, gBPush, k, gBSlab);
-    // the slab (or, with every slab busy, the shared area) now
+    nvPostResetNote("native", gBN, gBPush, gBVa);
+    // 0.8.0: the slab (or, with every slab busy, the shared area) now
     // belongs to this command buffer until the family completes it
     const uint32_t bit = gBSlab >= 0 ? 1u << gBSlab : 1u << 31;
+    const int si = gBSlab >= 0 ? gBSlab : NVB_SLABS;
     {
-        const int si = gBSlab >= 0 ? gBSlab : NVB_SLABS;
         snprintf(gSlabLabels[si], sizeof gSlabLabels[si], "%s", gBLabels);
         gSlabVa[si] = gBVa; gSlabWords[si] = gBPush;
     }
     pthread_mutex_lock(&gSlabMtx);
+    const uint64_t lease = ++gSlabLease[si];
     gSlabBusy |= bit;
     pthread_mutex_unlock(&gSlabMtx);
     [(id<MTLCommandBuffer>)cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
         (void)c;
         pthread_mutex_lock(&gSlabMtx);
-        gSlabBusy &= ~bit;
-        pthread_cond_broadcast(&gSlabCond);
+        // An old connection's callback can arrive after reset reopened and
+        // reused this slab. Only the current owner may make it reusable.
+        if (gSlabLease[si] == lease) {
+            gSlabBusy &= ~bit;
+            pthread_cond_broadcast(&gSlabCond);
+        }
         pthread_mutex_unlock(&gSlabMtx);
     }];
-    gBPush = gBData = gBN = gBNCode = 0;
+    gBPush = gBData = gBN = gBNCode = 0; gBComputeSeen = false;
     gBLabels[0] = 0;
     if (gBSlab >= 0) batchToSharedArea();
     else nvNativeDrainShared = true;
@@ -1112,21 +1373,23 @@ bool nvGrFlushNative(id cb) {
 bool nvGrFlush(void) {
     if (!gBN) return true;
     NV_GPU_LOCKED;
+    if (gB3DDirty) gBPush = nv3DFlushWords((uint32_t *)gBCpu, gBPush);
     const uint32_t words = gBPush, n = gBN;
-    gBPush = gBData = gBN = gBNCode = 0;
+    nvPostResetNote("batch", n, words, gBVa);
+    gBPush = gBData = gBN = gBNCode = 0; gBComputeSeen = false;
     gBLabels[0] = 0;          // the area is free again whatever happens
     struct { uint64_t va; uint32_t dw; uint32_t pad; } seg = {gBVa, words, 0};
     uint64_t in[1] = {0}, out[1] = {0};
     uint32_t outN = 1;
     const uint64_t ta = mach_absolute_time();
     if (!callMethod(kSelExecSeg, in, 1, out, &outN, &seg, sizeof(seg)) || !out[0]) {
-        NSLog(@"NVMTLGsp: GR batch of %u launches: execSegments failed", n); return false;
+        NSLog(@"NVMTLGsp: GR batch of %u launches: execSegments failed", n); nvNoteGpuFailure(1); return false;
     }
     const uint64_t tb0 = mach_absolute_time();
-    uint64_t wi[2] = {out[0], 2000000}, wo[1] = {0};
+    uint64_t wi[2] = {out[0], nvFenceUs()}, wo[1] = {0};
     outN = 1;
     if (IOConnectCallMethod(gConn, 18, wi, 2, NULL, 0, wo, &outN, NULL, NULL)) {
-        NSLog(@"NVMTLGsp: GR batch of %u launches: fenceWait failed", n); return false;
+        NSLog(@"NVMTLGsp: GR batch of %u launches: fenceWait failed", n); nvNoteGpuFailure(2); return false;
     }
     static int trace = -1;
     if (trace < 0) trace = getenv("NVMTL_TRACE") != NULL;
@@ -1151,15 +1414,29 @@ bool nvGrQueue(const uint32_t *code, uint32_t codeWords, uint32_t regs, uint32_t
                uint32_t smem, uint32_t barriers,
                const uint32_t *push, uint32_t npush,
                const uint32_t grid[3], const uint32_t block[3]) {
+    return grQueue(false, code, codeWords, regs, slm, smem, barriers, push, npush, grid, block);
+}
+
+// force: queue even with batching off (the caller flushes)
+static bool grQueue(bool force, const uint32_t *code, uint32_t codeWords, uint32_t regs, uint32_t slm,
+                    uint32_t smem, uint32_t barriers,
+                    const uint32_t *push, uint32_t npush,
+                    const uint32_t grid[3], const uint32_t block[3]) {
     NV_GPU_LOCKED;
-    const bool on = nvBatchOn();
-    if (gBSlab < 0 && nvNativeDrainShared && !gBN) {   // shared area still owned by a command buffer
+    const bool on = nvBatchOn() || force;
+    if (gBSlab < 0 && nvNativeDrainShared && !gBN) {   // 0.8.0: shared area still owned by a command buffer
         nvNativeDrain(); nvNativeDrainShared = false;
     }
-    if (!gBDepth || !on)
+    if (!force && (!gBDepth || !on))
         return nvGrLaunch(code, codeWords, regs, slm, smem, barriers, push, npush, grid, block);
-    if (!gCpu || !codeWords || codeWords * 4 + 1024 > 0x10000 || npush > 256) return false;
-    if (!grid[0] || !block[0] || !slmEnsure(slm)) return false;   // may flush
+    if (!gCpu) { nvGrWhy = "no GPU mapping"; return false; }
+    // code goes in the batch data area (after the push area), not the 64 KiB slot
+    if (!codeWords || codeWords * 4 + 1024 + 256 + 8192 > NVB_BYTES - NVB_PUSH_MAX) {
+        nvGrWhy = "code larger than the batch area"; return false;
+    }
+    if (npush > 256) { nvGrWhy = "push block over 1 KiB"; return false; }
+    if (!grid[0] || !block[0]) { nvGrWhy = "empty grid"; return false; }
+    if (!slmEnsure(slm)) { nvGrWhy = "scratch (slm) allocation"; return false; }   // may flush
     int ci = -1;
     for (uint32_t i = 0; i < gBNCode; i++)
         if (gBCode[i].code == code && gBCode[i].words == codeWords) { ci = (int)i; break; }
@@ -1178,8 +1455,17 @@ bool nvGrQueue(const uint32_t *code, uint32_t codeWords, uint32_t regs, uint32_t
         pb[c++] = mthd(1, 0x2A0, 2); pb[c++] = 0; pb[c++] = 0xFE000000;
         pb[c++] = mthd(1, 0x7B0, 2); pb[c++] = 0; pb[c++] = 0xFF000000;
     } else {
+        if (gB3DDirty) c = nv3DFlushWords(pb, c);              // 0.8.22: a pass's draws before this launch
         pb[c++] = (0x4u << 29) | (1u << 13) | (0x110u >> 2);   // IMMD WAIT_FOR_IDLE: serial dispatch order
+        // 0.8.69: a batch that started with draws never set the compute
+        // windows; a fresh GR context has them overlapping (SKEDCHECK17)
+        if (!gBComputeSeen) {
+            pb[c++] = mthd(1, 0x0, 1);   pb[c++] = 0xC9C0;
+            pb[c++] = mthd(1, 0x2A0, 2); pb[c++] = 0; pb[c++] = 0xFE000000;
+            pb[c++] = mthd(1, 0x7B0, 2); pb[c++] = 0; pb[c++] = 0xFF000000;
+        }
     }
+    gBComputeSeen = true;
     if (gSlmVa) {
         pb[c++] = mthd(1, 0x790, 2); pb[c++] = (uint32_t)(gSlmVa >> 32); pb[c++] = (uint32_t)gSlmVa;
         pb[c++] = mthd(1, 0x2E4, 3);
@@ -1266,7 +1552,7 @@ bool nvCeFill(uint64_t dstVa, uint64_t bytes, uint32_t value) {
     return true;
 }
 
-// ---------------------------------------------------------------- 3D
+// ---------------------------------------------------------------- 3D (0.5.0)
 // Method offsets: NVIDIA clc997.h (ADA_A), sequences as nvrun's first
 // triangle and NVK's draw macros (BEGIN / SET_VERTEX_ARRAY_START /
 // DRAW_VERTEX_ARRAY / END, instance count on Pascal B+).
@@ -1306,7 +1592,7 @@ static const uint32_t kInit3D[] = {
 0x00000000, 0x00000000, 0x2001036d, 0x00000000, 0x20010673, 0x00000000,
 };
 
-// what a draw that hung or faulted the GPU was made of: the shader
+// 0.6.12: what a draw that hung or faulted the GPU was made of: the shader
 // VAs (match "shader X stage N at" upload lines), targets and the 64-bit
 // words of each stage's cbuf 0 (buffer addresses among them)
 static void nvGr3DDump(const NV3DDraw *d) {
@@ -1325,14 +1611,14 @@ static void nvGr3DDump(const NV3DDraw *d) {
     }
 }
 
-// inside a batch a draw is appended to the batch's method
+// 0.8.4 (native N2): inside a batch a draw is appended to the batch's method
 // stream (cbufs in the batch's data area) like a compute launch, so a
 // command buffer of draws and dispatches is one submission; the family
 // completes it on the native path. Outside a batch it is submitted and
 // waited for as before.
 bool nvGr3DDraw(const NV3DDraw *d) {
     NV_GPU_LOCKED;
-    // draws stay out of the batch unless NVMTL_DRAWBATCH=1 or the file
+    // 0.8.8: draws stay out of the batch unless NVMTL_DRAWBATCH=1 or the file
     // /Library/Preferences/nvmtl-drawbatch: every native login hang (28 Sep,
     // attempts 1-6) was a WindowServer batch of draws, the login blur chain
     // (downsample_blur / narrow_blur passes sampling the previous pass)
@@ -1343,7 +1629,7 @@ bool nvGr3DDraw(const NV3DDraw *d) {
     }
     const bool batched = gBDepth && nvBatchOn() && drawBatch;
     if (!batched) nvGrFlush();
-    if (!gCpu || !d->nrt || d->nrt > 8) return false;
+    if (!gCpu || (!d->nrt && !d->zVa) || d->nrt > 8) return false;   // 0.8.16: depth-only passes
     uint32_t slm = d->vs.slm > d->fs.slm ? d->vs.slm : d->fs.slm;
     if (d->tcs.slm > slm) slm = d->tcs.slm;
     if (d->tes.slm > slm) slm = d->tes.slm;
@@ -1354,7 +1640,14 @@ bool nvGr3DDraw(const NV3DDraw *d) {
     uint32_t *pb = batched ? (uint32_t *)gBCpu + gBPush : (uint32_t *)(gCpu + NVGSP_GR_PUSH), c = 0;
 #define M3(m, n) (0x20000000u | ((uint32_t)(n) << 16) | (0u << 13) | ((m) >> 2))
 #define P1(m, v) do { pb[c++] = M3(m, 1); pb[c++] = (uint32_t)(v); } while (0)
-    if (batched && gBN) pb[c++] = (0x4u << 29) | (0u << 13) | (0x110u >> 2);   // IMMD WAIT_FOR_IDLE after earlier work
+    // 0.8.22: the next draw of the same pass follows without a wait; a new
+    // pass (or compute before it) first flushes the previous pass's ROP writes
+    // 0.8.40: a draw that reads its colour attachments waits for the earlier draws' writes too
+    const bool samePass = batched && gBN && gB3DDirty && d->passId && d->passId == gB3DPass && !d->fbFetch;
+    if (batched && gBN && !samePass) {
+        if (gB3DDirty) c = nv3DFlushWords(pb, c);
+        else pb[c++] = (0x4u << 29) | (0u << 13) | (0x110u >> 2);   // IMMD WAIT_FOR_IDLE after earlier work
+    }
     pb[c++] = M3(0x0, 1); pb[c++] = 0xC997;                              // SET_OBJECT ADA_A, subch 0
     memcpy(pb + c, kInit3D, sizeof kInit3D);
     c += sizeof kInit3D / 4;
@@ -1391,9 +1684,14 @@ bool nvGr3DDraw(const NV3DDraw *d) {
         if (t->w < w) w = t->w;
         if (t->h < h) h = t->h;
     }
+    if (!d->nrt) { w = d->zClipW; h = d->zClipH; }                     // depth-only: the zeta surface's size
     uint32_t sel = d->nrt;                                              // CT_SELECT: count, then target ids
     for (uint32_t i = 0; i < d->nrt; ++i) sel |= i << (4 + 3 * i);
     P1(0x121c, sel);
+    // 0.8.20: layered pass: the vertex stage's [[render_target_array_index]]
+    // picks the slice (SET_RT_LAYER CONTROL = shader selects, as NVK when the
+    // stage writes the layer); otherwise slice 0
+    P1(0x15cc, d->layers > 1 ? 1u << 16 : 0);
     const int zdbg = getenv("NVMTL_ZDBG") ? atoi(getenv("NVMTL_ZDBG")) : 0;
     if (d->zVa && !(zdbg & 1)) {                                        // zeta: block linear
         pb[c++] = M3(0x0fe0, 5);
@@ -1411,10 +1709,11 @@ bool nvGr3DDraw(const NV3DDraw *d) {
         P1(0x1208, 0);                                                  // ZT_SPARSE off (NVK, Maxwell B+)
     } else P1(0x1538, 0);                                               // ZT_SELECT: none
     P1(0x0ff4, w << 16); P1(0x0ff8, h << 16);                           // SURFACE_CLIP
-    // multisampling (NIL sample layouts; one shading pass)
+    // Multisampling: sample_id and per-sample interpolation need one pass
+    // per sample, with centroid evaluated per pass (NVK anti-alias macro).
     P1(0x15d0, d->aaMode);                                              // ANTI_ALIAS samples mode
     P1(0x1534, d->aaMode ? 1 : 0);                                      // ANTI_ALIAS_ENABLE
-    P1(0x0754, 0x1);                                                    // HYBRID_ANTI_ALIAS_CONTROL: 1 pass
+    P1(0x0754, d->sampleShading && d->aaMode ? (1u << d->aaMode) | 0x10u : 1u);
     {
         // standard sample positions (Metal = D3D = Vulkan), 1/16 pixel units,
         // repeated over the 2x2 pixel quad the registers cover (NVK does this)
@@ -1434,8 +1733,15 @@ bool nvGr3DDraw(const NV3DDraw *d) {
         }
     }
     P1(0x13ac, 0);                                                      // WINDOW_ORIGIN upper left
-    // write masks first: a clear writes only the enabled channels
-    for (uint32_t i = 0; i < d->nrt; ++i) P1(0x1a00 + i * 4, d->rt[i].writeMask ? d->rt[i].writeMask : 0x1111);
+    // 0.8.40: the hardware clear honours the colour mask, but a Metal load action clears the whole
+    // attachment whatever the first draw's pipeline masks: cleared targets get all four channels here,
+    // the pipeline's masks after the clears. (RenderBox starts its passes with a stencil-only draw,
+    // mask 0, so its coverage and colour targets were never cleared.)
+    for (uint32_t i = 0; i < d->nrt; ++i) P1(0x1a00 + i * 4, d->rt[i].clear ? 0x1111u : d->rt[i].writeMask);
+    // 0.8.40: kInit3D sets SINGLE_CT_WRITE_CONTROL, which applies COLOR_MASK(0) to every target; with
+    // differing masks (RenderBox: colour 0 off, coverage target green only) each target needs its own,
+    // as NVK does. The clears below use full masks per target, so per-target control from here on.
+    P1(0x0f90, 0);                                                      // SET_SINGLE_CT_WRITE_CONTROL false
     // clears (load action), full surface, before the viewport/scissor apply
     P1(0x0e00, 0);                                                      // SCISSOR_ENABLE(0) off
     if (d->zVa && (d->zClear || d->sClear) && !(zdbg & 3)) {
@@ -1450,8 +1756,15 @@ bool nvGr3DDraw(const NV3DDraw *d) {
         for (int k = 0; k < 4; ++k) pb[c++] = f2u(d->rt[i].clearColor[k]);
         P1(0x0d6c, w << 16);                                            // CLEAR_RECT_HORIZONTAL 0..w
         P1(0x0d70, h << 16);                                            // CLEAR_RECT_VERTICAL 0..h
-        P1(0x19d0, 0x3c | (i << 6));                                    // CLEAR_SURFACE RGBA, target i
+        // 0.8.20: every slice of a layered target (RT_ARRAY_INDEX 25:10)
+        const uint32_t nl = d->layers && !d->rt[i].depthIsZ && d->rt[i].depth > 1 ? d->rt[i].depth : 1;
+        for (uint32_t l = 0; l < nl; ++l)
+            P1(0x19d0, 0x3c | (i << 6) | (l << 10));                    // CLEAR_SURFACE RGBA, target i, slice l
     }
+    // 0.8.15: 0 is MTLColorWriteMaskNone (SpriteKit's shape fill draws its
+    // coverage pass with no colour writes), not "unset": every target gets
+    // its mask from the pipeline (All when there is none)
+    for (uint32_t i = 0; i < d->nrt; ++i) if (d->rt[i].clear) P1(0x1a00 + i * 4, d->rt[i].writeMask);
     // NVMTL_3D_STOP=n cuts the stream after phase n (1 clears, 2 fixed
     // state, 3 programs, 4 vertex fetch) to find a method the class refuses
     const int stop = getenv("NVMTL_3D_STOP") ? atoi(getenv("NVMTL_3D_STOP")) : 99;
@@ -1468,6 +1781,24 @@ bool nvGr3DDraw(const NV3DDraw *d) {
         P1(0x0e00, 1);                                                  // SCISSOR_ENABLE(0)
         P1(0x0e04, (d->sc[0] + d->sc[2]) << 16 | d->sc[0]);             // SCISSOR_HORIZONTAL xmax << 16 | xmin
         P1(0x0e08, (d->sc[1] + d->sc[3]) << 16 | d->sc[1]);
+        // 0.8.20: viewport arrays ([[viewport_array_index]]): viewport and
+        // scissor i at 0x20 / 0x10 strides (NV9097), viewport 0 as above
+        for (uint32_t i = 1; i < d->nvp && i < 16; ++i) {
+            const double *v = d->vps[i];
+            const float vsx = (float)(v[2] / 2), vsy = (float)(-v[3] / 2), vsz = (float)(v[5] - v[4]);
+            const float vox = (float)(v[0] + v[2] / 2), voy = (float)(v[1] + v[3] / 2), voz = (float)v[4];
+            pb[c++] = M3(0xa00 + i * 0x20, 3); pb[c++] = f2u(vsx); pb[c++] = f2u(vsy); pb[c++] = f2u(vsz);
+            pb[c++] = M3(0xa0c + i * 0x20, 3); pb[c++] = f2u(vox); pb[c++] = f2u(voy); pb[c++] = f2u(voz);
+            P1(0x0c00 + i * 16, w << 16); P1(0x0c04 + i * 16, h << 16);
+            P1(0x0c08 + i * 16, f2u(0.0f)); P1(0x0c0c + i * 16, f2u(1.0f));
+            P1(0x0e00 + i * 16, 1);
+            P1(0x0e04 + i * 16, (d->scs[i][0] + d->scs[i][2]) << 16 | d->scs[i][0]);
+            P1(0x0e08 + i * 16, (d->scs[i][1] + d->scs[i][3]) << 16 | d->scs[i][1]);
+        }
+        if (d->nvp > 1) {   // viewport 0 from the array too (setViewports overrides setViewport)
+            P1(0x0e04, (d->scs[0][0] + d->scs[0][2]) << 16 | d->scs[0][0]);
+            P1(0x0e08, (d->scs[0][1] + d->scs[0][3]) << 16 | d->scs[0][1]);
+        }
         // blend + write masks
         for (uint32_t i = 0; i < d->nrt; ++i) {
             const NV3DTarget *t = &d->rt[i];
@@ -1483,7 +1814,7 @@ bool nvGr3DDraw(const NV3DDraw *d) {
         P1(0x12cc, zt && d->zTest ? 1 : 0);                             // DEPTH_TEST
         P1(0x12e8, zt && d->zWrite ? 1 : 0);                            // DEPTH_WRITE
         if (zt && d->zTest) P1(0x130c, d->zFunc);                       // DEPTH_FUNC
-        // stencil, front + two-sided back
+        // 0.5.6: stencil, front + two-sided back
         P1(0x1380, zt && d->sTest ? 1 : 0);                             // STENCIL_TEST
         if (zt && d->sTest) {
             pb[c++] = M3(0x1384, 7);
@@ -1496,6 +1827,7 @@ bool nvGr3DDraw(const NV3DDraw *d) {
             pb[c++] = d->sRef[1]; pb[c++] = d->sWriteMask[1]; pb[c++] = d->sReadMask[1];   // REF, MASK, FUNC_MASK
         }
         // raster
+        P1(0x037c, d->rasterOff ? 0 : 1);                               // SET_RASTER_ENABLE (0.8.16)
         P1(0x1918, d->cull ? 1 : 0);                                    // CULL enable
         if (d->cull) P1(0x1920, d->cull == 1 ? 0x404 : 0x405);          // FRONT / BACK
         P1(0x191c, d->frontCCW ? 0x901 : 0x900);                        // front face CCW / CW
@@ -1557,11 +1889,17 @@ bool nvGr3DDraw(const NV3DDraw *d) {
         if (stop <= 4) goto submit;
         // draw
         P1(0x1434, (uint32_t)d->baseVertex);                            // GLOBAL_BASE_VERTEX_INDEX
+        P1(0x1118, (uint32_t)d->baseVertex);                            // VERTEX_ID_BASE
         P1(0x1438, d->baseInstance);                                    // GLOBAL_BASE_INSTANCE_INDEX
         if (d->indexed) {
             pb[c++] = M3(0x17c8, 2); pb[c++] = (uint32_t)(d->indexVa >> 32); pb[c++] = (uint32_t)d->indexVa;
             pb[c++] = M3(0x0238, 2); pb[c++] = 0; pb[c++] = (uint32_t)d->indexBytes;   // INDEX_BUFFER_SIZE
-            P1(0x1644, 0);                                              // no primitive restart
+            // 0.8.43: Metal always restarts line and triangle strips at the all-ones index (0xffff /
+            // 0xffffffff); RenderBox draws its path hulls as restarted strips, which were joined up
+            // through vertex 65535 into streaks across every glyph
+            const bool strip = d->topology == 3 || d->topology == 5;
+            P1(0x1644, strip ? 1 : 0);                                  // SET_DA_PRIMITIVE_RESTART
+            if (strip) P1(0x1648, d->indexSize == 2 ? 0xffffffffu : d->indexSize == 1 ? 0xffffu : 0xffu);   // _INDEX
             P1(0x17d8, d->indexSize);                                   // INDEX_BUFFER_E: index size
         }
         P1(0x0220, d->instances ? d->instances : 1);                    // SET_INSTANCE_COUNT
@@ -1571,8 +1909,15 @@ bool nvGr3DDraw(const NV3DDraw *d) {
         P1(0x1614, 0);                                                  // END
     }
 submit:
-    // release a semaphore after all writes, with the flush on: ROP
-    // writes still in the colour caches otherwise miss a copy engine readback
+    // 0.5.4: release a semaphore after all writes, with the flush on: ROP
+    // writes still in the colour caches otherwise miss a copy engine readback.
+    // 0.8.22: a batched draw leaves it to the pass end (gB3DDirty)
+    if (batched) {
+        if (c > maxw) { NSLog(@"NVMTLGsp: 3D method stream too long"); return false; }
+        gBPush += c; gBN++;
+        gB3DDirty = true; gB3DPass = d->passId;
+        return true;
+    }
     {
         static uint32_t seq;
         const uint64_t sva = gVa + NVGSP_GR_SEM;
@@ -1593,12 +1938,12 @@ submit:
     uint64_t in[1] = {0}, out[1] = {0};
     uint32_t outN = 1;
     if (!callMethod(kSelExecSeg, in, 1, out, &outN, &seg, sizeof(seg)) || !out[0]) {
-        NSLog(@"NVMTLGsp: 3D execSegments failed"); return false;
+        NSLog(@"NVMTLGsp: 3D execSegments failed"); nvNoteGpuFailure(1); return false;
     }
-    uint64_t wi[2] = {out[0], 2000000}, wo[1] = {0};
+    uint64_t wi[2] = {out[0], nvFenceUs()}, wo[1] = {0};
     outN = 1;
     if (IOConnectCallMethod(gConn, 18, wi, 2, NULL, 0, wo, &outN, NULL, NULL)) {
-        NSLog(@"NVMTLGsp: 3D fenceWait failed"); nvGr3DDump(d); return false;
+        NSLog(@"NVMTLGsp: 3D fenceWait failed"); nvNoteGpuFailure(2); nvGr3DDump(d); return false;
     }
     return true;
 }

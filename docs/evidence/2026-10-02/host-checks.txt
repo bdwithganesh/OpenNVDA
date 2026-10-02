@@ -1,0 +1,51 @@
+nvgsp_cursor_offset: PASS
+nvgsp_cursor_arm: PASS
+nvgsp_lut_identity: PASS
+nvgsp_vram_dword_read: PASS
+nvdisplay_window_probe: PASS
+nvdisplay_cursor_probe: PASS
+nvdisplay_cursor_setup: PASS
+nvdisplay_crc_probe: PASS
+nvdisplay_output_probe: PASS
+nvgsp_context_clear: PASS
+nvaccel_stamp_watchdog: PASS
+nvgsp_rpc_ownership: PASS
+nvgsp_lifecycle_gate: PASS
+nvgsp_reset_channel_fallback: PASS
+nvgsp_stamp_reuse: PASS
+display LUT: 1025 decoded identities, distinct encodings, header, tail and bounds PASS
+GR context promote: aligned regions, init/nonmapped descriptors, overflow and bounds PASS
+nvgsp_residency_check: PASS (1536 page round trips, LRU exclusions, bad backing)
+admin RPC reply: live FREE/ALLOC/CONTROL sizes, refusals and ambiguity PASS
+nvgsp_arena_map_check: PASS
+small pages: PASS
+nvgsp_arena_map_check (sparse): PASS
+small pages (sparse): PASS
+residency remap: PASS (36 rollback positions, aliases, holes, mixed page sizes)
+nvgsp_arena_pages_check: PASS
+nvgsp_vram_heap_check: PASS (67225 allocs, 66006 full)
+nvgsp_window_surface_check: PASS
+EDID 1.4 name "BenQ PD2705U" ext 1 parsed 1 bad 0 range 50-76 Hz 135-135 kHz 600 MHz
+  [ 0] base-dtd 3840x2160  60.00 Hz pclk 533.250 MHz total 4000x2222 flags 0x15
+  [ 1] standard 1920x1080  60.00 Hz pclk   0.000 MHz total 1920x1080 flags 0x00
+  [ 2] standard 1680x1050  60.00 Hz pclk   0.000 MHz total 1680x1050 flags 0x00
+  [ 3] standard 1600x900   60.00 Hz pclk   0.000 MHz total 1600x900 flags 0x00
+  [ 4] standard 1280x1024  60.00 Hz pclk   0.000 MHz total 1280x1024 flags 0x00
+  [ 5] standard 1280x800   60.00 Hz pclk   0.000 MHz total 1280x800 flags 0x00
+  [ 6] standard 1280x720   60.00 Hz pclk   0.000 MHz total 1280x720 flags 0x00
+  [ 7] cta-vic  3840x2160  24.00 Hz pclk 297.000 MHz total 5500x2250 flags 0x1c
+  [ 8] cta-vic  3840x2160  25.00 Hz pclk 297.000 MHz total 5280x2250 flags 0x1c
+  [ 9] cta-vic  3840x2160  30.00 Hz pclk 297.000 MHz total 4400x2250 flags 0x1c
+  [10] cta-vic  3840x2160  50.00 Hz pclk 594.000 MHz total 5280x2250 flags 0x1c
+  [11] cta-vic  1920x1080  60.00 Hz pclk 148.500 MHz total 2200x1125 flags 0x1c
+  [12] cta-vic  1920x1080  50.00 Hz pclk 148.500 MHz total 2640x1125 flags 0x1c
+  [13] cta-vic  1920x1080  30.00 Hz pclk  74.250 MHz total 2200x1125 flags 0x1c
+  [14] cta-vic  1920x1080  25.00 Hz pclk  74.250 MHz total 2640x1125 flags 0x1c
+  [15] cta-vic  1920x1080  24.00 Hz pclk  74.250 MHz total 2750x1125 flags 0x1c
+  [16] cta-vic  1280x720   60.00 Hz pclk  74.250 MHz total 1650x750 flags 0x1c
+  [17] cta-vic  1280x720   50.00 Hz pclk  74.250 MHz total 1980x750 flags 0x1c
+  [18] cta-vic   640x480   59.94 Hz pclk  25.175 MHz total 800x525 flags 0x10
+  [19] cta-dtd  2560x1440  59.95 Hz pclk 241.500 MHz total 2720x1481 flags 0x1c
+  [20] cta-dtd  1920x2160  59.99 Hz pclk 277.250 MHz total 2080x2222 flags 0x14
+nvdisplay_edid_check: OK
+Strict macOS display probe native and x86_64 compile: PASS

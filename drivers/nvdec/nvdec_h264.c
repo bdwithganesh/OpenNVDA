@@ -1,7 +1,5 @@
-/*
- * H.264 on NVDEC: decoding process state, buffers and methods (see nvdec_h264.h).
- * POC: H.264 8.2.1; marking: 8.2.5 (per field); output: C.4.
- */
+/* V1: H.264 on NVDEC — decoding process state + buffers + methods
+ * (see nvdec_h264.h). POC: H.264 8.2.1; marking: 8.2.5 (per field); output: C.4. */
 #include "nvdec_h264.h"
 
 #include <stdlib.h>
@@ -51,10 +49,8 @@ int nvdec_h264_new_picture(const nvdec_h264_dec *d, const h264_slice *a, const h
 
 /* ------------------------------------------------------------ DPB helpers */
 
-/*
- * Reference marking is kept per field (mark[0] top, mark[1] bottom); a frame or
- * a complementary field pair has both, a single field one.
- */
+/* Reference marking is kept per field (mark[0] top, mark[1] bottom); a frame
+ * or a complementary field pair has both, a single field one. */
 static int is_ref(const nvdec_h264_frame *f) { return f->mark[0] || f->mark[1]; }
 static int has_mark(const nvdec_h264_frame *f, int m) { return f->mark[0] == m || f->mark[1] == m; }
 static void unmark(nvdec_h264_frame *f, int m) {
@@ -68,10 +64,8 @@ static int frame_poc(const nvdec_h264_frame *f) {
     return f->poc_top < f->poc_bottom ? f->poc_top : f->poc_bottom;
 }
 
-/*
- * Output the waiting frame with the smallest POC (C.4.5.3), skipping `skip` and
- * any first field whose second field might still come.
- */
+/* Output the waiting frame with the smallest POC (C.4.5.3), skipping `skip`
+ * and a first field whose second field may still follow. */
 static int bump_one(nvdec_h264_dec *d, int skip) {
     int best = -1;
     for (int i = 0; i < NVDEC_H264_SURFACES; ++i) {
@@ -117,9 +111,8 @@ static int frame_num_wrap(int fn, int cur_fn, int max_fn) {
     return fn > cur_fn ? fn - max_fn : fn;
 }
 
-/*
- * 8.2.5.3 sliding window, `cur_fn` = frame_num of the picture being decoded
- */
+/* 8.2.5.3 sliding window, `cur_fn` = frame_num of the picture being marked.
+ * Counts frames / field pairs / single fields with any reference field. */
 static void sliding_window(nvdec_h264_dec *d, const h264_sps *s, int cur_fn, int skip) {
     const int max_refs = s->max_num_ref_frames > 1 ? s->max_num_ref_frames : 1;
     const int max_fn = 1 << s->log2_max_frame_num;
@@ -182,10 +175,8 @@ static void activate(nvdec_h264_dec *d, int sps_id) {
 
 /* --------------------------------------------------------------- picture */
 
-/*
- * 8.2.1. Frames: both field POCs; field pictures: *top = *bottom = the POC of
- * that field
- */
+/* 8.2.1. Frames: both field POCs; field pictures: *top = *bottom = the
+ * POC of the coded field (the caller stores it under its parity). */
 static void compute_poc(nvdec_h264_dec *d, const h264_sps *s, const h264_slice *sl,
                         int *top, int *bottom) {
     const int max_fn = 1 << s->log2_max_frame_num;
@@ -234,7 +225,7 @@ static void compute_poc(nvdec_h264_dec *d, const h264_sps *s, const h264_slice *
     }
 }
 
-/* 8.2.5.2: frame_num gap -> "non-existing" short-term frames */
+/* 8.2.5.2: frame_num gap -> "non-existing" short-term frames. */
 static int fill_gap(nvdec_h264_dec *d, const h264_sps *s, int frame_num) {
     const int max_fn = 1 << s->log2_max_frame_num;
     int unused = (d->prev_ref_frame_num + 1) % max_fn;
@@ -324,10 +315,8 @@ static void fill_setup(const nvdec_h264_dec *d, const h264_sps *s, const h264_pp
     /* a field not decoded (yet) reads 0 */
     o->CurrFieldOrderCnt[0] = cur->fields & 1 ? cur->poc_top : 0;
     o->CurrFieldOrderCnt[1] = cur->fields & 2 ? cur->poc_bottom : 0;
-    /*
-     * Every frame store with a reference field, incl. the current frame's first
-     * field while its second field is decoded
-     */
+    /* every frame store with a reference field, incl. the current frame's
+     * first field while its second field is decoded */
     for (int i = 0; i < NVDEC_H264_SURFACES; ++i) {
         const nvdec_h264_frame *f = &d->fs[i];
         if (!f->used || !is_ref(f) || f->dpb_slot < 0) continue;
@@ -366,10 +355,8 @@ int nvdec_h264_begin(nvdec_h264_dec *d, const h264_slice *sl, nvdec_h264_pic_s *
     d->n_out = 0;
     const int field = sl->field_pic_flag;
     const int parity = field ? (sl->bottom_field_flag ? 2 : 1) : 3;
-    /*
-     * 7.4.1.2.4 / C.4.5: the second field of a pair goes into the frame store
-     * of the first field that was decoded just before it
-     */
+    /* 7.4.1.2.4 / C.4.5: the second field of a pair goes into the frame
+     * store of the first field that was decoded just before it */
     int second = 0;
     if (field && d->open_field >= 0) {
         const nvdec_h264_frame *o = &d->fs[d->open_field];
@@ -441,13 +428,11 @@ int nvdec_h264_begin(nvdec_h264_dec *d, const h264_slice *sl, nvdec_h264_pic_s *
     return NVDEC_H264_OK;
 }
 
-/*
- * 8.2.4.1 / 8.2.5.4: find the short-term (long_term = 0, `num` = picNumX) or
- * long-term (long_term = 1, `num` = LongTermPicNum) reference an MMCO points
- * to. Frames: both fields must have the marking, *field = -1. Field decoding:
- * one field, PicNum = 2 * FrameNumWrap + 1 for the current parity and 2 *
- * FrameNumWrap for the other (same for LongTermPicNum).
- */
+/* 8.2.4.1 / 8.2.5.4: find the short-term (long_term = 0, `num` = picNumX)
+ * or long-term (long_term = 1, `num` = LongTermPicNum) reference named by
+ * an MMCO. Frames: both fields must carry the marking, *field = -1; field
+ * decoding: one field, PicNum = 2 * FrameNumWrap + 1 for the current
+ * parity, 2 * FrameNumWrap for the other (LongTermPicNum likewise). */
 static int find_pic(const nvdec_h264_dec *d, const h264_slice *sl, int long_term, int num,
                     int *field) {
     const h264_sps *s = &d->sps[d->sps_id];
@@ -480,10 +465,8 @@ static void set_mark(nvdec_h264_frame *f, int field, int m) {
     else f->mark[field] = m;
 }
 
-/*
- * LongTermFrameIdx `idx` moves to frame store `keep`: anyone else holding that
- * index loses its long-term fields (8.2.5.4.3 / 8.2.5.4.6)
- */
+/* LongTermFrameIdx `idx` moves to frame store `keep`: every other holder of
+ * the index loses its long-term fields (8.2.5.4.3 / 8.2.5.4.6). */
 static void free_long_idx(nvdec_h264_dec *d, int idx, int keep) {
     for (int i = 0; i < NVDEC_H264_SURFACES; ++i) {
         nvdec_h264_frame *r = &d->fs[i];
@@ -563,10 +546,8 @@ void nvdec_h264_end(nvdec_h264_dec *d) {
                     }
                 }
             } else if (!(d->cur_second && f->mark[1 - par] == 1)) {
-                /*
-                 * 8.2.5.3 is skipped for the second field of a pair whose first
-                 * field is short-term
-                 */
+                /* 8.2.5.3 is skipped for the second field of a pair whose
+                 * first field is short-term */
                 sliding_window(d, s, sl->frame_num, d->cur);
             }
             if (!made_long) set_mark(f, par, 1);
@@ -580,7 +561,7 @@ void nvdec_h264_end(nvdec_h264_dec *d) {
                 f->poc_bottom -= t;
             }
             f->frame_num = 0;
-            bump_all(d, d->cur);   /* C.4.5.3: all earlier pictures go out first */
+            bump_all(d, d->cur);   /* C.4.5.3: prior pictures all go out first */
         }
         d->prev_ref_frame_num = mmco5 ? 0 : sl->frame_num;
         d->prev_poc_msb = mmco5 ? 0 : d->cur_poc_msb;
@@ -690,11 +671,9 @@ uint32_t nvdec_h264_push(const nvdec_h264_addrs *a, const nvdec_h264_layout *l,
 
 static uint32_t bl_offset(uint32_t x, uint32_t y, uint32_t pitch) {
     const uint32_t block = (y >> 4) * (pitch >> 6) + (x >> 6);
-    /*
-     * GOB (64 B x 8 rows, 512 B) the way NVDEC writes it with KBL, measured on
-     * AD103 by decoding base_ip: two 256 B halves split on x bit 5, each is two
-     * 128 B row quads, each of those two 64 B columns of four 16 B rows.
-     */
+    /* GOB (64 B x 8 rows, 512 B) as NVDEC writes it with KBL, measured on
+     * AD103 (0.129.0 decode of base_ip): two 256 B halves by x bit 5, each
+     * two 128 B row quads, each two 64 B columns of four 16 B rows. */
     return block * 1024 + ((y >> 3) & 1) * 512 + ((x & 63) >> 5) * 256 + ((y & 7) >> 2) * 128 +
            ((x & 31) >> 4) * 64 + (y & 3) * 16 + (x & 15);
 }

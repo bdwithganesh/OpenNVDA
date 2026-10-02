@@ -4,8 +4,8 @@
 
 namespace nvgsp {
 
-// window-channel (C67E) surface formats accepted for scan-out (clc67e.h
-// NVC67E_SET_PARAMS_FORMAT_*). All are 32 bits per pixel.
+// 0.110.0: window-channel (C67E) surface formats accepted for scan-out
+// (clc67e.h NVC67E_SET_PARAMS_FORMAT_*). All are 32 bits per pixel.
 constexpr uint32_t kWndFormatA8R8G8B8 = 0xCF;     // VK B8G8R8A8
 constexpr uint32_t kWndFormatX8R8G8B8 = 0xE6;
 constexpr uint32_t kWndFormatA8B8G8R8 = 0xD5;     // VK R8G8B8A8

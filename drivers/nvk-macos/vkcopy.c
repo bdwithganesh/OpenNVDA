@@ -131,7 +131,9 @@ main(int argc, char **argv)
                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
    make_buffer(dev, size, host, &src, &src_m);
    make_buffer(dev, size, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &mid, &mid_m);
-   make_buffer(dev, size, host, &dst, &dst_m);
+   /* The CPU reads dst back: cached system memory, not write-combined BAR1
+    * VRAM (the first HOST_VISIBLE type), where reads crawl (~8 s per 64 MiB). */
+   make_buffer(dev, size, host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &dst, &dst_m);
    uint32_t *s = NULL, *d = NULL;
    CHECK(vkMapMemory(dev, src_m, 0, size, 0, (void **)&s));
    CHECK(vkMapMemory(dev, dst_m, 0, size, 0, (void **)&d));

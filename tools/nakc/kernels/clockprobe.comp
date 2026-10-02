@@ -1,0 +1,22 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_ARB_shader_clock : require
+#extension GL_EXT_shader_realtime_clock : require
+#extension GL_ARB_gpu_shader_int64 : require
+layout(local_size_x = 32) in;
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64s { uint64_t v[]; };
+layout(push_constant) uniform Push { U64s out_; uint spins; } p;
+void main() {
+    uint64_t c0 = clockARB();
+    uint64_t t0 = clockRealtimeEXT();
+    float x = float(gl_LocalInvocationID.x);
+    for (uint i = 0; i < p.spins; ++i) x = x * 1.000001 + 0.5;
+    uint64_t c1 = clockARB();
+    uint64_t t1 = clockRealtimeEXT();
+    if (gl_LocalInvocationID.x == 0) {
+        uint b = gl_WorkGroupID.x * 3u;
+        p.out_.v[b] = c1 - c0;
+        p.out_.v[b + 1] = t1 - t0;
+        p.out_.v[b + 2] = uint64_t(x);
+    }
+}

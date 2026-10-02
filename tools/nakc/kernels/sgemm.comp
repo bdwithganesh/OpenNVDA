@@ -1,0 +1,36 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+// C = A * B, row-major, N x N (N multiple of 64). 64x64 block tile, 16x16 threads, 4x4 outputs per thread.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer Mat { float v[]; };
+layout(push_constant) uniform Push { Mat a; Mat b; Mat c; uint n; } p;
+shared float As[16][64 + 1];
+shared float Bs[16][64 + 1];
+void main() {
+    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y;
+    uint row0 = gl_WorkGroupID.y * 64u, col0 = gl_WorkGroupID.x * 64u;
+    uint n = p.n;
+    float acc[4][4];
+    for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) acc[i][j] = 0.0;
+    uint tid = ty * 16u + tx;
+    for (uint k0 = 0u; k0 < n; k0 += 16u) {
+        // 64x16 tile of A (row-major) and 16x64 tile of B: 1024 floats each, 4 per thread
+        for (uint r = 0u; r < 4u; ++r) {
+            uint idx = tid + r * 256u;          // 0..1023
+            uint ar = idx / 16u, ac = idx % 16u; // A tile: 64 rows x 16 cols
+            As[ac][ar] = p.a.v[(row0 + ar) * n + k0 + ac];
+            uint br = idx / 64u, bc = idx % 64u; // B tile: 16 rows x 64 cols
+            Bs[br][bc] = p.b.v[(k0 + br) * n + col0 + bc];
+        }
+        barrier();
+        for (uint k = 0u; k < 16u; ++k) {
+            float av[4], bv[4];
+            for (int i = 0; i < 4; ++i) av[i] = As[k][ty * 4u + uint(i)];
+            for (int j = 0; j < 4; ++j) bv[j] = Bs[k][tx * 4u + uint(j)];
+            for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) acc[i][j] = fma(av[i], bv[j], acc[i][j]);
+        }
+        barrier();
+    }
+    for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j)
+        p.c.v[(row0 + ty * 4u + uint(i)) * n + col0 + tx * 4u + uint(j)] = acc[i][j];
+}

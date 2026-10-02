@@ -4,16 +4,16 @@
 
 namespace nvgsp {
 
-// VRAM range index for the kext allocator (memAllocLocked).
+// 0.126.0: VRAM range index for the kext allocator (memAllocLocked).
 //
-// The old code scanned all 4095 memory-object slots once per candidate
-// move, O(n^2) under the device lock. VramHeap keeps the live VRAM ranges
-// sorted by address in a fixed array (no allocation), so first fit is one
-// pass over the gaps and insert/remove is one memmove. Placement is the
-// same as before: lowest free address in [start, end).
+// Before 0.126.0 each VRAM allocation scanned all 4095 memory-object slots
+// once per candidate move, O(n^2) under the device lock. VramHeap keeps the
+// live VRAM ranges sorted by address in a fixed array (no allocation), so a
+// first-fit search is one pass over the gaps and insert/remove are one
+// memmove. Placement is unchanged: lowest free address in [start, end).
 //
-// Ranges never overlap and are never empty; the caller keeps the range <->
-// object mapping (key is the start address).
+// Ranges never overlap and have non-zero size; the caller keeps the
+// range <-> object mapping (the key is the start address).
 template <uint32_t Cap>
 struct VramHeap {
     struct Range { uint64_t phys, bytes; };
@@ -33,7 +33,7 @@ struct VramHeap {
         return lo;
     }
 
-    // Lowest address a >= start with [a, a + bytes) free and a + bytes <= end
+    // lowest address a >= start with [a, a + bytes) free and a + bytes <= end
     bool fit(uint64_t start, uint64_t end, uint64_t bytes, uint64_t *out) const {
         if (!bytes || !out || start >= end || bytes > end - start) return false;
         uint64_t cand = start;

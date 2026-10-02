@@ -1,0 +1,1265 @@
+{
+  "description": "Exact GPU source and host test file digests for this publication. Relocated legacy tests only adjust include paths. Firmware and compiled binaries excluded.",
+  "files": [
+    {
+      "path": "drivers/NVAccelerator/AGDC.hpp",
+      "sha256": "a75612184045750d5084f2f1e428588222680dedb3fe1c40415503e49190ea74"
+    },
+    {
+      "path": "drivers/NVAccelerator/IOAF2.hpp",
+      "sha256": "5291b923c1a27d6eaf21280e7ef6af56cc37ae936a74dac1ac7660952a9ffbef"
+    },
+    {
+      "path": "drivers/NVAccelerator/IOAF2Pipe.hpp",
+      "sha256": "10effd0334f755ce9842a93d44a047b0e3f6cc39a25fe33206b85a8cef658e02"
+    },
+    {
+      "path": "drivers/NVAccelerator/Info.plist",
+      "sha256": "9fa0d72c631f6645448454cb3c0fae25f22ad816108f3e46a1deeb9201073211"
+    },
+    {
+      "path": "drivers/NVAccelerator/NVAccelerator.cpp",
+      "sha256": "49226059e2425c0ce4edc1ee4473c87967547cb805651d3b25fcdaddaa222e84"
+    },
+    {
+      "path": "drivers/NVAccelerator/module.cpp",
+      "sha256": "fbf61dbd04ba52c083628f28fe6fd6340de0c10f96a3455368118ab666eca71b"
+    },
+    {
+      "path": "drivers/NVDisplay/Info.plist",
+      "sha256": "f13c95b8f2e61e7e3cb5c4cc476cb5acd86e513d3015593348b2b6d91715e403"
+    },
+    {
+      "path": "drivers/NVDisplay/NVDisplay.cpp",
+      "sha256": "9116773011216182699f2bda904a27555b38a7548c4b7c3c928df638ea99b0fa"
+    },
+    {
+      "path": "drivers/NVDisplay/NVDisplayEdid.hpp",
+      "sha256": "1fb1b1da3f2e743df1aa7c664b3a6722f1129374dd4f42a66b0f1652dca2fa5a"
+    },
+    {
+      "path": "drivers/NVDisplay/module.cpp",
+      "sha256": "200bdddea2cd493de890dfdb037d872e49e1da49d9512507552b06c2a52ab739"
+    },
+    {
+      "path": "drivers/NVGspControl/Info.plist",
+      "sha256": "1189511e9455ad8ff7c5a843235a4382ee73405e15420c81ed3496b9c3fca607"
+    },
+    {
+      "path": "drivers/NVGspControl/NVGspControl.cpp",
+      "sha256": "963511b95a90dddc6a8ac7efe73a636f56c2eff71e61a70eb816e76b147a05ac"
+    },
+    {
+      "path": "drivers/NVGspControl/NVGspControl.hpp",
+      "sha256": "f175df77b295655c649ca73da65911fb3c3fe50a260c38cff6c0ddbdecfdf60b"
+    },
+    {
+      "path": "drivers/NVGspControl/NVGspControlUserClient.cpp",
+      "sha256": "b6e03d21931ca4a708bfa7758f152f12d1d68780e7f3e90b07483b130501e7b9"
+    },
+    {
+      "path": "drivers/NVGspControl/module.cpp",
+      "sha256": "f93c3aeb10671fe7705ad648dbb21a34ea5f82d650dcd3f6031881c19b0194be"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspAbi.hpp",
+      "sha256": "688aa8e93c8a7beb8af999a521536bd05d2e798e72e7e02fe561cf75c03dc64c"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspArenaMap.hpp",
+      "sha256": "ca613a644a1fb5e083c72d0d53168a26ce0de582fff83171df8a9fcffe629227"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspArenaPages.hpp",
+      "sha256": "4a2353afe4a619b93f3a0bbedac0c19423bb71b50ed6435056a1c191fe7d6705"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspBoot.hpp",
+      "sha256": "947ab1a48b5975f09fb4ca9d4519f351e2937857f756457b903cf3749b1f123c"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspBooter.hpp",
+      "sha256": "8f2222d0fa69170d847774e491b848ce4efecaf8df2cc76ebec9e5c9ebb6f946"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspBooterFalcon.hpp",
+      "sha256": "fbcc3736a6fb1bedb0bfaa622a422fbd683a5a1d61b648aba929594981633afd"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspBooterStaging.hpp",
+      "sha256": "af0a365ebb7d4495d4bb8f5376cc01242a5bff9189bb790f91fcebe448a9e6da"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspChainWait.hpp",
+      "sha256": "bb8930f2b20985344c63e2f1735227db21d5e55a4842d2be2c0ba5bdeca5be35"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspChannel.hpp",
+      "sha256": "14784e9605b46a8626a625f1540a636a44b891030defa8e805b28923d1a5b533"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspDisplayLut.hpp",
+      "sha256": "432125d6c6735ce315bc0d49f1d4a9d7b6246e67c8cbea3766a3ff46aece6288"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspDma.hpp",
+      "sha256": "18dd8e23eb7d9ae8685625f97d84e3218b07bfe72b6b597e907cdf5bb4a999a3"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspDmaBuffer.hpp",
+      "sha256": "d62c25b086d455e0f472be86e73d9b3b8247c4da39b878470e003f6a448baa3b"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspEvict.hpp",
+      "sha256": "f3f226fc06a4fcc3adb09295e7b1a12f19795e9bd8eeddf9b8beb9259c85db40"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspExec.hpp",
+      "sha256": "e932a5fd6598b600f560441a888aa4947da3e06a02c7a8d5af0a4e1a0d2d0f2c"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspFalcon.hpp",
+      "sha256": "82a07e37bfa910a95b4e8d1132c13e4615e4198fe4d97f7c2103bd4cbb882269"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspFbLayout.hpp",
+      "sha256": "cdd2d9f95da6ee52a8bcb2733e15e5737961b043999323f503ba42dc1b8561dd"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspFwsec.hpp",
+      "sha256": "78ef1019d8b2f9681c54439449b1752aa70148ff34ff399c95909be5dc1f636b"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspFwsecStaging.hpp",
+      "sha256": "04cef2e376c81b384c46918254a837a52338998706eba72745436b85113f5ec7"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspGrContext.hpp",
+      "sha256": "821f6f801b5e33054180ebe78e4c4eda74cc6b33b9433873d84e2a86a759da4d"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspInit.hpp",
+      "sha256": "f89182aff8cb1009e73052ef79d370642a27737a8c758f089d65cf7dd2a17594"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspInitAbi.hpp",
+      "sha256": "63eeec35523fbb802c8cf8538d15157b15afafc0d23d724c065ce1b0accd3e48"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspKernelApi.hpp",
+      "sha256": "889623854f49101a711c0213e0dc6c0f5ad34cf9696d463690144caaa55bfc4e"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspPackage.hpp",
+      "sha256": "b00e51f36c07214ff2f583125a91930bbf27c32385fcbacd56c2c9b1ffce9951"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspRegistry.hpp",
+      "sha256": "644a51840f379b6032c5834ebc1053265c8e941a519a782098d9a8c140c41e14"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspResidency.hpp",
+      "sha256": "f9cd7a14337608a15f562d4a30152bddec63384c24936aeb5651137af8b5ed26"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspRpcReply.hpp",
+      "sha256": "1ec72d9ca48522c2fc0b69e60f584fc0bb8a58d3cbc2e2d960585555c8b4979c"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspStaging.hpp",
+      "sha256": "3086abb1bad6f59ad6451b6a9b602fe07dba22b397d70c8f86c9fdd38bf02eff"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspVbios.hpp",
+      "sha256": "ead254527c75cd0d63945a1db542a93b4ed6ae8318db4755afcc340a1bf0ff68"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspVideo.hpp",
+      "sha256": "b032b17047597f1276bd0c29aa9e4dea2d0c9c3ddf20a0db2d36885cedd259a0"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspVramHeap.hpp",
+      "sha256": "a5950f03688ce2c0061e03e972b11a6ebda1c8fcc6506e66dd9aa9264ec83346"
+    },
+    {
+      "path": "drivers/NVGspCore/NVGspWindowSurface.hpp",
+      "sha256": "1f722205caa7afa21641b09eebf16dda249fb2b7c15e69ef38db4cb486872d7b"
+    },
+    {
+      "path": "drivers/NVMTLDriver/Info.plist",
+      "sha256": "922e2578dd75ab0dcff83920d454d5dfe8807da3524006495846be8f30d95ae6"
+    },
+    {
+      "path": "drivers/NVMTLDriver/NVMTLBufferVa.h",
+      "sha256": "88da50ab0c6accf695090ab2f528f9c2efb5b4dbf7a171cef0cf68fce4793b0b"
+    },
+    {
+      "path": "drivers/NVMTLDriver/NVMTLCompiler.h",
+      "sha256": "4b1bc284148a31572e30fc4a075daf71168a7d209a3e944b129684d198666e9a"
+    },
+    {
+      "path": "drivers/NVMTLDriver/NVMTLCompiler.m",
+      "sha256": "3906abd7e8dae680e30937f30c3243f35c51c7d81c31a3f46326ee78b2ebe360"
+    },
+    {
+      "path": "drivers/NVMTLDriver/NVMTLDevice.m",
+      "sha256": "925eb39055ad0db6bf885a6a92d1fcb7c96adf6ce76f06ad9c4e6d0d55de2f53"
+    },
+    {
+      "path": "drivers/NVMTLDriver/NVMTLGsp.h",
+      "sha256": "8e4fa3bd9c6e9ab7fbf478ddf6139ab68e3003dca309da8217ceef6cb944ec00"
+    },
+    {
+      "path": "drivers/NVMTLDriver/NVMTLGsp.m",
+      "sha256": "2002fc069ba95b26908c41f7d81020b12fdbf32dbab75cddfb0456ebff2695cc"
+    },
+    {
+      "path": "drivers/NVMTLDriver/NVMTLLog.h",
+      "sha256": "c1843ef2cc2fc4c43498148a0c3a695a923c34cb20f945a0347bf92fcd01af9f"
+    },
+    {
+      "path": "drivers/NVMTLDriver/NVMTLRender.h",
+      "sha256": "8ce07a384de3aba81af106e26e3804ae017f487790b596bab4a0aaee6bff8a0f"
+    },
+    {
+      "path": "drivers/NVMTLDriver/NVMTLRender.m",
+      "sha256": "cb604a4c81168aa343c4cc413f47af70e96702be5c42e58442a200b4f567e2d1"
+    },
+    {
+      "path": "drivers/NVMTLDriver/NVMTLTexHw.h",
+      "sha256": "2d424d2df9b028176330e0320dc52baca95405c09dbe59ff68907cc4e387787b"
+    },
+    {
+      "path": "drivers/NVMTLDriver/NVMTLTexHw.m",
+      "sha256": "2e804329f04d8400bd94c71633e8363471d42b43a88b2bcf2ca0767a5a9e804e"
+    },
+    {
+      "path": "drivers/NVMTLDriver/air/airir.c",
+      "sha256": "c63528088d57da1ef578b1fa0e6c46374764aaad0e728790d4a204b47bfbab9d"
+    },
+    {
+      "path": "drivers/NVMTLDriver/air/airir.h",
+      "sha256": "7360af64f27d3bc0c63ceffb83926a36daafc26c59d9379882a57204585d6d84"
+    },
+    {
+      "path": "drivers/NVMTLDriver/air/bitstream.c",
+      "sha256": "c5b16788b2ab886da773e181bcbc49b142646f82d70ee2eadf5decebfea665e9"
+    },
+    {
+      "path": "drivers/NVMTLDriver/air/bitstream.h",
+      "sha256": "ef56a5162bc7ec85fdc5533ba529f6df1ad56dca6c47e4776c99b02dcbb04339"
+    },
+    {
+      "path": "drivers/NVMTLDriver/air/metallib.c",
+      "sha256": "03c2304483f4293f6069ecab449f5b8899db1d16d1aad4d2aff1e7c542615dac"
+    },
+    {
+      "path": "drivers/NVMTLDriver/air/metallib.h",
+      "sha256": "f14477570af848874f89dcdeca90c1a8ed9e2d8ea06d609e050c55bd42af4811"
+    },
+    {
+      "path": "drivers/NVMTLDriver/build.sh",
+      "sha256": "d2b0e9ec3a7067588c86a55b9dc633abb47a53433a45729345606481bad65736"
+    },
+    {
+      "path": "drivers/NVVTDecoder/Info.plist",
+      "sha256": "80b317b7ff7988114e1c31c624680c55b337cb4ad3d43c318411846155b6481d"
+    },
+    {
+      "path": "drivers/NVVTDecoder/NVVTDecoder.cpp",
+      "sha256": "4158da7ef043d1c9a98dd989d394f608ed29517b80b1e89009a630beb29a7a8f"
+    },
+    {
+      "path": "drivers/NVVTDecoder/NVVTDecoder.h",
+      "sha256": "12be9860bc974c7968d19ba40ee8f89f166c0a80847177e1b68b61ed4979c3fb"
+    },
+    {
+      "path": "drivers/NVVTDecoder/build.sh",
+      "sha256": "153dd746261a18a6315ab4bde72c2a3751c6ee1bc5b29e2b1dcf14b086685b39"
+    },
+    {
+      "path": "drivers/NVVTDecoder/spi/CMBaseObjectSPI.h",
+      "sha256": "2e30b39dadff06145a1dfc29f735b9067eb99d08151a7fe8b9464803df784a62"
+    },
+    {
+      "path": "drivers/NVVTDecoder/spi/VTVideoDecoderSPI.h",
+      "sha256": "3d3f58450ba71ec689a50dfab37d3d84e3d7e686c20b01d5892300866030092f"
+    },
+    {
+      "path": "drivers/nvdec/h264_parse.c",
+      "sha256": "8945054d9359662affac00012cc1c14c5eca14c77fcfcf5fb7ea5d7e803f1d11"
+    },
+    {
+      "path": "drivers/nvdec/h264_parse.h",
+      "sha256": "14f6e38059c900ac43ed23c00b9d4a7153767dcedb06f259bff18117ed1cbfe6"
+    },
+    {
+      "path": "drivers/nvdec/hevc_parse.c",
+      "sha256": "05457c285f6dd413482be39365b99656433af348190aad2406f16bdd95349200"
+    },
+    {
+      "path": "drivers/nvdec/hevc_parse.h",
+      "sha256": "e09debff708effb46c2123712d1d22e1ecbfa36065ab5e8dc566e172477d3037"
+    },
+    {
+      "path": "drivers/nvdec/nvdec_drv.h",
+      "sha256": "6211a3cf07e381374d81cee0b7745ebcbad8b6ef7e8fed8d903945a0a8878a73"
+    },
+    {
+      "path": "drivers/nvdec/nvdec_h264.c",
+      "sha256": "15a04b0488ec478799629e2f5a011ce53a81bf7b442f5a9f1e7123b54fec6d57"
+    },
+    {
+      "path": "drivers/nvdec/nvdec_h264.h",
+      "sha256": "d4307db0a9608e43fd57de304b84e0594d5503b16af688244370586110c2bbb6"
+    },
+    {
+      "path": "drivers/nvdec/nvdec_md5.h",
+      "sha256": "397267753dfa91aa516d5af89d27044517d2a2825a501a931ad0d307d8e04071"
+    },
+    {
+      "path": "drivers/nvenc/nvenc_drv.h",
+      "sha256": "04ba0a17c2a50e6102f7511c6294c2b61d99fdd1b6651410a3d63c4924da323d"
+    },
+    {
+      "path": "drivers/nvenc/nvenc_h264.c",
+      "sha256": "f35a463dd3d02dd230389f02fe24e9a671189ed5c68d7de0de0546b68060d44a"
+    },
+    {
+      "path": "drivers/nvenc/nvenc_h264.h",
+      "sha256": "e093407e1e79b03c5d24fd0e2f22514df16873bb44b5b1043a4901a9dffb98b6"
+    },
+    {
+      "path": "drivers/nvk-macos/dgc/nvkmd_macos_submit.h",
+      "sha256": "72b2447935d857a6352adb2680379279ca9c491ac99ebbd16b69ebdc396bb268"
+    },
+    {
+      "path": "drivers/nvk-macos/libdrm_stubs.c",
+      "sha256": "c81dee99123df85fdbc9236f38091f5332901bf00937fa064256c8086c743ffe"
+    },
+    {
+      "path": "drivers/nvk-macos/mesa-26.0.8-macos-nvk.patch",
+      "sha256": "a683e068c0a5d6b3d653ce15fea5a5a4a24480007cc389f58f5ed853b9b6574b"
+    },
+    {
+      "path": "drivers/nvk-macos/nvk_macos_layer.m",
+      "sha256": "562d0e6f22c8d4a6cff3edd8036271bf47c1d999e6309c7986e12a2aff93452b"
+    },
+    {
+      "path": "drivers/nvk-macos/nvk_macos_layer_wsi.c",
+      "sha256": "00afddb4885b480aac39156f2a054d2078d3f3efef808c112bf3114d32a0d5e7"
+    },
+    {
+      "path": "drivers/nvk-macos/nvk_macos_wsi.c",
+      "sha256": "abc27efcc146a49ff7dd106cfcf4a0878ec698df5965e4d972ca6a49bc50cae9"
+    },
+    {
+      "path": "drivers/nvk-macos/nvkmd_macos.c",
+      "sha256": "3f03c995418f390788575f23e0d18d94f8e82c6e1f38594edbc009ec6e5f4215"
+    },
+    {
+      "path": "drivers/nvk-macos/nvkmd_macos_submit.h",
+      "sha256": "72b2447935d857a6352adb2680379279ca9c491ac99ebbd16b69ebdc396bb268"
+    },
+    {
+      "path": "drivers/nvk-macos/vkcopy.c",
+      "sha256": "17f4765916f8b4938746536017687901e6d9c2e83f8b8bedf9153a8b2b52ce57"
+    },
+    {
+      "path": "drivers/nvk-macos/vkpresent.c",
+      "sha256": "fdaf6229a3a4d5cb80d55889685ceb4659e76e7d28a79b13b07e50490c2dd49c"
+    },
+    {
+      "path": "drivers/nvk-macos/vkwindow.m",
+      "sha256": "a7fbad6a0136cafa82990b101c7129a1022af81597bb9188e271bca443f42e07"
+    },
+    {
+      "path": "tests/nvdisplay_edid_check.cpp",
+      "sha256": "1bf5b9738fd732cbf9186e566d8f0cc7c3998c7279d63db1f85c6348d215e434"
+    },
+    {
+      "path": "tests/nvgsp_abi_check.cpp",
+      "sha256": "08772b8d14f4eb5d01d8cf4a75d18dca0d65c881b75a12747406cb7fa76a0b03"
+    },
+    {
+      "path": "tests/nvgsp_arena_map_check.cpp",
+      "sha256": "d1c3abce0780ef26ded9d8f9d4eaf88219ee5eaa6df958ddd0147b81bc6cde54"
+    },
+    {
+      "path": "tests/nvgsp_arena_pages_check.cpp",
+      "sha256": "100e05a278f5d6bcb216d68dbac3e85541a8a1e1bc9eff68aa524fd7d7646beb"
+    },
+    {
+      "path": "tests/nvgsp_boot_check.cpp",
+      "sha256": "9e2e854a18f32682e38110f8093e4f73f2288044ddd8b8f9ff30d51bb21a4643"
+    },
+    {
+      "path": "tests/nvgsp_booter_check.cpp",
+      "sha256": "2ef1473fff3940734a64a058fc7c8002b6b264a169608af52885c750f9ad2e98"
+    },
+    {
+      "path": "tests/nvgsp_booter_falcon_check.cpp",
+      "sha256": "30a4d2c059a43ae82918c6c7ffc0370939525e50312e4d0dd1a417313eb11ead"
+    },
+    {
+      "path": "tests/nvgsp_chain_wait_check.cpp",
+      "sha256": "e0185d876bd55bf5a6e2815c05321242d554bf9076838b4ed0546ff9a080e13f"
+    },
+    {
+      "path": "tests/nvgsp_channel_check.cpp",
+      "sha256": "9b8165957bc2e0d998324bdd90cd0c0b26ae6b89df3016c60a496858a906dcc1"
+    },
+    {
+      "path": "tests/nvgsp_display_lut_check.cpp",
+      "sha256": "2a4379595dc2bab4bc3d43d98d40d1e6fea74ca4f2dbeb711e1c508f53843adb"
+    },
+    {
+      "path": "tests/nvgsp_evict_check.cpp",
+      "sha256": "d3b2e975b526ededa150a1c551d38d01d6f9f06c0fde344a0bf70c1468260462"
+    },
+    {
+      "path": "tests/nvgsp_falcon_check.cpp",
+      "sha256": "08d1d0bd89b63be3fe6dad4f87bdc9115bbe168916278e913f3f0d9d667dd274"
+    },
+    {
+      "path": "tests/nvgsp_fb_layout_check.cpp",
+      "sha256": "da76d3dddb4767ceaef9eebff421497bdcca7957bf43761f1667cd25ba765875"
+    },
+    {
+      "path": "tests/nvgsp_fwsec_check.cpp",
+      "sha256": "d72e0b8ae120c627d90cfa527c977d6126bf46e8fd76f15b15eca28d7404b073"
+    },
+    {
+      "path": "tests/nvgsp_gr_context_check.cpp",
+      "sha256": "3bde0a5700343b5bedabb110c7bc82d20830742b439f9981c1d0ea4f5d7d71ac"
+    },
+    {
+      "path": "tests/nvgsp_init_check.cpp",
+      "sha256": "fe7dc6301d49e0ea5ea9ddfad32b822421ac109f554976a6155c4c95b41d93ed"
+    },
+    {
+      "path": "tests/nvgsp_package_check.cpp",
+      "sha256": "61a3dcc7c411f6789ce1fd579fb5559a83eb5c256fb0e75f621d340df5cac6b5"
+    },
+    {
+      "path": "tests/nvgsp_probe_qmd_check.cpp",
+      "sha256": "c68ca1ccb51bbec92bf75b981b784750fae4cd4235b74d160b5842fde11c8378"
+    },
+    {
+      "path": "tests/nvgsp_registry_check.cpp",
+      "sha256": "e904f2dcc15e17aad3acc19cc88e4519c4dade809cc9229de92255b68a5f80ab"
+    },
+    {
+      "path": "tests/nvgsp_residency_check.cpp",
+      "sha256": "f71602b06768dedc28b780c7c33ab83f3d9f4b6b27f1d9c46ef1c1c2397aff1b"
+    },
+    {
+      "path": "tests/nvgsp_rpc_reply_check.cpp",
+      "sha256": "57d31214cfcb801c0609b931fd319fd6975d24ede46a30636115560dc1983da4"
+    },
+    {
+      "path": "tests/nvgsp_vbios_fwsec_check.cpp",
+      "sha256": "46128c9d1cbeb8b36fe7cb698f3e7829819f6122ad720eb5d3aa76da152ba405"
+    },
+    {
+      "path": "tests/nvgsp_video_check.cpp",
+      "sha256": "5c5d92acfd9454c5e273418066772e950118816b7fe4b4a47007b26a3806db66"
+    },
+    {
+      "path": "tests/nvgsp_vram_heap_check.cpp",
+      "sha256": "2529655e611fc75da13806bbd08f4837e1c45deab498f4557e0ca6fdcb7bd576"
+    },
+    {
+      "path": "tests/nvgsp_window_surface_check.cpp",
+      "sha256": "3d77e2ed5bd4bb6b805e5d8e9367ce28264d4ff61af29569e124728aa5178e3b"
+    },
+    {
+      "path": "tests/nvk_dgc/run.sh",
+      "sha256": "eae6f2a44f819efc15c02b877ec32759996ab47694ba7a1156f62c3f087ab818"
+    },
+    {
+      "path": "tests/nvk_dgc/submit_check.cpp",
+      "sha256": "c5fa0bc650531d686fa651c4d586a96fa58acd7d2a5a0bb20789aeb3fc8a2095"
+    },
+    {
+      "path": "tests/nvkmd_macos/mock/CoreFoundation/CoreFoundation.h",
+      "sha256": "86fa973194b2cf3d58962004c4b2674a4488cf469c9c5b89ad627e27124d7bbf"
+    },
+    {
+      "path": "tests/nvkmd_macos/mock/IOKit/IOKitLib.h",
+      "sha256": "90f651f9e434c3e959157fc1153dd60f9e45230b7401a344bb33eedfe9909ba5"
+    },
+    {
+      "path": "tests/nvkmd_macos/mock/mach/mach.h",
+      "sha256": "f31b989fd9880879457bbd36bb6df35331089175075b0713fe0fa2f8bfc53034"
+    },
+    {
+      "path": "tests/nvkmd_macos/nvkmd_macos_mock_check.c",
+      "sha256": "6c74a75a5df28737b2db1a3962e2ce5ccdfd68970febb85956239b0f6d11d10a"
+    },
+    {
+      "path": "tests/nvkmd_macos/run.sh",
+      "sha256": "08cef1359461f4f8006828d74ebdd4bd29065ea1586be46d38fa970c7cb8913c"
+    },
+    {
+      "path": "tests/nvmtl_buffer_va/check.m",
+      "sha256": "d3939285b5decb9530383684d5831d894fc8cca0474fa2828eb15d8a31c8a745"
+    },
+    {
+      "path": "tests/nvmtl_buffer_va/run.sh",
+      "sha256": "13a6c02cf3c776bd026f0432ec4b7c0950ba8e9c1df9565d11aab7b95b691126"
+    },
+    {
+      "path": "tests/test_nvaccel_stamp_watchdog.py",
+      "sha256": "49038fff04138e003512c93d2ca9bf4e6ab9b867fb30534ea5591fe2e63689fe"
+    },
+    {
+      "path": "tests/test_nvdisplay_crc_probe.py",
+      "sha256": "f797c330da099515c9c3311276d46590750e6e0df8363d6bd8480a3a4a9d48f5"
+    },
+    {
+      "path": "tests/test_nvdisplay_cursor_probe.py",
+      "sha256": "8dd53dcd40657eb843fcb68e55ba0f652cf3ab96879c5f79b1af049b0e1b2ab8"
+    },
+    {
+      "path": "tests/test_nvdisplay_cursor_setup.py",
+      "sha256": "06a0a75e7abb0f9fa4150afa7d60a280d4309ccaf8f2b087321d7cf925e84696"
+    },
+    {
+      "path": "tests/test_nvdisplay_output_probe.py",
+      "sha256": "6025ec1fc4a4a147a3d50ae5763d7ec815639d348b530b8a5e761bec29d74566"
+    },
+    {
+      "path": "tests/test_nvdisplay_window_probe.py",
+      "sha256": "ce192f3cb154da6e00e09c36bcdea566127cb1815e6543bdb87bf18e13e37ea4"
+    },
+    {
+      "path": "tests/test_nvgsp_context_clear.py",
+      "sha256": "9e71db16a58074f53648c2dbf763960b22e617a41cd55e4c1b39545338b07cb6"
+    },
+    {
+      "path": "tests/test_nvgsp_cursor_arm.py",
+      "sha256": "1c565a99929000ada17a300c9e43f1df9afbd899d6edee8ba59cb2d2dd3050b2"
+    },
+    {
+      "path": "tests/test_nvgsp_cursor_offset.py",
+      "sha256": "7a2d60ade67f6bc0cc6dfbb45e93b49f14313091a66b4fe5d7448752ad779743"
+    },
+    {
+      "path": "tests/test_nvgsp_lifecycle_gate.py",
+      "sha256": "a1e59e59777901c919a1f26e850ec992079922257e15179ade973c799c10562d"
+    },
+    {
+      "path": "tests/test_nvgsp_lut_identity.py",
+      "sha256": "db1b8275418dbd536aacd024ce13039990db905a6ba89bbdf586be1fb7d816c2"
+    },
+    {
+      "path": "tests/test_nvgsp_reset_channel_fallback.py",
+      "sha256": "8ebb343ae311045e244f2b7d75059cd0b6f87cc34323262c1df9fbae5c173a7a"
+    },
+    {
+      "path": "tests/test_nvgsp_rpc_ownership.py",
+      "sha256": "baa935457294277e87d5dc8d87e4616773074f74c6324aa461db686472d920a3"
+    },
+    {
+      "path": "tests/test_nvgsp_stamp_reuse.py",
+      "sha256": "381b6347cb1e34c378b90114bf45b98843fba078929f11f1eb256a98cf2e2ade"
+    },
+    {
+      "path": "tests/test_nvgsp_vram_dword_read.py",
+      "sha256": "fc07619c36a0e7f7be31413aa41b4c8f507a633589940504e8bc7bab1cedb918"
+    },
+    {
+      "path": "tools/build_kext.sh",
+      "sha256": "600fe49dc35d619b8de1974b9f58840db9ee838f1df261fe14cc48ec614cbd8c"
+    },
+    {
+      "path": "tools/display/nvcursor.c",
+      "sha256": "e0722003ec75699054687557991453a333e1fd4ba18b625dbdd0a48b67caeb56"
+    },
+    {
+      "path": "tools/display/nvcursor_common.h",
+      "sha256": "679f03f11693966f3a11840984badec1dafa4d0ea83e9422727b2c2d81d0850c"
+    },
+    {
+      "path": "tools/display/nvcursor_probe.c",
+      "sha256": "dc4b7d72f7853a5f626ef1a291aa18f9710b0fc90e1c9e903879317c888a7e84"
+    },
+    {
+      "path": "tools/display/nvcursor_rm_probe.cpp",
+      "sha256": "fd22aea6ac13be78e7c5e9cecc2c755e651c9730171272f22bab8ef3ab517546"
+    },
+    {
+      "path": "tools/display/nvdisplay_admin.hpp",
+      "sha256": "9c179e11e72a9d2a29ccbd341fec638b4afe8896c98f50905200fd70ad652428"
+    },
+    {
+      "path": "tools/display/nvdisplay_crc_probe.cpp",
+      "sha256": "87ac5779595a5201a031a7afe6169c912a91abcfb8e7a4a4088e7719e4bcd4f4"
+    },
+    {
+      "path": "tools/display/nvdisplay_crc_probe.hpp",
+      "sha256": "d8e398a44bfba27bfc3b5ca1c75d2c03db79bdd6ffad2e3d2a32845c831ea1d7"
+    },
+    {
+      "path": "tools/display/nvdisplay_crc_resource.hpp",
+      "sha256": "a93a5491731bf87a89e9b7f6e9d554b4d5d5ddc75d285d551ee86b64fa85fdec"
+    },
+    {
+      "path": "tools/display/nvdisplay_cursor_crc_probe.hpp",
+      "sha256": "aa8c78f28a10f1bc28e9ff5d0a9356f5cca2ba12e6c36a46dac0c2280c1c7761"
+    },
+    {
+      "path": "tools/display/nvdisplay_cursor_pio_probe.hpp",
+      "sha256": "4bf5a256e4719f29ba6d62b529a4f31cd479f219f75063694a999d76c9587292"
+    },
+    {
+      "path": "tools/display/nvdisplay_cursor_probe.hpp",
+      "sha256": "4567e4f89283b6190273276d7b169d1ac4b1e5cf3bd70d2694fc003ede7d51ca"
+    },
+    {
+      "path": "tools/display/nvdisplay_fixture_probe.hpp",
+      "sha256": "08ce379f6756b2178394ef202d3cef01c77a44f65c9aa729f5f909bc1080f397"
+    },
+    {
+      "path": "tools/display/nvdisplay_olut_probe.cpp",
+      "sha256": "7000fdcdae57637243ba11d3ce7bbdc2621d91106aa207301c82e445e78b4586"
+    },
+    {
+      "path": "tools/display/nvdisplay_window_probe.hpp",
+      "sha256": "ddaced8d820d3d1e0800ae85af6f3454ecfad79f15ee5728762e1390bced4353"
+    },
+    {
+      "path": "tools/nakc/air_nir.c",
+      "sha256": "b95f799f5af7857a5e1b2606d222c9aaae7a5e97086b99191d2bbdf07e14c992"
+    },
+    {
+      "path": "tools/nakc/air_nir.h",
+      "sha256": "85d2ea80caaaa31b6ff70d22bb6e1b18e126b8323686c807c467a396dd18f241"
+    },
+    {
+      "path": "tools/nakc/build.sh",
+      "sha256": "bbc41605794e92f82fd0b44edaf0cfb55e1101a1d6ba26ea33b4ec91278dface"
+    },
+    {
+      "path": "tools/nakc/build_cross.sh",
+      "sha256": "7445aee88e687702b9c9cafd4f4fc27f89c246aa51ac3bdd6e701022eebba9ba"
+    },
+    {
+      "path": "tools/nakc/build_target.sh",
+      "sha256": "803061c2d3102f498985b25e7a7e9cb3a24d12e81a5589b008e4c2578da8f490"
+    },
+    {
+      "path": "tools/nakc/kernels/clockprobe.comp",
+      "sha256": "624fa7bff4637b1665dd4598adfdea8df787bc638a16d82b1be3b94efcbe6eac"
+    },
+    {
+      "path": "tools/nakc/kernels/cube.vert",
+      "sha256": "7e8184f6d6af931e038fd70c9d183ece104f71d2bbd954e568017119aa74bb50"
+    },
+    {
+      "path": "tools/nakc/kernels/fill3.comp",
+      "sha256": "f2d4d77d848257e3bb8f29ed94c5ffe9936a4848724d209d47da5ebbec43f7f1"
+    },
+    {
+      "path": "tools/nakc/kernels/grad.comp",
+      "sha256": "8b8a1cc4b0f6d17a6d42d5bf74e9ec1d26a9adf810c660052f5f02e5755e2109"
+    },
+    {
+      "path": "tools/nakc/kernels/init_ab.comp",
+      "sha256": "4340d297b8e21228acb4eba921567418151c78e27da86a69c085808987830c23"
+    },
+    {
+      "path": "tools/nakc/kernels/init_xy.comp",
+      "sha256": "0d997230d64f0a834638a386584193b86dc00f2fd57526bda8c33455a1ccd442"
+    },
+    {
+      "path": "tools/nakc/kernels/mandel.comp",
+      "sha256": "b755139ab0bc4b14d5a8c2b54e9fca702aa86116056d8f80af10dee128017f8d"
+    },
+    {
+      "path": "tools/nakc/kernels/quad.vert",
+      "sha256": "a81fe68da6ddaf669e16306afcef8d867295ad8a05d7de4ebfe11c375ed13612"
+    },
+    {
+      "path": "tools/nakc/kernels/saxpy.comp",
+      "sha256": "e65e929ddc5b558311eaf19fe9579d14bee0c133ea0fe02f0caea0b4811aeb22"
+    },
+    {
+      "path": "tools/nakc/kernels/sgemm.comp",
+      "sha256": "9a2bc254eaa48b80e55316fb3181702e80f1a05172b4a3002f4e35cc7bd11a59"
+    },
+    {
+      "path": "tools/nakc/kernels/tex.frag",
+      "sha256": "adbc7b0c598b72c0786866e84790597ac5f38b820eadc739c84f7f61e7775784"
+    },
+    {
+      "path": "tools/nakc/kernels/tri.frag",
+      "sha256": "53aa3f47b1c03561c4a3f2174b506124f6104358b0730cc7005b3ccd35fded40"
+    },
+    {
+      "path": "tools/nakc/kernels/tri.vert",
+      "sha256": "7d82ac136384197784e979c769d1d9ecd12a7e110feab0df1d03e7bccd85532d"
+    },
+    {
+      "path": "tools/nakc/mesa-26.0.8-macos-nak.patch",
+      "sha256": "77af0c3e1e416132c808693f09f969db4dffe4895fff0f2865119512db771139"
+    },
+    {
+      "path": "tools/nakc/mesa-26.0.8-macos-nvk.patch",
+      "sha256": "00293910ae37bea3e8105ee3a64d941c2d8db6dcc052b5520f258adc75f9fade"
+    },
+    {
+      "path": "tools/nakc/nakc.c",
+      "sha256": "30ca82e44ef55445f3fe221e8ad4ddcd389e834b921fc0a888fed0e6b689e224"
+    },
+    {
+      "path": "tools/nakc/tess_gen.c",
+      "sha256": "457bf4e87078c6b7f2a6b0703302c12d90212563d875ddf8825e6556ced9224f"
+    },
+    {
+      "path": "tools/nakc/tess_gen.h",
+      "sha256": "1455fb25da0c9015a99c3a00df35033356164dc56e100c0eaffa31be15219fe2"
+    },
+    {
+      "path": "tools/nvaccel/air/air_kernels.metal",
+      "sha256": "dfc12f6f2464a9e5138f707cb4d0be1cfbb9b14c20e2f369d5176bd260806b76"
+    },
+    {
+      "path": "tools/nvaccel/air/gen3d.c",
+      "sha256": "e3d00e264803cce59b9f335fb0abfb7ae9568603f05668ceb67a64902d2f2d56"
+    },
+    {
+      "path": "tools/nvaccel/air/gfx.metal",
+      "sha256": "60598af0479d7b53d9b3d0beada19188b489461fa1b697b5393c22c55ed35caa"
+    },
+    {
+      "path": "tools/nvaccel/ca_compare.m",
+      "sha256": "9efbf1d70ecd6a17eee2690eb1eb32fcea747b0dbd15eff52e2b739532c2ef2a"
+    },
+    {
+      "path": "tools/nvaccel/ca_diff.py",
+      "sha256": "d763fd3a7f80337cbf8176699c743bc113121eb73e3870de31aba91bcfe66237"
+    },
+    {
+      "path": "tools/nvaccel/ci_compare.py",
+      "sha256": "a2c1d51f6acd572a3620e1e60260ce8cfd97036735dc8dfadbdb6e64eabd2bb2"
+    },
+    {
+      "path": "tools/nvaccel/ci_dumpall.sh",
+      "sha256": "ad5588b405392ad3528d1beca1a847ec5bb1f82cec8d916b3381213ebe230689"
+    },
+    {
+      "path": "tools/nvaccel/ci_heic_test.m",
+      "sha256": "f59ba3488d4ae4e13b862caa77b7c0ae9a822ea31ca24d361555ac6aafe367e6"
+    },
+    {
+      "path": "tools/nvaccel/ci_sweep.m",
+      "sha256": "8ac2454e774d85bd98bde20ff7b3109ff8bcba2f087bef5d5f67d5cde18e66bb"
+    },
+    {
+      "path": "tools/nvaccel/cl_more.c",
+      "sha256": "725f881692b13ba65d19ef490c609ebff6e4eafa7671bc374a156b1e5f0724d6"
+    },
+    {
+      "path": "tools/nvaccel/cl_test.c",
+      "sha256": "df83ccd8416dc3c5a477c6e817673d41b536f2ff1863823923ebdb5485459b16"
+    },
+    {
+      "path": "tools/nvaccel/fbcap.c",
+      "sha256": "4daa73424b412195f132974d2e85620f2a8f4c33e2665468c9f2115fbe787b31"
+    },
+    {
+      "path": "tools/nvaccel/fbgrab.c",
+      "sha256": "cb7298663f49775f56b7fab13499f4b425a9a5142a68fde955312d31ba35b79b"
+    },
+    {
+      "path": "tools/nvaccel/feature_probe.m",
+      "sha256": "0a8512147547b7c858fe54356ce8c0ba624913e99864a6b8acdc3e3321881bc9"
+    },
+    {
+      "path": "tools/nvaccel/fw_compare.py",
+      "sha256": "6fd20c66e7def7d231d6652ac9628f2a614755852847a18ae40d9cccfa0639d4"
+    },
+    {
+      "path": "tools/nvaccel/fw_test.m",
+      "sha256": "4ab1457def23e2f09698910e4946d97e6736eb3147f96f7052c237db87e89d77"
+    },
+    {
+      "path": "tools/nvaccel/gl_test.c",
+      "sha256": "91c758e6658df3e8f5539980fec647b0434f34bd4c9b76f327b0f1720ced1f30"
+    },
+    {
+      "path": "tools/nvaccel/gpu_channel_fallback_test.c",
+      "sha256": "8c6bf4005fc49751cab8565fed64e63b85c2b033af0ae26d6986840736d347d5"
+    },
+    {
+      "path": "tools/nvaccel/gpu_channel_soak.py",
+      "sha256": "0d78c50758466d255a3444e6b050efc5baf68ea4ad4072a45866beff89c6f245"
+    },
+    {
+      "path": "tools/nvaccel/icon_alpha_probe.m",
+      "sha256": "8edb89e266501e587cdabbc02d23bf24ffe065b8f7eba54291b6d42500e9cb7e"
+    },
+    {
+      "path": "tools/nvaccel/iio_thumb_test.m",
+      "sha256": "4f3d2186d834d968743fb409445dd6988b04dcf3a79946120885a43b2ccd4cd2"
+    },
+    {
+      "path": "tools/nvaccel/integration_audit.sh",
+      "sha256": "1bb21e2061a9f80d41f91d0c482471584ae63b6ba463f3b98f3676f3a09c77be"
+    },
+    {
+      "path": "tools/nvaccel/iosurface_xproc.m",
+      "sha256": "60be0b2317b7f958e18bf818dcca59fcb00ee635a039852ac2659c5ca9c69dcd"
+    },
+    {
+      "path": "tools/nvaccel/lwlogin.c",
+      "sha256": "a7260530237eed8260f9eaed2b6a0c37080c07f99778c5f93fa441863bd00608"
+    },
+    {
+      "path": "tools/nvaccel/metal_3d_test.m",
+      "sha256": "d3abc1adc329b2244b0126bafb5044f338725b3e3ab32bf02879dcfdefa700b6"
+    },
+    {
+      "path": "tools/nvaccel/metal_adv_test.m",
+      "sha256": "3f4fb988c57926a48c4506752e7f717b85fc8c007a76f82e102279aa432fc4ac"
+    },
+    {
+      "path": "tools/nvaccel/metal_air_test.m",
+      "sha256": "e3139bc7f8ec11ddaa9803102ad2a4eb87b2f8e990d878094fd067c9fd853c80"
+    },
+    {
+      "path": "tools/nvaccel/metal_aniso_test.m",
+      "sha256": "5637f232740eb836c9771e8b7009a56d1a7b1034248998996f0ba0aac7eafd1a"
+    },
+    {
+      "path": "tools/nvaccel/metal_argbuf_tier2_test.m",
+      "sha256": "55f0697dcfff5c8771ffab0066c0678967f291a924cfd093ee22a988d235b5cd"
+    },
+    {
+      "path": "tools/nvaccel/metal_async_test.m",
+      "sha256": "e0803c3af529782491a2b312d50589b56c40594d01a828a90651aef760e66391"
+    },
+    {
+      "path": "tools/nvaccel/metal_bary_test.m",
+      "sha256": "5651eda6719db6237ecbeb45d63900306994b916ef585f1c883cc6e8e982ef6c"
+    },
+    {
+      "path": "tools/nvaccel/metal_batch_test.m",
+      "sha256": "8f04e4024529e6a18a44672629f7bbafad90fbe9a7e5842a958bd91504c869b5"
+    },
+    {
+      "path": "tools/nvaccel/metal_bench.m",
+      "sha256": "119c03dc5f1eac9c749d11c10a8134147dfd726526c148ccdd723040d1e1b995"
+    },
+    {
+      "path": "tools/nvaccel/metal_big_iosurface_test.m",
+      "sha256": "b9205ca4aba7393a3bc24ab3cae24823ea8e041fbf54aedf23637c7446dc4e18"
+    },
+    {
+      "path": "tools/nvaccel/metal_blit_bench.m",
+      "sha256": "2e26d44945a8d34a35bc1fb31c36074c498ac6e0dc1ba0da7a71064c0baddd2a"
+    },
+    {
+      "path": "tools/nvaccel/metal_blurchain_test.m",
+      "sha256": "fc684347cab9235da32cfba002771bad3d5efc3adfe1a274ebd8ec232b569a29"
+    },
+    {
+      "path": "tools/nvaccel/metal_burn.m",
+      "sha256": "af52817faf85dc9a204a983c8f59af58b337250ddea647a41b0679cce4555904"
+    },
+    {
+      "path": "tools/nvaccel/metal_capability_contract_test.m",
+      "sha256": "4d0c867f29c898889d5b3d8c3864e1a824ac6c3ad2d2d4c64f19e85041a8a116"
+    },
+    {
+      "path": "tools/nvaccel/metal_caps.m",
+      "sha256": "00d80aac96f034544033d5c1247eff12d98bc53b7b1c4ab302b96e758aaa5eb6"
+    },
+    {
+      "path": "tools/nvaccel/metal_ci_test.m",
+      "sha256": "38cb7a5345bc747508a6c7387c31b3661332f798a5e8316bb7323e973c877d27"
+    },
+    {
+      "path": "tools/nvaccel/metal_coherence_test.m",
+      "sha256": "91bbbdff06ab369646772b1674eeb9e1a0614939d0cf9cf8ef70b6f3911841ff"
+    },
+    {
+      "path": "tools/nvaccel/metal_counter_test.m",
+      "sha256": "e88f8a029c34137565e5caae0655aa77b0da0b850ee6fbf5fc3236a8dbf83247"
+    },
+    {
+      "path": "tools/nvaccel/metal_coverage.m",
+      "sha256": "d43dfdf396d56c08d05fa7cad60908baaa82d2a803e03b63681a49b0e79f63ad"
+    },
+    {
+      "path": "tools/nvaccel/metal_ctxsw_test.m",
+      "sha256": "a99cd8ad6ac314ef8062513db0e7d22583d91d34bede5b9244926487386a6b4f"
+    },
+    {
+      "path": "tools/nvaccel/metal_cull_test.m",
+      "sha256": "41764b9cfa7f38068969f1cf521c0bb74dac06369b4ae92cca6c42b2313cd0f5"
+    },
+    {
+      "path": "tools/nvaccel/metal_depth_stencil_view_test.m",
+      "sha256": "ff21ff9e792b2368aa3bc550c5bdeeec01b966510a87d6cb8edf96c18ea866db"
+    },
+    {
+      "path": "tools/nvaccel/metal_depth_test.m",
+      "sha256": "5720725af609bb35f4f953c9adf43e23ca861df898634b21544ecb1223f31811"
+    },
+    {
+      "path": "tools/nvaccel/metal_deriv_divergent_test.m",
+      "sha256": "35a2257ff650c2b9b87f02774e93501f3a4e559843ca2c555c14ccdd4d6ad25c"
+    },
+    {
+      "path": "tools/nvaccel/metal_deriv_edges_test.m",
+      "sha256": "770fde974494032c20d02c8b3795ca1f56f05d879dfb1c7510d8e1ec409a6600"
+    },
+    {
+      "path": "tools/nvaccel/metal_event_test.m",
+      "sha256": "ba95d2cfbdb343a898e298fd3274b2bfaeac3f3cf834de11f382f9edbf6a01d9"
+    },
+    {
+      "path": "tools/nvaccel/metal_fault_test.m",
+      "sha256": "fb43ed07f07b05848281dd3a12402becda28c0780051372d39811b3f52084a0b"
+    },
+    {
+      "path": "tools/nvaccel/metal_fbfetch_test.m",
+      "sha256": "48a6b341a7611bd6c10d0d9df5818a7f6798f829a941048877ea47df8cc8269e"
+    },
+    {
+      "path": "tools/nvaccel/metal_feature_test.m",
+      "sha256": "474080215d9aa70b0ca9302a97f0a4ec5f2aedffa1bd1b66a7fab366c392dbfd"
+    },
+    {
+      "path": "tools/nvaccel/metal_fnptr_test.m",
+      "sha256": "3ad841e422dc05734cb4b8bc85ba346cab2826f34539cdae0c3154f374430a41"
+    },
+    {
+      "path": "tools/nvaccel/metal_frag_scratch_test.m",
+      "sha256": "05e60c28744d7490a42a6801e08bfd6f435b42984e7b731a88906952dbcf90a6"
+    },
+    {
+      "path": "tools/nvaccel/metal_fragcoord_test.m",
+      "sha256": "f3f6e7cb3ebe21d46b6663566a1d6a049c6a526fc0130eac67d344d07094ac25"
+    },
+    {
+      "path": "tools/nvaccel/metal_gather_test.m",
+      "sha256": "a04745dda64f6ba53090c344c897a314dffd10e47d25f58ce3d1ae8cc5dc4a61"
+    },
+    {
+      "path": "tools/nvaccel/metal_heap_churn_test.m",
+      "sha256": "a5f71feb594a9006a2fa9603e3709a270262556c161039ea67e3ecd909018139"
+    },
+    {
+      "path": "tools/nvaccel/metal_icb_test.m",
+      "sha256": "27882eace10b229640e0ebf771a7b0d427203517b94765395c6f015eb2136376"
+    },
+    {
+      "path": "tools/nvaccel/metal_index_offset_test.m",
+      "sha256": "09f30e80bc130ae9425028d2cb3e6c2995aebdef0433f7a260107e78d88166b0"
+    },
+    {
+      "path": "tools/nvaccel/metal_iosurface_stride_test.m",
+      "sha256": "42a89992678360847a0e0e05ed489d5d186b6a98b63c22c4c21bc8c585b1cb81"
+    },
+    {
+      "path": "tools/nvaccel/metal_kind_churn_test.m",
+      "sha256": "6c4ad9d2c92ffa73ff26537075fdde0dc072da52e76cf0d2b711eb7c75d33d27"
+    },
+    {
+      "path": "tools/nvaccel/metal_kind_reuse_data_test.m",
+      "sha256": "4e1f748e76b862950be3e341483db61a044f2b5fef6a926cedef7e078655136a"
+    },
+    {
+      "path": "tools/nvaccel/metal_lat.m",
+      "sha256": "665cf88be02ec99e263896a40c492afce7fc1c1a4a51f7bd432cdb4dc2876ad0"
+    },
+    {
+      "path": "tools/nvaccel/metal_layered_test.m",
+      "sha256": "3fce996194fcca9c3949b1812e9245a92a7fb8b2e498f4cac34a26270d2d8c4f"
+    },
+    {
+      "path": "tools/nvaccel/metal_lib_scan.m",
+      "sha256": "7dda488cb0a3b7095e38b26d87f683988db76911b1c02b8abffb4279c19632fe"
+    },
+    {
+      "path": "tools/nvaccel/metal_linked_globals_test.m",
+      "sha256": "2c1891e820fa21a20b18b4fef1e6d02ace6588557106d1d0a433e60a7fd874ba"
+    },
+    {
+      "path": "tools/nvaccel/metal_linked_test.m",
+      "sha256": "749eae56afe9aee4a5a5c028f733f63ffcec875082c54de87eacd6d9b15d5e14"
+    },
+    {
+      "path": "tools/nvaccel/metal_list.m",
+      "sha256": "10a82cd790c53f22770f6ec29b7c62bf13e10d2b7bc9fc9c7f2c59910b3890a0"
+    },
+    {
+      "path": "tools/nvaccel/metal_managed_test.m",
+      "sha256": "826785a6f5adc519bd0ecc2ce983b304da028ea84ea50634db9046741d5624a0"
+    },
+    {
+      "path": "tools/nvaccel/metal_mesh_test.m",
+      "sha256": "3abacfcee2c081ffa18716ad39e387f5571112b718bea22f562eadf3b83c7dc7"
+    },
+    {
+      "path": "tools/nvaccel/metal_mix_test.m",
+      "sha256": "148d13539394118b694069a5dfcb2e9349010b6ed279f0e64a88c70deb8161d1"
+    },
+    {
+      "path": "tools/nvaccel/metal_mrt_mask_test.m",
+      "sha256": "4ea11d8025d798bfa28499b3207cb25595246abe5c6d52f399ca6447e991a28f"
+    },
+    {
+      "path": "tools/nvaccel/metal_native_reject_test.m",
+      "sha256": "05f9a88c0be9edfe8c36874455d33aa8ee1d3e3c32fe36bb104503e8bcefe1ab"
+    },
+    {
+      "path": "tools/nvaccel/metal_nofrag_test.m",
+      "sha256": "d0e3733818b5197961e5ac6606811493038ed80e24c7004ba9ce59166740cfaa"
+    },
+    {
+      "path": "tools/nvaccel/metal_normalized_mips_test.m",
+      "sha256": "dd94b03a224d77a2a61019811182c636d02409d8dcfe6c3d5110a41d06b2e8d9"
+    },
+    {
+      "path": "tools/nvaccel/metal_null_failure_test.m",
+      "sha256": "bd1eb7e70de3c9cc081fe288231751a819d35466b4ec4fc98479c12f3a6b059f"
+    },
+    {
+      "path": "tools/nvaccel/metal_overhead_bench.m",
+      "sha256": "263de3455e3684fedb2e9b86afdc8a9919bc39981c20dac5532ea00220941af5"
+    },
+    {
+      "path": "tools/nvaccel/metal_perf.m",
+      "sha256": "fa7f89e769580494ea90e5a6c83b53082794e63ae78d4086ca2fdff984aeb0dd"
+    },
+    {
+      "path": "tools/nvaccel/metal_pipe.m",
+      "sha256": "b2598047ab62a28a939d8aa3853b90cf3a353c921a7ec8a9a9c767d4c6ad1563"
+    },
+    {
+      "path": "tools/nvaccel/metal_present.m",
+      "sha256": "e4735320730b5a2062f5867ef6ee88b74853de93f73e168b88b2a3af3506cda3"
+    },
+    {
+      "path": "tools/nvaccel/metal_priv_test.m",
+      "sha256": "45ecaa08b01bd98dcf2fd5652cbf56701e8e6547cc201db110f059df6881766c"
+    },
+    {
+      "path": "tools/nvaccel/metal_private_getbytes_test.m",
+      "sha256": "750b09d75c0ca5eeb4e8ce734d8ae6ebc6f3b8c62d789afcb04661e3a82751f5"
+    },
+    {
+      "path": "tools/nvaccel/metal_raster_edge_test.m",
+      "sha256": "14a66e6cd8bb04bfa22996b5bd73ef480a74b68a88423348f58313ae691f0e99"
+    },
+    {
+      "path": "tools/nvaccel/metal_rb_sdf_test.m",
+      "sha256": "1ab18da4a301cad2a467740dd17705f0b61d8684649388d28091ef3d9cca2ccf"
+    },
+    {
+      "path": "tools/nvaccel/metal_rbpass_test.m",
+      "sha256": "fdb0ec6b87cbf62ebbff80ca7fc204bd094c45711aa88829266682585a5fdcd2"
+    },
+    {
+      "path": "tools/nvaccel/metal_refl_dump.m",
+      "sha256": "f179a8e6c359bddf44fba0f8a8c6b3d489929c62a5a27fa290683dfe1da4858b"
+    },
+    {
+      "path": "tools/nvaccel/metal_render_test.m",
+      "sha256": "b509410aad0bcc8c8ce77868dcbc53b6533e644ae002043fe10174092e42cda0"
+    },
+    {
+      "path": "tools/nvaccel/metal_reset_inflight_test.m",
+      "sha256": "3a140eab6b758bdb81e76e5cffb25927c84fb104a400680ba39af0a06c50c983"
+    },
+    {
+      "path": "tools/nvaccel/metal_reset_reuse_test.m",
+      "sha256": "6baaa6719a54f2243cf0d2ecf42f5c37290b4253ef8a048791652666ff3c97fa"
+    },
+    {
+      "path": "tools/nvaccel/metal_restart_test.m",
+      "sha256": "60e6d92079c5d76f358dc9b3222c6fbf6ea021df68b83adeada2eb9140ebf554"
+    },
+    {
+      "path": "tools/nvaccel/metal_rg8_test.m",
+      "sha256": "af51d25c881d8d68092bc91a00da12b2b35847afda724fbf5cd1a05919b2b52f"
+    },
+    {
+      "path": "tools/nvaccel/metal_rt_sample_sizes_test.m",
+      "sha256": "082d1ff55d13aa2c0c070654b3267958bf487567560da0344e726db73e21c2f8"
+    },
+    {
+      "path": "tools/nvaccel/metal_sample_interpolation_test.m",
+      "sha256": "5cc66c32af85868c71cee6b912b4fd789f96e093a0ee0b77fba8816a41579c84"
+    },
+    {
+      "path": "tools/nvaccel/metal_sgemm.m",
+      "sha256": "b9d64857f12189b1fabac2a6f3ff4f3c12e11190053e9874ef220e57546ca887"
+    },
+    {
+      "path": "tools/nvaccel/metal_shadow_map_test.m",
+      "sha256": "0c15bfbcbbebce97a128885e20d4aaaa7f9785efa7441c5422ce274c2827ac2b"
+    },
+    {
+      "path": "tools/nvaccel/metal_shadow_test.m",
+      "sha256": "c9ef75cbd9c5d26e586dac6f5899d5c48c9640f9968760652ac0c5680933a491"
+    },
+    {
+      "path": "tools/nvaccel/metal_shared_event_xproc_test.m",
+      "sha256": "650403d367c046d5d914b58ad8a4eca7b780f20d6832785a87dcb6082087636a"
+    },
+    {
+      "path": "tools/nvaccel/metal_signed_formats_test.m",
+      "sha256": "ee73953e8aa0f2cb2389008e29245bc032eb309a468bbc089f2e4fa324904068"
+    },
+    {
+      "path": "tools/nvaccel/metal_signed_render_test.m",
+      "sha256": "981af8878da995ed03838818aadd9e46e34738a502be9813a52459f021988c65"
+    },
+    {
+      "path": "tools/nvaccel/metal_simd_test.m",
+      "sha256": "0f95d7a49ec6508a03e471c98bb072a8d41481f49f5e1d4a07a3d228a936f3e3"
+    },
+    {
+      "path": "tools/nvaccel/metal_srgb_test.m",
+      "sha256": "98b9b2f5bdea20af103c2057cb06b96d35cef8f44bfb99752b081a38bc981324"
+    },
+    {
+      "path": "tools/nvaccel/metal_stagein_test.m",
+      "sha256": "54463251fe2ba3b7cecb9e130cfe995d8bdaa736ff025142c87d7ecb5b6a2f7f"
+    },
+    {
+      "path": "tools/nvaccel/metal_stencil_cover_test.m",
+      "sha256": "6e3f36f59a7f4ea0628434382d9fefa3d2c05d4f7f484b9dca30b91e8a2f0d2e"
+    },
+    {
+      "path": "tools/nvaccel/metal_stencil_implicit_test.m",
+      "sha256": "050c36fd1de722358d691f6b4fc314899045b1b4b21944daac90829c1d516827"
+    },
+    {
+      "path": "tools/nvaccel/metal_storage_bench.m",
+      "sha256": "2cd4153b46cf7e56d152e537bc47f195ad0c636f5faa75aa65cf57795a0f6a9a"
+    },
+    {
+      "path": "tools/nvaccel/metal_surface_alias_test.m",
+      "sha256": "e4208fab7ba640b71a303b28334da380ea91cc125dcc5cf3136e3a0e4fc5981e"
+    },
+    {
+      "path": "tools/nvaccel/metal_sync_test.m",
+      "sha256": "d10c8f51defe78f8f24fa54d49202d1c0db815d9103b0f85788d683f349ff74c"
+    },
+    {
+      "path": "tools/nvaccel/metal_tess_lifetime_test.m",
+      "sha256": "269c307c59f59dc6346796b02171c4b17c35620dca2e70a34a1d7dd1be518533"
+    },
+    {
+      "path": "tools/nvaccel/metal_tess_test.m",
+      "sha256": "16f123e6e6a7ae289f62a2f7c87f0ad1c3144b63f6930da7be5d7f6877b0d45e"
+    },
+    {
+      "path": "tools/nvaccel/metal_test.m",
+      "sha256": "0e5b47c5934d7dbbd14acd05b2042c8cbef0dbb9ff9c4cc5a202c7a6a752af38"
+    },
+    {
+      "path": "tools/nvaccel/metal_tex_test.m",
+      "sha256": "8f02ee55806b7e541f822810ee943cafa82880f996b3494919f83bcd287b1c6e"
+    },
+    {
+      "path": "tools/nvaccel/metal_va0_test.m",
+      "sha256": "c33f84346e51e5f03eeca8713fb55229e0bf5e57f505315f0dcdaa8ee8326dc2"
+    },
+    {
+      "path": "tools/nvaccel/metal_vec_select_test.m",
+      "sha256": "4cfe7d2a167cf2b4ed91307de1a6f07c65eba50dae6e02a64dc7194e4cbcd36e"
+    },
+    {
+      "path": "tools/nvaccel/metal_vertex_id_state_test.m",
+      "sha256": "d06f4069b5c561978266b588760d4f8ffbf5e06eb2752ea3af26a16176ae9d30"
+    },
+    {
+      "path": "tools/nvaccel/metal_vram_coalesce_test.m",
+      "sha256": "b331703ed70f824890b3f34b16b5898555201359fb09dac24ebb2fc487cb58f6"
+    },
+    {
+      "path": "tools/nvaccel/metal_wsload_test.m",
+      "sha256": "8a383b7192ff01378786688ee64e6679654c3237455f4ad134802a6d359902fc"
+    },
+    {
+      "path": "tools/nvaccel/mtlspy.m",
+      "sha256": "68bbda4e66bd835b43b93aa2d374e168cea16db38b47cf42ce7b5e31a2f5dd86"
+    },
+    {
+      "path": "tools/nvaccel/nvaccel-go.sh",
+      "sha256": "adc113d8e26b706f4d869948e3ad8018e979f327ae96b33a27aa7636756fd742"
+    },
+    {
+      "path": "tools/nvaccel/nvaccel_go.c",
+      "sha256": "b60c83b211655d1c9e08a92b1f72a1298aaa7aa73916bdac8c6709f9cfa64805"
+    },
+    {
+      "path": "tools/nvaccel/nvperf.c",
+      "sha256": "70700ad536dc18fee5e8c38680d08d06ea43aaec8b193c96b400f422c0fe694b"
+    },
+    {
+      "path": "tools/nvaccel/rb_render_test.swift",
+      "sha256": "0ab80919c9fac14c305c5a9c93f5a43e94c59b7f04331af4de4d71f444bfb68d"
+    },
+    {
+      "path": "tools/nvaccel/rb_scene_test.swift",
+      "sha256": "74b981601d836603bc7db1dcae531c4613f94f0270b3729ef40993c3ecf8c3ad"
+    },
+    {
+      "path": "tools/nvaccel/rb_vertex_replay_test.m",
+      "sha256": "f3bbef61ee08a44ded6aa096724c9933729bb94b4f747d8aa45a3a9a77c9b662"
+    },
+    {
+      "path": "tools/nvaccel/rcwatch.sh",
+      "sha256": "ab5f2a338e147e0d4ae9e9563ee05799cfb6348681a82e8df2f0890c203c63b9"
+    },
+    {
+      "path": "tools/nvaccel/runsuite.sh",
+      "sha256": "495e8fbdb7b9ee357f28366f93102132476afbb605cf0b586820f2c316878f60"
+    },
+    {
+      "path": "tools/nvaccel/scn_subdiv_test.m",
+      "sha256": "a56a698073e749db6b43b50fdf10c1008911ecec18a42bbe88af2bb782c0a47b"
+    },
+    {
+      "path": "tools/nvaccel/vram_zero_test.m",
+      "sha256": "b2258163b6d6bf9165c00a970d428d73c46ace4b8ec955feab325609b227c066"
+    },
+    {
+      "path": "tools/nvaccel/vt_transfer_test.m",
+      "sha256": "a2e620582a00592fee01e84693aef60913a4add324c7e1ebee3a1266218cfcff"
+    },
+    {
+      "path": "tools/nvgsp_package.py",
+      "sha256": "e3589fdc14b321702ef4c56d01d632e70230a654733fc6b0bb338c7d6d809247"
+    },
+    {
+      "path": "tools/nvidia_bootloader_blob.py",
+      "sha256": "bc66365a59a462a8f72778f075c0006b6f23939850231288e0abda298ff8921f"
+    },
+    {
+      "path": "tools/nvidia_gsp_elf.py",
+      "sha256": "8eeae7ba1467d9cfb377b1a0c0de96a87988e9c303b9dc03e3d5b239ef9bba69"
+    },
+    {
+      "path": "tools/nvk-cts/build_cts.sh",
+      "sha256": "1cf7414e70e38b33e7571e2b481d1fcdc8dbda36def8c8185016d552684ba9b1"
+    },
+    {
+      "path": "tools/nvk-cts/regen.py",
+      "sha256": "36f585f59ade332e506d8f6e7b875c0ab65ec3b9a1f4aa6dbe1ab9665f01e6f6"
+    },
+    {
+      "path": "tools/nvk-cts/run_cts.py",
+      "sha256": "f6e2a28a0bc81169e84203da5da468bf96eb560883525ce48eca01072ebac6b6"
+    }
+  ]
+}

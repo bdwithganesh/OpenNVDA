@@ -9,8 +9,8 @@ namespace nvgsp {
 
 class GspInitStaging {
 public:
-    // `registry` = a packed SET_REGISTRY table (NVGspRegistry.hpp); null
-    // sends the empty table (8-byte header) as before.
+    // 0.113.0: `registry` = a packed SET_REGISTRY table (NVGspRegistry.hpp);
+    // null sends the empty table (8-byte header) as before.
     bool stage(const GspSystemInfoParameters &system, IOMapper *mapper = nullptr,
                const uint8_t *registry = nullptr, uint32_t registryBytes = 0) {
         if (ready_ || !queues_.allocate(kGspSharedBytes, false, mapper) ||
@@ -119,7 +119,7 @@ public:
 
     void reset() {
         ready_ = false; queueRootBus_ = 0;
-        // A fresh GSP expects command element seqNum 2 after the two
+        // 0.99.3: a fresh GSP expects command element seqNum 2 after the two
         // pre-queued RPCs; a stale counter (110 after one session) made the
         // S3 re-booted GSP-RM answer UNLOADING_GUEST_DRIVER (47) and halt.
         txSequence_ = 2;
@@ -127,7 +127,7 @@ public:
         libosArgs_.release(); gspArgs_.release(); queues_.release();
     }
     bool ready() const { return ready_; }
-    // GSP_ARGUMENTS_CACHED.srInitArguments (offset 32): resume =
+    // 0.100.0: GSP_ARGUMENTS_CACHED.srInitArguments (offset 32): resume =
     // {oldLevel 3, flags PRESERVING|PM_TRANSITION (5), bInPMTransition 1}
     // (nouveau r570_gsp_set_rmargs); cold = all zero.
     bool setSrArgs(bool resume) {
@@ -161,7 +161,7 @@ public:
         return static_cast<const uint8_t *>(queues_.bytes()) +
             kGspQueuePageTableBytes + kGspQueueBytes + 4096 + index * 4096;
     }
-    // Restore a post-stage queue snapshot (S3 re-boot on retained
+    // 0.99.0: restore a post-stage queue snapshot (S3 re-boot on retained
     // staging): identical bytes incl. page table, headers and the 2
     // pre-queued init RPCs, then synced for the device.
     bool restoreQueues(const void *snapshot) {
@@ -178,7 +178,7 @@ public:
         return queues_.syncToDevice();
     }
     bool enqueueRpc(uint32_t function, const void *payload,
-                    uint32_t payloadBytes) {
+                    uint32_t payloadBytes, uint32_t rpcSequence = 0) {
         const uint32_t messageBytes = sizeof(GspQueueElementHeader) +
             sizeof(RpcMessageHeader) + payloadBytes;
         const uint32_t elements = (messageBytes + 4095) / 4096;
@@ -201,7 +201,7 @@ public:
         uint8_t *record = static_cast<uint8_t *>(IOMalloc(recordBytes));
         if (!record) return false;
         const bool built = queueRpc(record, recordBytes, txSequence_, function,
-                                    payload, payloadBytes);
+                                    payload, payloadBytes, rpcSequence);
         if (built) {
             for (uint32_t i = 0; i < elements; ++i) {
                 const uint32_t slot = (header.writePtr + i) % header.msgCount;
@@ -215,7 +215,7 @@ public:
         __builtin_memcpy(command, &header, sizeof(header));
         if (!queues_.syncToDevice()) return false;
         ++txSequence_;
-        // Notify GSP (NV_PGSP_QUEUE_HEAD(0) doorbell, nouveau
+        // 0.100.5: notify GSP (NV_PGSP_QUEUE_HEAD(0) doorbell, nouveau
         // r535_gsp_cmdq_push). Without it GSP-RM only noticed commands on its
         // own ~0.7 s timer: every chain RPC cost ~1 s.
         if (doorbell_) doorbell_(doorbellCtx_);
@@ -223,7 +223,7 @@ public:
     }
     void setDoorbell(void (*fn)(void *), void *ctx) { doorbell_ = fn; doorbellCtx_ = ctx; }
     uint32_t txSequence() const { return txSequence_; }
-    // Debug read of the shared queue memory (page table + cmd + status).
+    // 0.99.2: debug read of the shared queue memory (page table + cmd + status).
     bool snapshotQueue(size_t offset, void *out, size_t bytes) const {
         if (!ready_ || !out || offset + bytes > kGspSharedBytes ||
             !queues_.syncFromDevice()) return false;
@@ -256,7 +256,7 @@ private:
     }
     static bool queueRpc(uint8_t *slot, size_t capacity, uint32_t queueSequence,
                          uint32_t function, const void *payload,
-                         uint32_t payloadBytes) {
+                         uint32_t payloadBytes, uint32_t rpcSequence = 0) {
         if (!slot || (!payload && payloadBytes) ||
             sizeof(GspQueueElementHeader) + sizeof(RpcMessageHeader) +
                 payloadBytes > capacity) return false;
@@ -274,6 +274,7 @@ private:
         rpc->function = function;
         rpc->result = 0xffffffff;
         rpc->privateResult = 0xffffffff;
+        rpc->sequence = rpcSequence;   // echoed by GSP-RM: matches a reply to its request
         if (payloadBytes)
             __builtin_memcpy(reinterpret_cast<uint8_t *>(rpc) + sizeof(*rpc),
                              payload, payloadBytes);

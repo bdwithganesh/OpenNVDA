@@ -1,26 +1,13 @@
-# nvk-macos
+# NVK on macOS
 
-Mesa's NVK (the open Vulkan driver for NVIDIA) running on macOS on top of NVGspControl.
+The Mesa 26.0.8 port is `mesa-26.0.8-macos-nvk.patch` in this folder. The patch under `tools/nakc` is an older compiler-era snapshot, so use this one for the Vulkan driver.
 
-NVK talks to the kernel through a small backend interface called `nvkmd`. On Linux that's nouveau's
-DRM; here `nvkmd_macos.c` implements it with our kext's user client instead (memory objects, VA binds,
-submits, fences). The rest of NVK runs pretty much unchanged, which is the nice part.
+Each submission restores context initialization and queue state before the command-buffer pushes, in one kernel batch. Push-stream allocations remain alive through the recorded completion fence. Submission splitting, shared channels and reset handling still have limits; this is not full Vulkan conformance or queue-isolation certification.
 
-## Files
+An earlier 1 October focused draw.renderpass selection reported 1896 passes and 152 unsupported cases, with zero failures; the separate restoration build had 370 failures in that selection. Those results were not rerun for this publication. Current [2 October evidence](../../docs/evidence/2026-10-02/README.md) is for display and focused Metal checks.
 
-- `mesa-26.0.8-macos-nvk.patch` – changes to the Mesa tree (build glue, the new backend hook)
-- `nvkmd_macos.c` – the backend itself
-- `nvk_macos_wsi.c`, `nvk_macos_layer*.{c,m}` – presenting to a window / to the screen
-- `libdrm_stubs.c` – the few libdrm functions NVK expects, stubbed
-- `vkcopy.c`, `vkpresent.c`, `vkwindow.m` – small test programs
+The resumable runner is in `tools/nvk-cts`. It journals completed cases and stops on requested crash/timeout boundaries. It does not recover the GPU by itself. Build the patched source in a configured x86 Mesa NVK tree:
 
-## Building
-
-Get Mesa 26.0.8, apply the patch, and build NVK with meson as usual (`-Dvulkan-drivers=nouveau`,
-`-Dgallium-drivers=`), pointing it at this folder. It's fiddly on macOS the first time; you'll need
-python3 with mako, meson and ninja.
-
-## Tests
-
-`tests/nvkmd_macos/run.sh <patched mesa tree>` runs the backend against a mock of the kext, no GPU
-needed (it runs on Linux too).
+```sh
+ninja -C build-nvk-x86 src/nouveau/vulkan/libvulkan_nouveau.dylib
+```

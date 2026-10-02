@@ -10,7 +10,7 @@
 // Pool addresses for SET_TEX_HEADER_POOL / SET_TEX_SAMPLER_POOL. False
 // until the first descriptor is made.
 bool nvTexPool(uint64_t *ticVa, uint32_t *ticMax, uint64_t *tscVa, uint32_t *tscMax);
-bool nvTicRead(uint32_t index, uint32_t d[8]);   // fault dumps
+bool nvTicRead(uint32_t index, uint32_t d[8]);   // 0.8.13: fault dumps
 
 // A pitch-linear 2D texture header. 0 when the format has no hardware
 // mapping yet or the address / pitch are not 32-byte aligned. *swapRB is set
@@ -31,7 +31,7 @@ void nvTscFree(uint32_t index);
 // Sampler from the 64-bit sampler-state word of an AIR constexpr sampler.
 uint32_t nvTscFromAirBits(uint64_t bits);
 
-// block-linear textures (mipmaps, arrays, cube, 3D), laid out the way
+// 0.5.2: block-linear textures (mipmaps, arrays, cube, 3D), laid out the way
 // NIL does it for Turing+ colour GOBs (64 B x 8 rows): level 0 takes a block
 // of 2^y GOBs high and 2^z deep (up to 32), later levels clamp it to their
 // size; each level is aligned to its block; layers sit array_stride apart.
@@ -42,14 +42,25 @@ typedef struct {
     uint64_t offset[16];               // level offsets inside a layer
     uint32_t rowBytes[16], rows[16], depth[16], ylog[16], zlog[16];
     uint64_t arrayStride, size;
+    uint32_t blk;                      // 0.8.14: texels per element edge (4: BC blocks), 0/1 plain
 } NVTexLayout;
 
 void nvTexLayoutInit(NVTexLayout *l, uint32_t w, uint32_t h, uint32_t d, uint32_t layers,
                      uint32_t levels, uint32_t bpp, bool is3D);
+// 0.8.14: w/h stay in texels; rows and row bytes are in blk x blk elements
+// (BC: 4x4 blocks of bpp bytes), level sizes rounded up per level like the
+// hardware does it
+void nvTexLayoutInitBlk(NVTexLayout *l, uint32_t w, uint32_t h, uint32_t d, uint32_t layers,
+                        uint32_t levels, uint32_t bpp, bool is3D, uint32_t blk);
+// texels per block edge: 4 for the BC formats, 1 otherwise
+uint32_t nvFormatBlockDim(MTLPixelFormat fmt);
 
 // Texture header for a block-linear texture. type: TEXHEAD texture type
 // (0 1D, 1 2D, 2 3D, 3 cube, 4 1D array, 5 2D array, 8 cube array).
 uint32_t nvTicAllocBL(MTLPixelFormat fmt, uint64_t va, uint32_t type, const NVTexLayout *l, bool *swapRB);
+void nvTicSwizzle(uint32_t index, MTLPixelFormat fmt, const uint8_t sw[4]);   // MTLTextureSwizzle per R G B A
 
 // bytes per pixel of a format the header table knows, 0 otherwise
 uint32_t nvFormatBytes(MTLPixelFormat fmt);
+// 0.8.25: 1 unsigned integer, 2 signed integer, 0 anything else (clear values go as raw bits)
+uint32_t nvFormatIntKind(MTLPixelFormat fmt);

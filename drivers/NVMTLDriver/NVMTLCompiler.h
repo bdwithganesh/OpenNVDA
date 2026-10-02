@@ -1,4 +1,4 @@
-// NVMTLCompiler: a small MetalSL-subset compute frontend that drives NAK.
+// NVMTLCompiler: MetalSL-subset compute frontend + NAK driver (B4 M4 v1).
 //
 // Subset: one or more `kernel void name(device [const] T *buf
 // [[buffer(N)]], ..., uint tid [[thread_position_in_grid]]) { body }` with
@@ -22,7 +22,7 @@
 @property (nonatomic) NSString *glsl;    // compute source, rebuilt per threadgroup shape
 @property (nonatomic) NSMutableDictionary *variants;   // "x,y,z" -> NVMTLKernel
 @property (nonatomic) BOOL isVertex;     // vertex shader: runtime appends out+vstart push
-// Vertex output layout: vec4 slots per vertex (1 for a float4
+// Vertex output layout (0.3.0): vec4 slots per vertex (1 for a float4
 // return, one per field for a struct return) and the [[position]] slot.
 @property (nonatomic) uint32_t voutStride;
 @property (nonatomic) uint32_t posSlot;
@@ -40,6 +40,11 @@
 @property (nonatomic) BOOL hwTex;         // textures/samplers as hardware handles (AIR kernels)
 @property (nonatomic) uint32_t nconstSamp;// constexpr samplers after the nsamp argument slots
 @property (nonatomic) NSData *constTsc;   // their sampler indices (uint32 each)
+@property (nonatomic) NSArray<NSString *> *refl;   // 0.8.15: nakc "refl ..." lines (pipeline reflection)
+@property (nonatomic) NSArray<NSNumber *> *mesh;   // 0.8.23: object/mesh stage: kind slot payloadStride maxV maxP nvdata vstride groupStride vpp
+@property (nonatomic) uint32_t rtReadMask;  // 0.8.40: fragment: [[color(n)]] inputs (framebuffer fetch), bit n
+@property (nonatomic) uint32_t rtReadDword; // push dword of attachment 0's texture handle (2 dwords each)
+@property (nonatomic) BOOL sampleShading; // fragment sample_id / per-sample interpolation
 @end
 
 // Fragment function. v1: constant color only (parsed). 0.3.0: `raster` is
@@ -67,8 +72,9 @@ NVMTLKernel *nvCompileGLSL(NSString *name, NSString *glsl);
 // The kernel built for a threadgroup shape (NIR folds gl_LocalInvocationID
 // against the declared local size, so 2D/3D groups need their own build).
 // Returns k itself for 256x1x1 or when k has no stored source.
-// tessellation pipeline stages nakc generates: "vs" (control point
+// 0.6.0: tessellation pipeline stages nakc generates: "vs" (control point
 // attributes -> varyings) or "tcs" (pass-through + factors from the buffer)
+NVMTLKernel *nvCompileMeshGen(NSArray<NSNumber *> *mesh);
 NVMTLKernel *nvCompileTessGen(NSString *kind, NSArray<NSNumber *> *locs, uint32_t cps, uint32_t domain);
 NVMTLKernel *nvKernelForBlock(NVMTLKernel *k, uint32_t x, uint32_t y, uint32_t z);
 
@@ -77,6 +83,7 @@ NVMTLKernel *nvKernelForBlock(NVMTLKernel *k, uint32_t x, uint32_t y, uint32_t z
 // kernel of it for a threadgroup shape. nil when the kernel is outside what
 // the AIR translator handles (the log says why).
 NSString *nvSaveMetallib(NSData *lib);
-NSString *nvSaveAir(NSData *bc);   // one function's bitcode
+NSString *nvSaveAir(NSData *bc);   // 0.6.5: one function's bitcode
+NSArray<NSString *> *nvVisibleArguments(NSString *libPath, NSString *name);   // 0.8.15
 NVMTLKernel *nvCompileAir(NSString *libPath, NSString *name, uint32_t x, uint32_t y, uint32_t z,
                           NSArray<NSString *> *extra);

@@ -1,7 +1,5 @@
-/*
- * H.264 syntax parser (see h264_parse.h). Written from the H.264 spec (7.3
- * syntax, 7.4 semantics, Table 7-2/7-3, Table A-1).
- */
+/* V1: H.264 syntax parser (see h264_parse.h). Written from the H.264
+ * specification (7.3 syntax, 7.4 semantics, Table 7-2/7-3, Table A-1). */
 #include "h264_parse.h"
 
 #include <string.h>
@@ -112,7 +110,7 @@ static void to_raster(const uint8_t *zz, const uint8_t *scan, int n, uint8_t *ou
     for (int i = 0; i < n; ++i) out[scan[i]] = zz[i];
 }
 
-/* scaling_list(): 1 = parsed, 0 = use the default list (7.3.2.1.1.1) */
+/* scaling_list(): 1 = parsed, 0 = use the default list (7.3.2.1.1.1). */
 static int parse_scaling_list(h264_bits *b, int n, const uint8_t *scan, uint8_t *raster) {
     uint8_t zz[64];
     int last = 8, next = 8;
@@ -128,10 +126,8 @@ static int parse_scaling_list(h264_bits *b, int n, const uint8_t *scan, uint8_t 
     return 1;
 }
 
-/*
- * Parse the lists present in the bitstream; fall-back per Table 7-2. seq4/seq8
- * = the sequence-level lists (rule B), NULL = rule A.
- */
+/* Parse the lists present in the bitstream; fall-back per Table 7-2.
+ * seq4/seq8 = the sequence-level lists (rule B), NULL = rule A. */
 static void parse_scaling_matrix(h264_bits *b, int count, uint8_t s4[6][16], uint8_t s8[6][64],
                                  const uint8_t (*seq4)[16], const uint8_t (*seq8)[64]) {
     for (int i = 0; i < 12; ++i) {

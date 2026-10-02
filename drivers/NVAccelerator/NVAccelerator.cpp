@@ -1,28 +1,26 @@
-// NVAccelerator: the RTX 4080 as an IOAcceleratorFamily2 accelerator,
-// basically the kernel half of Metal.
+// NVAccelerator: the RTX 4080 as an IOAcceleratorFamily2 accelerator, the
+// kernel half of Metal (B4, milestone M14 "Metal Device").
 //
-// Right now it's a skeleton: the family's user clients open and Metal can
-// enumerate the device. Every vendor hook is done the way AppleParavirtGPU
-// (from the KDK) does it where we know that, otherwise it's a stub that logs.
-// Actual GPU work (memory, submission) will go through NVGspControl.
+// 0.1.0 = M1 skeleton: the family's user clients open and Metal can enumerate
+// the device. Every vendor hook is implemented the way AppleParavirtGPU (KDK
+// 14.8.9) does it where that is known, otherwise as a logged stub. GPU work
+// (memory, submission) goes through NVGspControl in later milestones.
+// 0.1.5 = M2 memory: NVAccelSysMemory subclass (the family's MetaClass::alloc
+// returns NULL), factory tracing.
 //
-// Memory side: the family's IOAccelSysMemory can't be allocated directly
-// (its MetaClass::alloc just returns NULL), so we hand out our own
-// NVAccelSysMemory subclass, same trick Paravirt uses.
-//
-// Safety: a panic in an accelerator path repeats on every boot (Aux KC). An
-// NVRAM marker set from the kernel didn't survive such a loop, so the
-// accelerator only comes up once NVGspControl publishes the NVAcceleratorGo
-// resource, and userspace (tools/nvaccel/nvaccel-go.sh) asks for that after
-// the GSP chain, behind a file-based crash guard.
-//
-// We used to do that gate with IOResourceMatch right on the GPU personality.
-// Bad idea. IOKit's checkResource() just parks the GPU's matching thread in
-// waitForService() till the resource appears, so VGA@0 stays busy from boot.
-// WindowServer waits for the GPU to go quiet, gives up after 240 s and keeps
-// respawning, and you're stuck looking at the Apple logo. So now nothing
-// matches the GPU at all; NVAccelLauncher sits on IOResources, checks for the
-// resource once a second and starts NVAccelerator on the card by itself.
+// Safety: a panic in an accelerator path would repeat on every boot (Aux KC).
+// A kernel-set NVRAM marker did not survive such a loop (0.1.2, 26 Sep), so
+// the accelerator only starts after NVGspControl publishes the resource
+// NVAcceleratorGo, which userspace (tools/nvaccel/nvaccel-go.sh) does after
+// the GSP chain under a file-based crash guard.
+// 0.1.6: that gate used to be IOResourceMatch on the GPU personality. IOKit's
+// checkResource() parks the provider's matching thread in waitForService()
+// until the resource exists, so VGA@0 stayed busy from boot until someone
+// ran nvaccel_go; WindowServer waits for the GPU to go quiet, timed out after
+// 240 s ("FB: 0 of 1 opened") and respawned forever: Apple logo stuck (27 Sep).
+// Now nothing matches the GPU: NVAccelLauncher sits on IOResources, polls for
+// the resource once a second and attaches/starts NVAccelerator on the RTX
+// itself.
 #include "IOAF2.hpp"
 #include "IOAF2Pipe.hpp"
 #include "AGDC.hpp"
@@ -34,11 +32,14 @@
 #include <IOKit/IORangeAllocator.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <kern/clock.h>
+#ifndef KEXT_BUNDLE_VERSION
+#define KEXT_BUNDLE_VERSION "unknown"
+#endif
 
 #define NVALOG(fmt, ...) IOLog("NVAccelerator: " fmt "\n", ##__VA_ARGS__)
 
 // ---------------------------------------------------------------- event machine
-// what the family hands the vendor as a
+// 0.4.0 (native N1): what the family hands the vendor as a
 // vendevtCommandRec when it wants a stamp written. We only note which stamp
 // and value; NVAccelChannel::submitBuffer releases it on the GPU.
 struct NVStampRec {
@@ -52,7 +53,7 @@ class NVAccelEventMachine : public IOAccelEventMachineFast2 {
     OSDeclareDefaultStructors(NVAccelEventMachine)
 public:
     // AppleParavirtEventMachine::writeStamp = CommandAllocator::addSignal(idx, value)
-    // AppleParavirtEventMachine::init = super + setStampBaseAddress(
+    // 0.4.1: AppleParavirtEventMachine::init = super + setStampBaseAddress(
     // accel->getStampBaseAddress()); without it the per-stamp table (+0x28)
     // stays NULL and signalStamp faults (0.4.0 panic, 28 Sep 19:00)
     bool init(IOGraphicsAccelerator2 *a, unsigned int n, int t) override;
@@ -86,10 +87,10 @@ class NVAccelDisplayMachine : public IOAccelDisplayMachine {
     OSDeclareDefaultStructors(NVAccelDisplayMachine)
 public:
     // bool: returning false panics in IOAccelDisplayMachine::display_mode_did_change
-    // ("driver returns false", when WindowServer opens the framebuffer)
+    // ("driver returns false", WindowServer opening the framebuffer, live 0.1.2)
     bool displayModeWillChange() override { return true; }
     bool displayModeDidChange() override { return true; }
-    // the family looks for IOFramebuffers among the PCI device's
+    // 0.2.1: the family looks for IOFramebuffers among the PCI device's
     // children only; NVDisplay sits under NVGspControl, so hand it over
     bool start(IOPCIDevice *pci) override;
     bool started_ = false;
@@ -112,7 +113,7 @@ void NVAccelDisplayMachine::attachNVDisplay() {
     IOFramebuffer *fb = OSDynamicCast(IOFramebuffer, svc);
     const bool ok = fb && ((uintptr_t)found_framebuffer(fb) & 0xff);   // returns bool
     NVALOG("display machine: NVDisplay %p, found_framebuffer %s", fb, ok ? "true" : "false");
-    // the pipe comes after the framebuffer went online, so it never saw
+    // 0.2.4: the pipe comes after the framebuffer went online, so it never saw
     // that notification: tell it, then check what WindowServer will see
     const unsigned count = ioaf2DmFramebufferCount(this);
     IOAccelDisplayPipe *pipe = count ? ioaf2DmDisplayPipe(this, 0) : nullptr;
@@ -144,7 +145,7 @@ void NVAccelDisplayMachine::attachNVDisplay() {
 }
 
 // ---------------------------------------------------------------- display pipe
-// WindowServer composites into IOSurfaces and hands them to the
+// 0.2.0 (W1): WindowServer composites into IOSurfaces and hands them to the
 // display pipe of the framebuffer (without one: "Unable to find display
 // pipe for IOFB service"). v1 copies plane 0 of each transaction into
 // NVDisplay's scan-out memory (the aperture the software path used) and
@@ -161,6 +162,15 @@ extern uint32_t iosurfBytesPerRow(const void *s) __asm("__ZNK9IOSurface14getByte
 extern uint64_t iosurfAllocSize(const void *s) __asm("__ZNK9IOSurface12getAllocSizeEv");
 extern uint32_t iosurfPixelFormat(const void *s) __asm("__ZNK9IOSurface14getPixelFormatEv");
 
+// 0.5.9: how an asynchronous display pipe retires its transactions: once the
+// flip is done, signalTransactionInterrupt() (it only acts while the family
+// has transaction interrupts enabled, +0x2a4) kicks the family's workloop;
+// transaction_interrupt_gated asks isTransactionComplete(live) and then
+// completeTransaction. 0.5.7/0.5.8 never signalled: releaseLiveTransaction in
+// a display change slept for good and WindowServer hung (IOAcceleratorFamily2
+// 487.4.4 disassembly, KDK 25G83).
+extern void ioaf2SignalTxnInterrupt(IOAccelDisplayPipe *p, void *ref)
+    __asm("__ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv");
 extern void *ioaf2SysMemWithMD(IOGraphicsAccelerator2 *a, IOAccelResource2 *r, IOMemoryDescriptor *md)
     __asm("__ZN16IOAccelSysMemory20withMemoryDescriptorEP22IOGraphicsAccelerator2P16IOAccelResource2P18IOMemoryDescriptor");
 
@@ -168,24 +178,24 @@ class NVAccelDisplayPipe : public IOAccelDisplayPipe {
     OSDeclareDefaultStructors(NVAccelDisplayPipe)
     IOFramebuffer *fb_ = nullptr;
     IOGraphicsAccelerator2 *accel_ = nullptr;   // not retained (it owns us)
-    IOBufferMemoryDescriptor *fbMem_ = nullptr;   // sysmem framebuffer resource backing
+    IOBufferMemoryDescriptor *fbMem_ = nullptr;   // 0.2.9: sysmem framebuffer resource backing
     IOMemoryMap *map_ = nullptr;
     UInt32 fbRowBytes_ = 0, fbHeight_ = 0, fbWidthBytes_ = 0;
     UInt64 copies_ = 0, empty_ = 0, lastFormat_ = 0;
-    // surfaces WindowServer flips, wired and mapped once (it cycles a
+    // 0.3.9: surfaces WindowServer flips, wired and mapped once (it cycles a
     // few). readBytes on an unprepared descriptor panics (IOGMD: not wired).
     struct SurfMap { IOMemoryDescriptor *md; IOMemoryMap *map; UInt64 used; };
     SurfMap surf_[6] = {};
     UInt64 copyTicks_ = 0;
     UInt64 surfTick_ = 0;
-    // the flip on the kernel copy engine (NVGspControl
+    // 0.4.9 (native N4): the flip on the kernel copy engine (NVGspControl
     // "nvgsp-flip-copy"); the CPU copy stays as the fallback. NVRAM
     // nvaccel-ceflip=0 keeps the CPU copy.
     UInt64 apBus_ = 0;
     IOService *gsp_ = nullptr;
     int ceFlip_ = -1;
     UInt64 ceFlips_ = 0, ceFails_ = 0;
-    // vsync. The CPU copy went into the live scan-out buffer at any
+    // 0.5.1: vsync. The CPU copy went into the live scan-out buffer at any
     // point of the frame, so the beam showed half old, half new (glitches,
     // tearing). Now the copy starts right after a vblank: 1.5 ms for a 4K
     // frame against 16.7 ms of scan-out, it stays ahead of the beam. The
@@ -197,6 +207,45 @@ class NVAccelDisplayPipe : public IOAccelDisplayPipe {
     UInt64 vblWaits_ = 0, vblTimeouts_ = 0;
     static void onVblank(void *ref, UInt32 count, UInt64 at);
     void waitVblank();
+    // 0.5.7: asynchronous flips. submitTransaction used to wait for the next
+    // vblank and copy on WindowServer's thread (up to ~18 ms a frame blocked:
+    // the compositor could not prepare the next frame, animations stuttered).
+    // Now it queues the surface and returns; a thread call started by the
+    // vblank callback copies it right after the vblank, and the transaction
+    // stays incomplete (isTransactionComplete) until its copy is done, so
+    // WindowServer does not reuse the surface early. A newer submit replaces
+    // a queued one that was not copied yet (that frame is skipped, as a swap
+    // queue does). NVRAM nvaccel-asyncflip=0 keeps the synchronous path.
+    // 0.5.8: the family waits for the live transaction in display changes
+    // (releaseLiveTransaction), when vblanks may stop while the head is
+    // reprogrammed: 0.5.7 then never copied, WindowServer hung, watchdog
+    // panic. A 25 ms backstop call copies without a vblank, and a transaction
+    // pending for more than 100 ms reads complete whatever happens.
+    IOLock *flipLock_ = nullptr;
+    thread_call_t flipCall_ = nullptr, flipBackstop_ = nullptr;
+    volatile UInt64 pendingSince_ = 0;
+    int asyncFlip_ = -1;
+    struct PendingFlip { IOAccelDisplayPipeTransaction2 *t; IOMemoryDescriptor *md; UInt64 bpr, size; UInt32 fmt;
+                         bool ringWait; UInt32 grTarget, ceTarget; };
+    PendingFlip pending_ = {};
+    IOAccelDisplayPipeTransaction2 *volatile pendingTxn_ = nullptr;   // queued, not copied yet
+    IOAccelDisplayPipeTransaction2 *volatile copyingTxn_ = nullptr;   // being copied now
+    UInt64 asyncFlips_ = 0, skippedFlips_ = 0;
+    static void flipCallout(thread_call_param_t self, thread_call_param_t);
+    UInt64 renderWaits_ = 0;
+    // 0.5.13: the last frame on screen, put back after a GPU reset wiped the
+    // scan-out memory (black until WindowServer's next flip)
+    PendingFlip lastFlip_ = {};
+    thread_call_t restoreCall_ = nullptr;
+    UInt32 restores_ = 0;
+    static void onResetDone(void *ref);
+    static void restoreCallout(thread_call_param_t self, thread_call_param_t);
+    UInt32 eventLogs_ = 0;
+    bool renderDone(IOAccelDisplayPipeTransaction2 *t);
+    bool ringProgress(UInt32 p[4]);                   // 0.5.11: NVGspControl "nvgsp-ring-progress"
+    bool ringsPassed(const PendingFlip &f);
+    bool setupVsync();
+    void copySurface(IOMemoryDescriptor *md, UInt64 bpr, UInt64 size, UInt32 fmt);
     IOService *gspService();
     bool flipOnCopyEngine(IOMemoryDescriptor *md, UInt64 bpr, UInt32 rows, UInt32 n);
     IOMemoryMap *surfaceMap(IOMemoryDescriptor *md);
@@ -205,13 +254,19 @@ class NVAccelDisplayPipe : public IOAccelDisplayPipe {
 public:
     bool init(IOGraphicsAccelerator2 *a, IOAccelDisplayMachine *m, IOFramebuffer *fb, unsigned int idx) override;
     void free() override;
-    // the framebuffer resource wraps the scan-out memory, as Paravirt's
+    // 0.2.8: the framebuffer resource wraps the scan-out memory, as Paravirt's
     // pipe does (IOAccelSysMemory::withMemoryDescriptor); without it
     // init_framebuffer_resource fails and the pipe never becomes active
     void *initFramebufferResource(unsigned int idx, IOAccelResource2 *res) override;
     void *destroyFramebufferResource(unsigned int idx, IOAccelResource2 *res) override;
-    bool isTransactionComplete(IOAccelDisplayPipeTransaction2 *) override { return true; }
-    // trace how far WindowServer's swaps get into the family
+    bool isTransactionComplete(IOAccelDisplayPipeTransaction2 *t) override {
+        if (t != pendingTxn_ && t != copyingTxn_) return true;   // 0.5.7: see asynchronous flips
+        UInt64 ns = 0;
+        const UInt64 since = pendingSince_;
+        if (since) absolutetime_to_nanoseconds(mach_absolute_time() - since, &ns);
+        return since && ns > 100000000ULL;                        // 0.5.8: never wait forever
+    }
+    // 0.3.7: trace how far WindowServer's swaps get into the family
     UInt32 trace_[8] = {};
     bool tr(unsigned k) { return trace_[k] < 6 && ++trace_[k]; }
     void *newDisplayPipeTransaction() override {
@@ -263,7 +318,7 @@ bool NVAccelDisplayPipe::init(IOGraphicsAccelerator2 *a, IOAccelDisplayMachine *
 }
 
 void *NVAccelDisplayPipe::initFramebufferResource(unsigned int idx, IOAccelResource2 *res) {
-    // system memory, as Paravirt's framebuffer is (the aperture as an
+    // 0.2.9: system memory, as Paravirt's framebuffer is (the aperture as an
     // IOAccelSysMemory never prepared: "failed to wire down system map");
     // submitTransaction copies whatever is flipped into the aperture
     OSSafeReleaseNULL(fbMem_);
@@ -328,11 +383,103 @@ void NVAccelDisplayPipe::onVblank(void *ref, UInt32 count, UInt64) {
     p->vblSeen_ = count;
     IOLockWakeup(p->vblLock_, (event_t)&p->vblSeen_, false);
     IOLockUnlock(p->vblLock_);
+    if (p->pendingTxn_ && p->flipCall_) thread_call_enter(p->flipCall_);   // 0.5.7
+}
+
+// 0.5.7: the queued flip, right after a vblank (thread call, not the
+// interrupt workloop: the copy takes ~1.5 ms for a 4K frame)
+void NVAccelDisplayPipe::flipCallout(thread_call_param_t param, thread_call_param_t) {
+    NVAccelDisplayPipe *p = static_cast<NVAccelDisplayPipe *>(param);
+    if (!p || !p->flipLock_) return;
+    IOLockLock(p->flipLock_);
+    // 0.5.10: the family queues a transaction (and calls submitTransaction)
+    // before the GPU has rendered its surface; the hardware is meant to hold
+    // the flip until the transaction's IOAccelEvent (+0x60, 8 x {stamp
+    // index, value}) has passed. Copying at once showed half-drawn frames
+    // (a black triangle-edged block right after display wake, 1 Oct 04:20).
+    if (p->pending_.t && (!p->ringsPassed(p->pending_) || !p->renderDone(p->pending_.t))) {
+        IOLockUnlock(p->flipLock_);
+        UInt64 deadline = 0;                          // look again soon (and at the next vblank)
+        clock_interval_to_deadline(2, kMillisecondScale, &deadline);
+        thread_call_enter_delayed(p->flipBackstop_, deadline);
+        ++p->renderWaits_;
+        return;
+    }
+    PendingFlip f = p->pending_;
+    p->pending_ = PendingFlip{};
+    p->copyingTxn_ = f.t;
+    p->pendingTxn_ = nullptr;
+    p->pendingSince_ = 0;
+    if (f.md) {
+        p->copySurface(f.md, f.bpr, f.size, f.fmt);
+        if (p->lastFlip_.md != f.md) {                // 0.5.13
+            f.md->retain();
+            if (p->lastFlip_.md) p->lastFlip_.md->release();
+        }
+        p->lastFlip_ = f;
+        p->lastFlip_.t = nullptr;
+    }
+    p->copyingTxn_ = nullptr;
+    IOLockUnlock(p->flipLock_);
+    if (f.md) f.md->release();
+    if (!f.md) return;                                // a backstop after the vblank copy: nothing to do
+    ++p->asyncFlips_;
+    ioaf2SignalTxnInterrupt(p, nullptr);              // 0.5.9: let the family retire it now
+}
+
+// 0.5.11: ring positions from NVGspControl (see "nvgsp-ring-progress")
+bool NVAccelDisplayPipe::ringProgress(UInt32 p[4]) {
+    IOService *g = gspService();
+    return g && g->callPlatformFunction("nvgsp-ring-progress", false, p, nullptr, nullptr, nullptr) == kIOReturnSuccess;
+}
+
+// everything queued on the GR and CE rings when the flip was queued is done
+bool NVAccelDisplayPipe::ringsPassed(const PendingFlip &f) {
+    if (!f.ringWait) return true;
+    UInt32 p[4] = {};
+    if (!ringProgress(p)) return true;                // no GPU state (reset): do not hold the screen
+    return static_cast<SInt32>(p[1] - f.grTarget) >= 0 && static_cast<SInt32>(p[3] - f.ceTarget) >= 0;
+}
+
+// 0.5.10: has the GPU finished the surface of `t`? (IOAccelEventMachineFast2::
+// testEventUnlocked on the transaction's event, lock-free stamp reads)
+bool NVAccelDisplayPipe::renderDone(IOAccelDisplayPipeTransaction2 *t) {
+    IOAccelEventMachine2 *em = accel_ ? *reinterpret_cast<IOAccelEventMachine2 **>(reinterpret_cast<UInt8 *>(accel_) + 0x380)
+                                      : nullptr;
+    if (!em || !t) return true;
+    IOAccelEvent *ev = reinterpret_cast<IOAccelEvent *>(reinterpret_cast<UInt8 *>(t) + 0x60);
+    const bool done = static_cast<bool>(reinterpret_cast<uintptr_t>(em->testEventUnlocked(ev)) & 1);
+    if (eventLogs_ < 6) {                             // what the event holds, for the layout check
+        const UInt32 *w = reinterpret_cast<const UInt32 *>(ev);
+        ++eventLogs_;
+        NVALOG("display pipe: txn event %d:%u %d:%u %d:%u -> %s", (int)w[0], w[1], (int)w[2], w[3], (int)w[4], w[5],
+               done ? "done" : "pending");
+    }
+    return done;
 }
 
 // Sleep until the next vblank (at most 20 ms: a missing interrupt must not
 // stall WindowServer).
-void NVAccelDisplayPipe::waitVblank() {
+// 0.5.13: NVGspControl calls this (no lock held) when a GPU reset is over
+void NVAccelDisplayPipe::onResetDone(void *ref) {
+    NVAccelDisplayPipe *p = static_cast<NVAccelDisplayPipe *>(ref);
+    NVALOG("display pipe: GPU reset over, last frame %s", p && p->lastFlip_.md ? "kept" : "none");
+    if (p && p->restoreCall_) thread_call_enter(p->restoreCall_);
+}
+
+void NVAccelDisplayPipe::restoreCallout(thread_call_param_t param, thread_call_param_t) {
+    NVAccelDisplayPipe *p = static_cast<NVAccelDisplayPipe *>(param);
+    if (!p || !p->flipLock_) return;
+    IOLockLock(p->flipLock_);
+    if (p->lastFlip_.md && p->mapFramebuffer()) {
+        p->copySurface(p->lastFlip_.md, p->lastFlip_.bpr, p->lastFlip_.size, p->lastFlip_.fmt);
+        ++p->restores_;
+    }
+    IOLockUnlock(p->flipLock_);
+    NVALOG("display pipe: last frame put back after a GPU reset (%u)", p->restores_);
+}
+
+bool NVAccelDisplayPipe::setupVsync() {
     if (vsync_ < 0) {
         vsync_ = 1;
         if (IORegistryEntry *o = IORegistryEntry::fromPath("/options", gIODTPlane)) {
@@ -348,8 +495,19 @@ void NVAccelDisplayPipe::waitVblank() {
                              : kIOReturnUnsupported;
         if (r != kIOReturnSuccess) vsync_ = 0;
         NVALOG("display pipe: vsync %s (0x%x)", vsync_ ? "on" : "off", r);
+        if (!restoreCall_) restoreCall_ = thread_call_allocate(&NVAccelDisplayPipe::restoreCallout, this);
+        if (g && restoreCall_) {                        // 0.5.13
+            const IOReturn rr = g->callPlatformFunction("nvgsp-reset-register", false,
+                                                        reinterpret_cast<void *>(&NVAccelDisplayPipe::onResetDone),
+                                                        this, nullptr, nullptr);
+            NVALOG("display pipe: reset callback 0x%x", rr);
+        }
     }
-    if (vsync_ != 1) return;
+    return vsync_ == 1;
+}
+
+void NVAccelDisplayPipe::waitVblank() {
+    if (!setupVsync()) return;
     IOLockLock(vblLock_);
     const UInt32 start = vblSeen_;
     UInt64 deadline = 0;
@@ -393,6 +551,16 @@ bool NVAccelDisplayPipe::flipOnCopyEngine(IOMemoryDescriptor *md, UInt64 bpr, UI
 }
 
 void NVAccelDisplayPipe::free() {
+    if (restoreCall_ && gsp_)                         // 0.5.13
+        gsp_->callPlatformFunction("nvgsp-reset-register", false, nullptr, this, nullptr, nullptr);
+    if (restoreCall_) { thread_call_cancel(restoreCall_); thread_call_free(restoreCall_); restoreCall_ = nullptr; }
+    if (lastFlip_.md) OSSafeReleaseNULL(lastFlip_.md);
+    thread_call_t *calls[2] = {&flipCall_, &flipBackstop_};   // 0.5.7
+    for (thread_call_t *c : calls)
+        if (*c) { thread_call_cancel(*c); thread_call_free(*c); *c = nullptr; }
+    if (pending_.md) OSSafeReleaseNULL(pending_.md);
+    pendingTxn_ = copyingTxn_ = nullptr;
+    if (flipLock_) { IOLockFree(flipLock_); flipLock_ = nullptr; }
     if (vsync_ == 1 && gsp_)
         gsp_->callPlatformFunction("nvgsp-vblank-unregister", false,
                                    reinterpret_cast<void *>(&NVAccelDisplayPipe::onVblank), this, nullptr, nullptr);
@@ -444,20 +612,63 @@ IOReturn NVAccelDisplayPipe::submitTransaction(IOAccelDisplayPipeTransaction2 *t
         md = fbMem_; bpr = fbRowBytes_; size = fbMem_->getLength(); fmt = 'BGRA';
     }
     if (!md || !bpr) return kIOReturnSuccess;
+    if (asyncFlip_ < 0) {                            // 0.5.7
+        asyncFlip_ = 1;
+        if (IORegistryEntry *o = IORegistryEntry::fromPath("/options", gIODTPlane)) {
+            if (OSData *d = OSDynamicCast(OSData, o->getProperty("nvaccel-asyncflip")))
+                asyncFlip_ = !(d->getLength() >= 1 && static_cast<const char *>(d->getBytesNoCopy())[0] == '0');
+            o->release();
+        }
+        if (asyncFlip_) {
+            flipLock_ = IOLockAlloc();
+            flipCall_ = flipLock_ ? thread_call_allocate(&NVAccelDisplayPipe::flipCallout, this) : nullptr;
+            flipBackstop_ = flipCall_ ? thread_call_allocate(&NVAccelDisplayPipe::flipCallout, this) : nullptr;
+            if (!flipBackstop_) asyncFlip_ = 0;
+        }
+        NVALOG("display pipe: asynchronous flips %s", asyncFlip_ ? "on" : "off");
+    }
+    // without vblanks there is nothing to start the copy: do it here
+    if (asyncFlip_ != 1 || !setupVsync()) {
+        waitVblank();
+        if (flipLock_) IOLockLock(flipLock_);
+        copySurface(md, bpr, size, fmt);
+        if (flipLock_) IOLockUnlock(flipLock_);
+        return kIOReturnSuccess;
+    }
+    md->retain();
+    UInt32 prog[4] = {};                              // 0.5.11: the GPU work queued so far
+    const bool rw = ringProgress(prog);
+    IOLockLock(flipLock_);
+    IOMemoryDescriptor *dropped = pending_.md;
+    if (dropped) ++skippedFlips_;                     // the queued frame never reached the screen
+    pending_ = PendingFlip{t, md, bpr, size, fmt, rw, prog[0], prog[2]};
+    if (!dropped) pendingSince_ = mach_absolute_time();
+    pendingTxn_ = t;                                  // the replaced one now reads complete
+    IOLockUnlock(flipLock_);
+    if (dropped) dropped->release();
+    UInt64 deadline = 0;                              // 0.5.8: copy even if no vblank comes
+    clock_interval_to_deadline(25, kMillisecondScale, &deadline);
+    thread_call_enter_delayed(flipBackstop_, deadline);
+    return kIOReturnSuccess;
+}
+
+// Copy one surface into the scan-out memory. Caller holds flipLock_ (when
+// there is one): surf_ and the copy statistics are shared with flipCallout.
+void NVAccelDisplayPipe::copySurface(IOMemoryDescriptor *md, UInt64 bpr, UInt64 size, UInt32 fmt) {
     UInt32 rows = fbHeight_;
     if (bpr * rows > size) rows = (UInt32)(size / bpr);
     const UInt32 n = (UInt32)(bpr < fbWidthBytes_ ? bpr : fbWidthBytes_);
-    uint8_t *dst = reinterpret_cast<uint8_t *>(map_->getVirtualAddress());
+    uint8_t *dst = map_ ? reinterpret_cast<uint8_t *>(map_->getVirtualAddress()) : nullptr;
+    if (!dst) return;
     if (fbRowBytes_ * (UInt64)rows > map_->getLength()) rows = (UInt32)(map_->getLength() / fbRowBytes_);
     // the framebuffer resource is ours and wired; a client surface is wired
     // and mapped here once (surfaceMap), then copied row by row
     IOMemoryMap *sm = md == fbMem_ ? nullptr : surfaceMap(md);
     const uint8_t *src = sm ? reinterpret_cast<const uint8_t *>(sm->getVirtualAddress())
                             : md == fbMem_ ? static_cast<const uint8_t *>(fbMem_->getBytesNoCopy()) : nullptr;
-    if (!src) { if (tr(7)) NVALOG("display pipe: surface could not be mapped"); return kIOReturnSuccess; }
+    if (!src) { if (tr(7)) NVALOG("display pipe: surface could not be mapped"); return; }
     const UInt64 have = sm ? sm->getLength() : size;
     if (bpr * (UInt64)rows > have) rows = (UInt32)(have / bpr);
-    waitVblank();
     const UInt64 t0 = mach_absolute_time();
     if (!flipOnCopyEngine(md, bpr, rows, n))
         for (UInt32 y = 0; y < rows; ++y) memcpy(dst + (UInt64)y * fbRowBytes_, src + (UInt64)y * bpr, n);
@@ -466,20 +677,19 @@ IOReturn NVAccelDisplayPipe::submitTransaction(IOAccelDisplayPipeTransaction2 *t
         lastFormat_ = fmt;
         UInt64 ns = 0;
         absolutetime_to_nanoseconds(copyTicks_ / (copies_ + 1), &ns);
-        NVALOG("display pipe: flip %llu, surface fmt %c%c%c%c bpr %llu, %u rows, copy %llu us avg, %llu on the copy engine, vsync %d (%llu waits, %llu timeouts)",
+        NVALOG("display pipe: flip %llu, surface fmt %c%c%c%c bpr %llu, %u rows, copy %llu us avg, %llu on the copy engine, vsync %d (%llu waits, %llu timeouts), async %d (%llu, %llu skipped, %llu render waits)",
                copies_, (char)(fmt >> 24), (char)(fmt >> 16), (char)(fmt >> 8), (char)fmt, bpr, rows, ns / 1000, ceFlips_,
-               vsync_, vblWaits_, vblTimeouts_);
+               vsync_, vblWaits_, vblTimeouts_, asyncFlip_, asyncFlips_, skippedFlips_, renderWaits_);
     }
     ++copies_;
-    return kIOReturnSuccess;
 }
 
 // ---------------------------------------------------------------- memory
 // IOAccelSysMemory::MetaClass::alloc in the family returns NULL (0x55686:
-// xor %eax,%eax; ret) - the class is abstract-by-alloc, so newSysMemory must
+// xor %eax,%eax; ret) — the class is abstract-by-alloc, so newSysMemory must
 // return our own subclass, exactly like AppleParavirtSysMemory (which only
 // overrides dtor/getMetaClass). Verified: without this, withOptions logs
-// "allocIOAccelResource failed to alloc texture object" (seen live).
+// "allocIOAccelResource failed to alloc texture object" (live 0.1.4).
 class NVAccelSysMemory : public IOAccelSysMemory {
     OSDeclareDefaultStructors(NVAccelSysMemory)
 };
@@ -500,7 +710,7 @@ OSDefineMetaClassAndStructors(NVAccelVidMemory, IOAccelVidMemory)
 class NVAccelMemoryMap : public IOAccelMemoryMap {
     OSDeclareDefaultStructors(NVAccelMemoryMap)
 public:
-    // IOAccel resources are not in our GPU page tables (NVMTLDriver
+    // 0.2.10: IOAccel resources are not in our GPU page tables (NVMTLDriver
     // maps memory through NVGspControl), so committing one is a no-op that
     // succeeds; returning false made every IOAccel prepare fail
     void *commitIntoGPUPageTable() override { return (void *)1; }
@@ -525,7 +735,7 @@ public:
     void *rebuildPagingBuffer() override { return nullptr; }
     void *getLevelOffset(unsigned char, unsigned char, int *o) override { if (o) *o = 0; return nullptr; }
     void *getBackingLevelOffset(unsigned char, unsigned char, int *o) override { if (o) *o = 0; return nullptr; }
-    // as AppleParavirtResource: the surface's allocation size and
+    // 0.3.12: as AppleParavirtResource: the surface's allocation size and
     // row bytes. The family takes the first as the length of an IOSurface
     // resource (type 0xc0); 0 here gave WindowServer's display surfaces an
     // empty mapping that could not get a GPU address.
@@ -543,8 +753,8 @@ public:
 OSDefineMetaClassAndStructors(NVAccelResource, IOAccelResource2)
 
 // ---------------------------------------------------------------- GPU task
-// AppleParavirtTask::init(accel, vaBytes): IORangeAllocator over [0, va), 4
-// KiB granules, page 0 reserved, then IOAccelTask::init(accel, 1, &ra).
+// AppleParavirtTask::init(accel, vaBytes): IORangeAllocator over [0, va),
+// 4 KiB granules, page 0 reserved, then IOAccelTask::init(accel, 1, &ra).
 class NVAccelTask : public IOAccelTask {
     OSDeclareDefaultStructors(NVAccelTask)
 public:
@@ -561,7 +771,7 @@ public:
 OSDefineMetaClassAndStructors(NVAccelTask, IOAccelTask)
 
 // ---------------------------------------------------------------- AGDC
-// IOPresentment (WindowServer's display path on Sonoma) builds
+// 0.3.0 (W1): IOPresentment (WindowServer's display path on Sonoma) builds
 // its device map from AppleGraphicsDeviceControl services: it opens each,
 // asks for the vendor information (attribute 1) and the GPU capabilities,
 // and only then pairs the IOFramebuffer with a display pipe. Real GPU
@@ -623,7 +833,7 @@ void *NVGraphicsDeviceControl::vendor_doDeviceAttribute(unsigned int attr, unsig
             const UInt64 mask = 1ULL << 1;   // ((1 << n) - 1) * 2 with n = 1
             for (int k = 0; k < 4; ++k) *reinterpret_cast<UInt64 *>(o + 8 * k) = mask;
             for (int k = 0; k < 5; ++k) *reinterpret_cast<UInt32 *>(o + 0x20 + 4 * k) = 1;
-            // pointers, not IDs; AGDC turns 0x34 (the GPU) and the 0x3c
+            // 0.3.3: pointers, not IDs; AGDC turns 0x34 (the GPU) and the 0x3c
             // framebuffer list into registry IDs itself (an ID here panicked it)
             if (!fb_) {
                 OSDictionary *m = IOService::serviceMatching("NVDisplay");
@@ -725,21 +935,31 @@ void *NVGraphicsDeviceControl::vendor_doDeviceAttribute(unsigned int attr, unsig
 // ---------------------------------------------------------------- accelerator
 class NVAccelerator : public IOGraphicsAccelerator2 {
     OSDeclareDefaultStructors(NVAccelerator)
-    IOMemoryDescriptor *stamp_ = nullptr;   // VRAM stamp region (BAR1) or sysmem fallback
-    IOMemoryMap *stampMap_ = nullptr;       // kernel view for the event machine
-    NVAccelDisplayMachine *dm_ = nullptr;   // not retained (the family owns it)
+    IOMemoryDescriptor *stamp_ = nullptr;   // 0.4.0: VRAM stamp region (BAR1) or sysmem fallback
+    IOMemoryMap *stampMap_ = nullptr;       // 0.4.1: kernel view for the event machine
+    NVAccelDisplayMachine *dm_ = nullptr;   // 0.2.2: not retained (the family owns it)
 public:
-    // IOAccel stamps written by the GPU, see NVAccelChannel
+    // 0.4.0 (native N1): IOAccel stamps written by the GPU, see NVAccelChannel
     IOService *gsp_ = nullptr;              // NVGspControl, retained
     UInt64 stampGpuVa_ = 0;                 // 0 = native path off
     class NVAccelChannel *chan_[2] = {};    // stamp 0 GR, 1 CE
     IOLock *taskLock_ = nullptr;
     volatile UInt32 nativeOut_ = 0;         // native submits so far (0 = never signal)
-    // the GR non-stall interrupt only lands now and then, so the
+    // 0.4.5: the GR non-stall interrupt only lands now and then, so the
     // family retired native command buffers on its ~100 ms timer. A poller
     // watches the stamps while work is out and signals them as they land.
     volatile UInt32 stampSubmitted_[2] = {}, stampSignaled_[2] = {};
-    // the family hands out the stamp value (writeStampCommand) before
+    // Protected by stampCancelLock_: a rejected stamp may retire only after the
+    // last accepted stamp before it has really completed.
+    UInt32 stampAccepted_[2] = {}, stampCanceled_[2] = {}, stampCancelAfter_[2] = {};
+    bool stampCancelPending_[2] = {}, stampSubmitting_[2] = {};
+    IOLock *stampCancelLock_ = nullptr;
+    UInt32 canceledCompletions_ = 0;
+    void beginNativeStamp(UInt32 index);
+    void recordNativeStamp(UInt32 index, UInt32 value, bool accepted);
+    void retireCanceledStamps();
+    UInt32 failedSubmits_ = 0;              // 0.5.12
+    // 0.5.0: the family hands out the stamp value (writeStampCommand) before
     // we put the work on the ring (submitBuffer). Two processes submitting at
     // once could reach the ring in the other order; the later value landed
     // first and completed the earlier command buffer before its work ran, so
@@ -751,14 +971,16 @@ public:
     thread_call_t pollCall_ = nullptr;
     volatile UInt32 pollArmed_ = 0;
     volatile bool pollStop_ = false;
-    // GPU busy time from native submissions, published as the
+    // 0.4.8 (N6): GPU busy time from native submissions, published as the
     // keys Activity Monitor reads from PerformanceStatistics
     UInt64 busyStartAbs_ = 0, busyAccumAbs_ = 0, busyLastAccumAbs_ = 0, statLastAbs_ = 0;
     UInt32 utilPct_ = 0;
+    UInt32 tempC_ = 0;                        // 0.5.5
+    const OSSymbol *tempSym_ = nullptr;
     IOLock *statLock_ = nullptr;
     thread_call_t statCall_ = nullptr;
     void noteBusy(bool busy);
-    // PGRAPH busy sampled at 100 Hz through NVGspControl, so every
+    // 0.5.1: PGRAPH busy sampled at 100 Hz through NVGspControl, so every
     // client counts (sync submissions too, not only native ones)
     thread_call_t sampleCall_ = nullptr;
     const OSSymbol *grBusySym_ = nullptr;
@@ -773,21 +995,21 @@ public:
     void kickStampPoll();
     void checkStamps();
     static void pollCallout(thread_call_param_t self, thread_call_param_t);
-    // the kernel command names its client by tag; a process may
+    // 0.4.7: the kernel command names its client by tag; a process may
     // hold more than one client (WindowServer does), each with its own arena
     struct TaskClient { void *task; IOUserClient *inner; UInt32 tag; };
     TaskClient tasks_[128] = {};
     void noteTaskClient(void *task, IOUserClient *inner, UInt32 tag, bool add);
     IOUserClient *clientForTag(void *task, UInt32 tag);
     static void stampIrq(void *ref, UInt32 mask);
-    IOAccelEventMachine2 *eventMachine() {   // IOGraphicsAccelerator2 + 0x380
+    IOAccelEventMachine2 *eventMachine() {   // IOGraphicsAccelerator2 + 0x380 (14.8.9)
         return *reinterpret_cast<IOAccelEventMachine2 **>(reinterpret_cast<UInt8 *>(this) + 0x380);
     }
     IOAccelCommandQueue *newCommandQueue() override;
     void nativeStart();
-    volatile UInt32 *stampBase();
+    volatile UInt32 *stampBase();           // 0.4.1
 private:
-    NVGraphicsDeviceControl *agdc_ = nullptr;
+    NVGraphicsDeviceControl *agdc_ = nullptr;   // 0.3.0
     thread_call_t okCall_ = nullptr;
     static void okCallout(thread_call_param_t self, thread_call_param_t);
     NVAccelTask *newTask();
@@ -799,13 +1021,13 @@ public:
     void free() override;
 
     IOReturn newUserClient(task *owningTask, void *securityID, unsigned int type,
-                           IOUserClient **handler) override;
+                           IOUserClient **handler) override;   // 0.3.8
     IOMemoryDescriptor *getStampMemory(unsigned int *count) override;
     IOAccelEventMachine2 *newEventMachine() override;
     IOAccelTask *createUserGPUTask() override;
     IOAccelTask *createKernelGPUTask() override;
     void populateAccelConfig(IOAccelConfig *cfg) override;
-    bool configureDevice(IOPCIDevice *pci) override;   // bool: 0 gives "configureDevice failed"
+    bool configureDevice(IOPCIDevice *pci) override;   // bool: live 0.1.0 (0 = "configureDevice failed")
     void teardownDevice(IOPCIDevice *pci) override;
     IOAccelDisplayMachine *newDisplayMachine() override;
     IOAccelDisplayPipe *newDisplayPipe() override;
@@ -825,11 +1047,11 @@ IOService *NVAccelerator::probe(IOService *provider, SInt32 *score) {
     return IOGraphicsAccelerator2::probe(provider, score);
 }
 
-// IOGraphicsAccelerator2::enableAccelerator is non-virtual and not in our
+// IOGraphicsAccelerator2::enableAccelerator() is non-virtual and not in our
 // generated header, but exported (14.8.9 and 26.x). The family only calls it
 // from IOAccelDisplayMachine::display_mode_did_change, so an accelerator that
 // starts while the display mode is stable stays "disabled" and every
-// new_resource blocks in acceleratorWaitEnabled (27 Sep: metal_test hung in
+// new_resource blocks in acceleratorWaitEnabled() (27 Sep: metal_test hung in
 // newBufferWithLength). We are usable as soon as start succeeds.
 extern void ioaf2EnableAccelerator(IOGraphicsAccelerator2 *a) __asm("__ZN22IOGraphicsAccelerator217enableAcceleratorEv");
 
@@ -839,12 +1061,14 @@ void NVAccelerator::okCallout(thread_call_param_t self, thread_call_param_t) {
 
 bool NVAccelerator::start(IOService *provider) {
     NVALOG("start: provider %s", provider ? provider->getName() : "?");
-    // Stamp page(s), as AppleParavirtAccelerator::setupFIFO: 64 KiB,
+    // stamp page(s), as AppleParavirtAccelerator::setupFIFO: 64 KiB,
     // options 0x890 (kernel/user shared, contiguous, in/out)
     taskLock_ = IOLockAlloc();
     statLock_ = IOLockAlloc();
     submitLock_ = IOLockAlloc();
-    // stamps in VRAM that the GPU releases, when
+    stampCancelLock_ = IOLockAlloc();
+    if (!submitLock_ || !stampCancelLock_) return false;
+    // 0.4.0: stamps in VRAM that the GPU releases (native N1), when
     // NVGspControl offers them and NVRAM nvaccel-native isn't "0"
     bool nativeOff = false;
     if (IORegistryEntry *o = IORegistryEntry::fromPath("/options", gIODTPlane)) {
@@ -878,17 +1102,17 @@ bool NVAccelerator::start(IOService *provider) {
         NVALOG("IOGraphicsAccelerator2::start failed");
         return false;
     }
-    setProperty("NVAccelerator-version", "0.5.0");
+    setProperty("NVAccelerator-version", KEXT_BUNDLE_VERSION);   // from Info.plist (build_kext.sh)
     if (stampGpuVa_) nativeStart();
     ioaf2EnableAccelerator(this);
     setProperty("NVAccelerator-enabled-at-start", true);
-    // the family did not start the display machine on the PCI device
+    // 0.2.2: the family did not start the display machine on the PCI device
     // (NVDisplay is not a child of it): give it NVDisplay ourselves
     if (dm_ && !dm_->started_) {
         NVALOG("display machine not started by the family: attaching NVDisplay");
         dm_->attachNVDisplay();
     }
-    // the family publishes DisplayPipeSupported=No when start finds no
+    // 0.2.3: the family publishes DisplayPipeSupported=No when start finds no
     // pipe; with NVDisplay's pipe in place say what the NVIDIA web driver
     // said, or CoreDisplay reports "Unable to find display pipe for IOFB"
     if (OSDictionary *caps = OSDictionary::withCapacity(2)) {
@@ -898,9 +1122,9 @@ bool NVAccelerator::start(IOService *provider) {
         caps->release();
     }
     // IOGraphicsAccelerator2::start leaves the service unregistered (live
-    // !registered); Metal discovers accelerators by matching.
+    // 0.1.3: !registered); Metal discovers accelerators by matching.
     registerService();
-    // an AGDC service on the GPU for IOPresentment (NVRAM nvaccel-agdc=0 skips it)
+    // 0.3.0: an AGDC service on the GPU for IOPresentment (NVRAM nvaccel-agdc=0 skips it)
     bool agdcOff = false;
     if (IORegistryEntry *o = IORegistryEntry::fromPath("/options", gIODTPlane)) {
         if (OSData *d = OSDynamicCast(OSData, o->getProperty("nvaccel-agdc")))
@@ -924,7 +1148,7 @@ bool NVAccelerator::start(IOService *provider) {
         clock_interval_to_deadline(60, kSecondScale, &deadline);
         thread_call_enter_delayed(okCall_, deadline);
     }
-    startStats();                                    // native or not
+    startStats();                                    // 0.5.1: native or not
     NVALOG("started");
     return true;
 }
@@ -946,6 +1170,7 @@ void NVAccelerator::stop(IOService *provider) {
         sampleCall_ = nullptr;
     }
     OSSafeReleaseNULL(grBusySym_);
+    OSSafeReleaseNULL(tempSym_);
     if (pollCall_) {   // no thread_call_cancel_wait for kexts: stop re-arming, cancel, free when idle
         pollStop_ = true;
         thread_call_cancel(pollCall_);
@@ -968,10 +1193,11 @@ void NVAccelerator::free() {
     if (taskLock_) { IOLockFree(taskLock_); taskLock_ = nullptr; }
     if (statLock_) { IOLockFree(statLock_); statLock_ = nullptr; }
     if (submitLock_) { IOLockFree(submitLock_); submitLock_ = nullptr; }
+    if (stampCancelLock_) { IOLockFree(stampCancelLock_); stampCancelLock_ = nullptr; }
     IOGraphicsAccelerator2::free();
 }
 
-// GPU access for sandboxed processes. NVMTLDriver and the Vulkan
+// 0.3.8: GPU access for sandboxed processes. NVMTLDriver and the Vulkan
 // driver talk to NVGspControl's user client, whose class the sandboxes of
 // Safari/WebKit, iconservicesagent, VTDecoderXPCService, mediaanalysisd ...
 // don't list. Their Metal rules do allow IOAccelSharedUserClient2 (class
@@ -1001,8 +1227,14 @@ public:
     }
     IOReturn externalMethod(unsigned int sel, IOExternalMethodArguments *a, IOExternalMethodDispatch *,
                             OSObject *, void *) override {
-        if (sel == 0x4E5654) {   // 'NVT': this client's tag for native kernel commands
+        if (sel == 0x4E5654) {   // 'NVT' (0.4.7): this client's tag for native kernel commands
             if (!a || a->scalarOutputCount != 1) return kIOReturnBadArgument;
+            UInt64 generation = 0;
+            IOExternalMethodArguments valid{};
+            valid.scalarOutput = &generation; valid.scalarOutputCount = 1;
+            const IOReturn status = inner_ ? inner_->externalMethod(37, &valid, nullptr, nullptr, nullptr)
+                                          : kIOReturnOffline;
+            if (status != kIOReturnSuccess) return status;
             a->scalarOutput[0] = tag_;
             return tag_ ? kIOReturnSuccess : kIOReturnNotReady;
         }
@@ -1011,9 +1243,9 @@ public:
     IOReturn clientMemoryForType(UInt32 type, IOOptionBits *opts, IOMemoryDescriptor **mem) override {
         return inner_ ? inner_->clientMemoryForType(type, opts, mem) : kIOReturnNotAttached;
     }
-    NVAccelerator *accel_ = nullptr;   // task -> client table for kernel submits
+    NVAccelerator *accel_ = nullptr;   // 0.4.0: task -> client table for kernel submits
     void *task_ = nullptr;
-    UInt32 tag_ = 0;                   // names this client in native kernel commands
+    UInt32 tag_ = 0;                   // 0.4.7: names this client in native kernel commands
     void setAccel(NVAccelerator *a, void *t) {
         accel_ = a; task_ = t;
         do { tag_ = static_cast<UInt32>(random()) ^ static_cast<UInt32>(reinterpret_cast<uintptr_t>(this) >> 4); } while (!tag_);
@@ -1098,7 +1330,7 @@ void NVAccelerator::populateAccelConfig(IOAccelConfig *cfg) {
     auto *b = reinterpret_cast<UInt8 *>(cfg);
     static const char kName[] = "NVIDIA GeForce RTX 4080";
     *reinterpret_cast<const char **>(b + 0x00) = kName;
-    // bit 21 = every IOAccel resource in system memory
+    // 0.3.10: bit 21 = every IOAccel resource in system memory
     // (IOAccelResource2::allocMemory tests accel+0xc90 = cfg+0x08, bit 0x15,
     // and skips createVidMemory). Our VRAM belongs to NVGspControl, not to
     // the family; with the display pipe on, WindowServer's VRAM resources
@@ -1118,8 +1350,8 @@ void NVAccelerator::populateAccelConfig(IOAccelConfig *cfg) {
 }
 
 bool NVAccelerator::configureDevice(IOPCIDevice *pci) {
-    // The hardware belongs to NVGspControl (GSP boot, channels, memory), so
-    // nothing needed here for now.
+    // The hardware belongs to NVGspControl (GSP boot, channels, memory); M1
+    // needs nothing here.
     NVALOG("configureDevice %p", pci);
     return true;
 }
@@ -1132,7 +1364,7 @@ IOAccelDisplayMachine *NVAccelerator::newDisplayMachine() {
     return dm_;
 }
 
-// NVRAM nvaccel-pipe=0 turns the display pipe off again
+// 0.2.0: NVRAM nvaccel-pipe=0 turns the display pipe off again
 IOAccelDisplayPipe *NVAccelerator::newDisplayPipe() {
     bool off = false;
     if (IORegistryEntry *o = IORegistryEntry::fromPath("/options", gIODTPlane)) {
@@ -1144,26 +1376,24 @@ IOAccelDisplayPipe *NVAccelerator::newDisplayPipe() {
     return off ? nullptr : OSTypeAlloc(NVAccelDisplayPipe);
 }
 
+// 0.5.3: no log in the allocation hooks (tens of thousands of lines a
+// minute once apps run)
 IOAccelSysMemory *NVAccelerator::newSysMemory() {
-    NVALOG("newSysMemory");
     return OSTypeAlloc(NVAccelSysMemory);
 }
 
 IOAccelVidMemory *NVAccelerator::newVidMemory() {
-    NVALOG("newVidMemory");
     return OSTypeAlloc(NVAccelVidMemory);
 }
 IOAccelResource2 *NVAccelerator::newResource() {
-    NVALOG("newResource");
     return OSTypeAlloc(NVAccelResource);
 }
 IOAccelMemoryMap *NVAccelerator::newMemoryMap() {
-    NVALOG("newMemoryMap");
     return OSTypeAlloc(NVAccelMemoryMap);
 }
 
 // ---------------------------------------------------------------- launcher
-// See the note at the top of the file. Matches IOResources (IOResourceMatch IOKit,
+// See the 0.1.6 note at the top. Matches IOResources (IOResourceMatch IOKit,
 // always there), so it never blocks anyone's matching.
 class NVAccelLauncher : public IOService {
     OSDeclareDefaultStructors(NVAccelLauncher)
@@ -1271,7 +1501,7 @@ void NVAccelLauncher::free() {
 }
 
 
-// ---------------------------------------------------------------- native N1
+// ---------------------------------------------------------------- native N1 (0.4.0)
 // The Apple model (docs/APPLE-GPU-STACK-STUDY.md, sections 7-8, taken from
 // AppleParavirtGPU in the 14.8.9 KDK): work arrives as a vendor kernel
 // command in a command buffer segment; the queue asks the channel for a
@@ -1285,7 +1515,7 @@ void NVAccelLauncher::free() {
 struct NVExecKernelCommand {
     UInt32 type, size;
     UInt32 engine, n;
-    UInt32 tag, reserved;   // the NVGP client (IOAccelNVGspSharedClient tag) whose arena runs it
+    UInt32 tag, reserved;   // 0.4.7: the NVGP client (IOAccelNVGspSharedClient tag) whose arena runs it
     struct { UInt64 va; UInt32 dwords, flags; } seg[];
 };
 static constexpr UInt32 kNVExecKernelCommand = 0x10000;
@@ -1318,17 +1548,21 @@ public:
         ks.va = va; ks.dwords = dw; ks.flags = fl;
         ks.stampVa = sub->stamp.idx >= 0 ? accel_->stampGpuVa_ + UInt64(sub->stamp.idx) * 4 : 0;
         ks.stampValue = sub->stamp.value;
+        if (sub->stamp.idx >= 0 && sub->stamp.idx < 2) accel_->beginNativeStamp(sub->stamp.idx);
         sub->result = accel_->gsp_->callPlatformFunction("nvgsp-submit-stamp", false, &ks, nullptr, nullptr, nullptr);
         ++submits_;
         if (sub->result == kIOReturnSuccess) {
             OSIncrementAtomic(&accel_->nativeOut_);
             accel_->noteBusy(true);
-            if (sub->stamp.idx >= 0 && sub->stamp.idx < 2) {
-                const int i = sub->stamp.idx;
-                // idle until now: the stall watchdog counts from this submit
-                if (accel_->stampSignaled_[i] == accel_->stampSubmitted_[i]) clock_get_uptime(&accel_->stampProgressAbs_);
-                accel_->stampSubmitted_[i] = sub->stamp.value;
-            }
+            if (sub->stamp.idx >= 0 && sub->stamp.idx < 2)
+                accel_->recordNativeStamp(sub->stamp.idx, sub->stamp.value, true);
+            accel_->kickStampPoll();
+        } else if (sub->stamp.idx >= 0 && sub->stamp.idx < 2) {
+            // The family assigned an event to work the GPU never accepted.
+            // Retire it in order after earlier accepted work, preserving the
+            // submission error; a healthy delay cannot justify forging fences.
+            accel_->recordNativeStamp(sub->stamp.idx, sub->stamp.value, false);
+            ++accel_->failedSubmits_;
             accel_->kickStampPoll();
         }
         return nullptr;
@@ -1377,6 +1611,15 @@ public:
             NVAccelChannel *ch = accel_->chan_[c->engine];
             IOUserClient *owner = accel_->clientForTag(getOwningTask(), c->tag);
             if (ch && owner) {
+                UInt64 generation = 0;
+                IOExternalMethodArguments valid{};
+                valid.scalarOutput = &generation; valid.scalarOutputCount = 1;
+                r = owner->externalMethod(37, &valid, nullptr, nullptr, nullptr);
+                if (r != kIOReturnSuccess) {
+                    owner->release();
+                    setSubmissionError(10);
+                    return nullptr;  // no stamp/FIFO event for rejected old-generation work
+                }
                 if (accel_->submitLock_) IOLockLock(accel_->submitLock_);
                 NVChannelSubmit sub{};
                 sub.stamp.magic = kNVStampRecMagic; sub.stamp.idx = -1;
@@ -1386,6 +1629,18 @@ public:
                 // old value and the command buffer completes before the GPU ran
                 ch->incrementStamp();
                 chanWriteStampCommand(ch, &sub.stamp);          // family -> our writeStamp(idx, value)
+                // submitCommands can wait on a reused FIFO event before it
+                // reaches submitBuffer. Arm recovery for the assigned stamp
+                // now, so that wait cannot hide outstanding work from poll.
+                if (sub.stamp.idx >= 0 && sub.stamp.idx < 2) {
+                    const UInt32 i = static_cast<UInt32>(sub.stamp.idx);
+                    if (static_cast<SInt32>(sub.stamp.value - accel_->stampSubmitted_[i]) > 0) {
+                        if (accel_->stampSignaled_[i] == accel_->stampSubmitted_[i])
+                            clock_get_uptime(&accel_->stampProgressAbs_);
+                        accel_->stampSubmitted_[i] = sub.stamp.value;
+                    }
+                    accel_->kickStampPoll();
+                }
                 alignas(16) UInt8 desc[0x60] = {};
                 *reinterpret_cast<void **>(desc + 0x10) = this;
                 *reinterpret_cast<NVChannelSubmit **>(desc + 0x20) = &sub;
@@ -1396,6 +1651,7 @@ public:
                 if (accel_->submitLock_) IOLockUnlock(accel_->submitLock_);
                 r = sub.result;
             } else r = kIOReturnNotReady;
+            if (owner) owner->release();
         }
         if (r != kIOReturnSuccess) {
             static UInt32 nlog;
@@ -1444,9 +1700,9 @@ void NVAccelerator::nativeStart() {
 }
 
 // MSI workloop, NVGspControl's lock dropped: AppleParavirtEventMachine::signalStamps
-// only once the family has set the event machine's per-stamp
+// 0.4.1: only once the family has set the event machine's per-stamp
 // pointers (+0x28, read by signalStamp) and only while native work is out.
-// signalled on every GR interrupt and panicked on a NULL table.
+// 0.4.0 signalled on every GR interrupt and panicked on a NULL table.
 void NVAccelerator::stampIrq(void *ref, UInt32 mask) {
     auto *self = static_cast<NVAccelerator *>(ref);
     if (!self || !self->nativeOut_) return;
@@ -1454,7 +1710,7 @@ void NVAccelerator::stampIrq(void *ref, UInt32 mask) {
     self->checkStamps();
 }
 
-// signalStamp only wakes the event machine; the fence machine
+// 0.4.6: signalStamp only wakes the event machine; the fence machine
 // (IOGraphicsAccelerator2 + 0x390) then waited for its own ~100 ms
 // fence_timeout before retiring the command buffer. notify_fences runs its
 // eventfence_notifier now (thread context, never from the interrupt itself).
@@ -1494,6 +1750,7 @@ void NVAccelerator::noteBusy(bool busy) {
 void NVAccelerator::startStats() {
     if (statCall_ || !statLock_) return;
     grBusySym_ = OSSymbol::withCString("nvgsp-gr-busy");
+    tempSym_ = OSSymbol::withCString("nvgsp-gpu-temp");   // 0.5.5
     sampleCall_ = thread_call_allocate(&NVAccelerator::sampleCallout, this);
     statCall_ = thread_call_allocate(&NVAccelerator::statCallout, this);
     UInt64 deadline = 0;
@@ -1538,6 +1795,11 @@ void NVAccelerator::statCallout(thread_call_param_t p, thread_call_param_t) {
     const UInt32 sampled = n ? b * 100 / n : 0;
     if (sampled > pct) pct = sampled;
     self->utilPct_ = pct > 100 ? 100 : pct;
+    if (self->gsp_ && self->tempSym_) {
+        SInt32 mC = 0;
+        if (self->gsp_->callPlatformFunction(self->tempSym_, false, &mC, nullptr, nullptr, nullptr) == kIOReturnSuccess && mC > 0)
+            self->tempC_ = static_cast<UInt32>(mC / 1000);
+    }
     OSDictionary *cur = OSDynamicCast(OSDictionary, self->copyProperty("PerformanceStatistics"));
     if (!cur) cur = OSDictionary::withCapacity(4);   // the family never published one: start ours
     if (cur) {
@@ -1561,6 +1823,28 @@ OSDictionary *NVAccelerator::withUtilization(OSDictionary *family) {
         d->setObject("Tiler Utilization %", n);
         n->release();
     }
+    // 0.5.5: memory and temperature under the keys AMD's drivers use (what
+    // iStat Menus and other monitors read); VRAM from NVGspControl's books
+    auto put = [d](const char *k, UInt64 v) {
+        if (OSNumber *x = OSNumber::withNumber(v, 64)) { d->setObject(k, x); x->release(); }
+    };
+    if (gsp_) {
+        // 0.5.6: copyProperty, not getProperty: NVGspControl replaces these
+        // numbers all the time (on its own threads), and a borrowed pointer
+        // was freed under us (kernel panic in this timer, 30 Sep 13:53, after
+        // a burst of GPU resets)
+        OSObject *uo = gsp_->copyProperty("NVGspControl-mem-vram-bytes");
+        OSObject *so = gsp_->copyProperty("NVGspControl-mem-sys-bytes");
+        IORegistryEntry *pci = gsp_->copyParentEntry(gIOServicePlane);
+        OSObject *mo = pci ? pci->copyProperty("VRAM,totalMB") : nullptr;
+        OSNumber *used = OSDynamicCast(OSNumber, uo), *sys = OSDynamicCast(OSNumber, so), *mb = OSDynamicCast(OSNumber, mo);
+        if (used) put("vramUsedBytes", used->unsigned64BitValue());
+        if (used && mb && (mb->unsigned64BitValue() << 20) > used->unsigned64BitValue())
+            put("vramFreeBytes", (mb->unsigned64BitValue() << 20) - used->unsigned64BitValue());
+        if (sys) put("In use system memory", sys->unsigned64BitValue());
+        OSSafeReleaseNULL(uo); OSSafeReleaseNULL(so); OSSafeReleaseNULL(mo); OSSafeReleaseNULL(pci);
+    }
+    if (tempC_) put("Temperature(C)", tempC_);
     return d;
 }
 
@@ -1585,31 +1869,106 @@ void NVAccelerator::kickStampPoll() {
     }
 }
 
+// Separate from submitLock_: submitCommands may hold that lock while waiting
+// for a reused FIFO event, which cancellation must be able to retire.
+void NVAccelerator::beginNativeStamp(UInt32 index) {
+    if (index >= 2 || !stampCancelLock_) return;
+    IOLockLock(stampCancelLock_);
+    stampSubmitting_[index] = true;  // exclude CPU stamp writes while GSP may kick newer GPU work
+    IOLockUnlock(stampCancelLock_);
+}
+
+void NVAccelerator::recordNativeStamp(UInt32 index, UInt32 value, bool accepted) {
+    if (index >= 2 || !stampCancelLock_) return;
+    IOLockLock(stampCancelLock_);
+    stampSubmitting_[index] = false;
+    if (stampSignaled_[index] == stampSubmitted_[index]) clock_get_uptime(&stampProgressAbs_);
+    if (static_cast<SInt32>(value - stampSubmitted_[index]) > 0) stampSubmitted_[index] = value;
+    if (accepted) {
+        stampAccepted_[index] = value;
+    } else {
+        stampCanceled_[index] = value;
+        stampCancelAfter_[index] = stampAccepted_[index];
+        stampCancelPending_[index] = true;
+    }
+    IOLockUnlock(stampCancelLock_);
+}
+
+void NVAccelerator::retireCanceledStamps() {
+    if (!stampMap_ || !stampCancelLock_) return;
+    IOLockLock(stampCancelLock_);
+    volatile UInt32 *base = reinterpret_cast<volatile UInt32 *>(stampMap_->getVirtualAddress());
+    for (UInt32 i = 0; i < 2; ++i) {
+        if (!stampCancelPending_[i] || stampSubmitting_[i]) continue;
+        const UInt32 done = base[i], canceled = stampCanceled_[i];
+        if (static_cast<SInt32>(done - canceled) >= 0) {
+            stampCancelPending_[i] = false;  // a later GPU fence already retired it
+        } else if (static_cast<SInt32>(stampAccepted_[i] - canceled) <= 0 &&
+                   static_cast<SInt32>(done - stampCancelAfter_[i]) >= 0) {
+            // A newer accepted GPU stamp may land asynchronously; leave it to
+            // retire the cancellation rather than race it with a CPU write.
+            // Otherwise all earlier accepted work is complete and beginNativeStamp
+            // excludes a new kick. Keep the family's submission error.
+            base[i] = canceled;
+            stampCancelPending_[i] = false;
+            ++canceledCompletions_;
+        }
+    }
+    IOLockUnlock(stampCancelLock_);
+}
+
 // 20 us steps while work is out; then a few 1 ms looks, then stop
 void NVAccelerator::pollCallout(thread_call_param_t p, thread_call_param_t) {
     auto *self = static_cast<NVAccelerator *>(p);
     if (self->pollStop_) { self->pollArmed_ = 0; return; }
+    // Private channels use CPU-ordered stamps. Do not depend on the sparse
+    // GR interrupt or the slow status daemon to advance that queue.
+    if (self->gsp_) self->gsp_->callPlatformFunction("nvgsp-stamp-poll", false,
+                                                  nullptr, nullptr, nullptr, nullptr);
+    self->retireCanceledStamps();
     self->checkStamps();
     bool out = false;
     for (UInt32 i = 0; i < 2; ++i) out |= self->stampSignaled_[i] != self->stampSubmitted_[i];
     if (out) self->pollIdle_ = 0;
-    // stamps that have not moved for 3 s with work out: the GPU was
-    // reset or hung. Complete those command buffers (their results are lost)
-    // instead of leaving WindowServer waiting on them forever, as the family
-    // does after a channel restart.
+    // Delay alone does not mean work is lost: at 40 clients the old watchdog
+    // signaled success before GPU writes finished. Only retire lost stamps
+    // when the driver explicitly reports reset/sleep or GR unavailable.
     if (out && self->stampMap_) {
         UInt64 now = 0, ns = 0;
         clock_get_uptime(&now);
         if (!self->stampProgressAbs_) self->stampProgressAbs_ = now;
         absolutetime_to_nanoseconds(now - self->stampProgressAbs_, &ns);
         if (ns > 3000000000ULL) {
-            volatile UInt32 *base = reinterpret_cast<volatile UInt32 *>(self->stampMap_->getVirtualAddress());
-            for (UInt32 i = 0; i < 2; ++i) base[i] = self->stampSubmitted_[i];
-            ++self->forcedCompletions_;
-            NVALOG("native: stamps stuck for 3 s (GPU reset?): completing the outstanding command buffers (%u)",
-                   self->forcedCompletions_);
+            auto propertyIs = [self](const char *key, bool value) {
+                OSObject *o = self->gsp_ ? self->gsp_->copyProperty(key) : nullptr;
+                OSBoolean *b = OSDynamicCast(OSBoolean, o);
+                const bool match = b && b->isTrue() == value;
+                OSSafeReleaseNULL(o);
+                return match;
+            };
+            const bool unavailable = propertyIs("NVGspControl-reset-busy", true) ||
+                propertyIs("NVGspControl-sleeping", true) ||
+                propertyIs("NVGspControl-gr-persistent", false);
+            if (unavailable) {
+                volatile UInt32 *base = reinterpret_cast<volatile UInt32 *>(self->stampMap_->getVirtualAddress());
+                IOAccelEventMachine2 *em = self->eventMachine();
+                for (UInt32 i = 0; i < 2; ++i) {
+                    UInt32 value = self->stampSubmitted_[i];
+                    if (em) {
+                        const UInt32 assigned = static_cast<UInt32>(reinterpret_cast<uintptr_t>(em->getStamp(i)));
+                        if (static_cast<SInt32>(assigned - value) > 0) value = assigned;
+                    }
+                    self->stampSubmitted_[i] = value;
+                    base[i] = value;
+                }
+                ++self->forcedCompletions_;
+                NVALOG("native: GPU unavailable, retiring lost stamps (%u)",
+                       self->forcedCompletions_);
+                self->checkStamps();
+            } else {
+                NVALOG("native: stamps delayed 3 s while GPU available; waiting for GPU fences");
+            }
             self->stampProgressAbs_ = now;
-            self->checkStamps();
         }
     }
     if (out || self->pollIdle_++ < 4) {
@@ -1623,7 +1982,7 @@ void NVAccelerator::pollCallout(thread_call_param_t p, thread_call_param_t) {
         if (self->stampSignaled_[i] != self->stampSubmitted_[i]) { self->kickStampPoll(); break; }
 }
 
-// every client with its tag; entries go with clientClose/free
+// 0.4.7: every client with its tag; entries go with clientClose/free
 void NVAccelerator::noteTaskClient(void *task, IOUserClient *inner, UInt32 tag, bool add) {
     if (!taskLock_ || !task || !inner) return;
     IOLockLock(taskLock_);
@@ -1638,12 +1997,16 @@ IOUserClient *NVAccelerator::clientForTag(void *task, UInt32 tag) {
     if (!taskLock_ || !task || !tag) return nullptr;
     IOUserClient *r = nullptr;
     IOLockLock(taskLock_);
-    for (auto &t : tasks_) if (t.task == task && t.tag == tag) { r = t.inner; break; }
+    for (auto &t : tasks_) if (t.task == task && t.tag == tag) {
+        r = t.inner;
+        if (r) r->retain();   // 0.5.15: clientClose can remove the entry after taskLock_ drops
+        break;
+    }
     IOLockUnlock(taskLock_);
     return r;
 }
 
-// as AppleParavirtAccelerator::setupFIFO maps its stamp memory
+// 0.4.1: as AppleParavirtAccelerator::setupFIFO maps its stamp memory
 volatile UInt32 *NVAccelerator::stampBase() {
     if (!stampMap_ && stamp_) stampMap_ = stamp_->createMappingInTask(kernel_task, 0, kIOMapAnywhere);
     return stampMap_ ? reinterpret_cast<volatile UInt32 *>(stampMap_->getVirtualAddress()) : nullptr;

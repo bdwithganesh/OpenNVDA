@@ -1,22 +1,22 @@
 /*
- * H.264 decode on NVDEC (NVC9B0, AD103), the driver-side state machine.
- * NVDEC firmware parses the slice data (and most of every slice header). Per
- * picture the driver gives it nvdec_h264_pic_s (SPS/PPS fields, POC, the
- * reference DPB), the bitstream with a slice offset table, and the surface
- * addresses. This file keeps the decoding process state from H.264 clause 8.2.1
- * (POC) and 8.2.5 (reference marking) plus the C.4 output order ("bumping"),
- * and builds the buffers and the method stream.
+ * V1: H.264 decode on NVDEC (NVC9B0, AD103) — driver-side state machine.
+ * The NVDEC firmware parses slice data (and most of each slice header);
+ * the driver supplies, per picture, nvdec_h264_pic_s (SPS/PPS fields, POC,
+ * the reference DPB), the bitstream with a slice offset table, and the
+ * surface addresses. This file keeps the decoding process state of
+ * H.264 clause 8.2.1 (POC) and 8.2.5 (reference marking) plus C.4 output
+ * order ("bumping"), and builds the buffers and the method stream.
  *
- * Scope: frames (progressive and MBAFF) and field pictures (PAFF: both fields
- * of a frame share one frame store and surface, marking is per field); 4:2:0
- * 8-bit (NV12 out).
+ * Scope: frames (progressive and MBAFF) and field pictures (PAFF: the two
+ * fields of a frame share one frame store and surface, reference marking
+ * is per field); 4:2:0 8-bit (NV12 output).
  *
- * Hardware conventions (NVIDIA open-gpu-doc clc9b0.h / nvdec_drv.h, MIT; method
- * order and buffer sizes follow the open Tegra NVDEC FFmpeg hwaccel): addresses
- * are GPU VA >> 8; surfaces are block linear (GOB 64 B x 8, block height 2 GOBs
- * = "TBL"/GOB_2), luma first then interleaved chroma; each slice is 00 00 01 +
- * NAL; the stream ends with a 16-byte end sequence; col_idx = pic_idx = surface
- * index.
+ * Hardware conventions (NVIDIA open-gpu-doc clc9b0.h / nvdec_drv.h, MIT;
+ * the method order and buffer sizes follow the open Tegra NVDEC FFmpeg
+ * hwaccel): addresses are GPU VA >> 8; surfaces are block linear (GOB
+ * 64 B x 8, block height 2 GOBs = "TBL"/GOB_2), luma then interleaved
+ * chroma; each slice is 00 00 01 + NAL; the stream ends with a 16-byte
+ * end sequence; col_idx = pic_idx = surface index.
  */
 #pragma once
 #include <stdint.h>
@@ -76,11 +76,9 @@ int nvdec_h264_param_nal(nvdec_h264_dec *d, const h264_nal *nal);
 /* 7.4.1.2.4: does slice `b` start a new picture after slice `a`? */
 int nvdec_h264_new_picture(const nvdec_h264_dec *d, const h264_slice *a, const h264_slice *b);
 
-/*
- * Per picture: begin (POC, gaps, IDR flush, surface, pic setup), the caller
+/* Per picture: begin (POC, gaps, IDR flush, surface, pic setup), the caller
  * decodes, then end (reference marking, output bumping). Pictures leave in
- * display order through out_surface[] (read them before the next begin).
- */
+ * display order through out_surface[] (read them before the next begin). */
 int nvdec_h264_begin(nvdec_h264_dec *d, const h264_slice *first, nvdec_h264_pic_s *setup,
                      int *surface);
 void nvdec_h264_end(nvdec_h264_dec *d);
@@ -123,26 +121,20 @@ typedef struct {
     uint32_t subch, obj_class;
 } nvdec_h264_addrs;
 
-/*
- * SET_OBJECT, application/codec, picture index, buffers, the 17 surfaces,
- * EXECUTE, then an engine semaphore release of `fence` at in_va + NVDEC_IN_SEM.
- * Returns words written, 0 if `max` is too small or an address is not 256-byte
- * aligned / above 40 bits.
- */
+/* SET_OBJECT, application/codec, picture index, buffers, the 17 surfaces,
+ * EXECUTE, then an engine semaphore release of `fence` at in_va +
+ * NVDEC_IN_SEM. Returns words written, 0 if `max` is too small or an
+ * address is not 256-byte aligned / above 40 bits. */
 uint32_t nvdec_h264_push(const nvdec_h264_addrs *a, const nvdec_h264_layout *l,
                          uint32_t picture_index, uint32_t fence, uint32_t *out, uint32_t max);
 
-/*
- * Block-linear (GOB 64x8, 2 GOBs per block) <-> pitch-linear copy of one plane
- * of `rows` rows x `bytes_per_row` bytes; bl_pitch multiple of 64.
- */
+/* Block-linear (GOB 64x8, 2 GOBs per block) <-> pitch-linear copy of one
+ * plane of `rows` rows x `bytes_per_row` bytes; bl_pitch multiple of 64. */
 void nvdec_detile(const uint8_t *bl, uint32_t bl_pitch, uint8_t *dst, uint32_t dst_pitch,
                   uint32_t bytes_per_row, uint32_t rows);
-/*
- * MD5 of the cropped NV12 picture in a decoded block-linear surface: luma rows
- * (visible width) then interleaved chroma rows, as gen_vectors.py writes the
- * reference digests. 0 = ok, -1 = out of memory.
- */
+/* MD5 of the cropped NV12 picture in a decoded block-linear surface: luma
+ * rows (visible width) then interleaved chroma rows, as gen_vectors.py
+ * writes the reference digests. 0 = ok, -1 = out of memory. */
 int nvdec_surface_nv12_md5(const uint8_t *surface, uint32_t pitch, uint32_t luma_bytes,
                            uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, char hex[33]);
 int nvdec_h264_surface_md5(const uint8_t *surface, const nvdec_h264_layout *l,

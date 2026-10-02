@@ -4,24 +4,24 @@
 
 namespace nvgsp {
 
-// When pollStatusLocked should stop draining the status queue.
+// 0.95.0: status-drain exit policy for pollStatusLocked.
 //
-// The chain's ~9 min boot time was nearly all tail waiting: GSP usually
-// answers in the daemon's 0.2 s gap between polls, so the drain finds the
-// reply in its first snapshot and then burns ~4000 more iterations
-// confirming nothing else is coming. Leaving early is safe ONLY once at
-// least one message got collected in this call; a phase that's waiting with
-// nothing arrived must keep waiting exactly like before (leaving on an
-// empty queue once parked the chain). A short quantum after the last
-// message still catches bursts (reply + follow-up events) in one drain, and
-// anything later gets picked up by the daemon's next poll with no side
-// effects (reply flags are per poll; persistent phases are unconditional or
-// idempotent).
+// The chain's ~9 min boot cost is almost entirely tail waiting: GSP usually
+// answers during the daemon's 0.2 s inter-poll gap, so the drain finds the
+// reply on its first snapshot and then burns the remaining ~4000 iterations
+// confirming silence. Exiting early is safe ONLY after at least one message
+// was collected this call: an awaiting phase with zero arrivals must keep
+// waiting exactly like before (0.90/0.91 parked the chain by exiting on an
+// empty queue). A short coalescing quantum after the last message still
+// catches multi-message bursts (reply + follow-up events) in one drain;
+// anything later is picked up by the daemon's next poll with no re-entry
+// side effect (reply flags are poll-local; persistent phases are
+// unconditional or idempotent).
 //
-// collected: messages eaten so far in this call; idleMs: empty snapshots in
-// a row since the last message; parked: postInitPhase_ == 33.
+// collected: messages consumed so far this call; idleMs: consecutive empty
+// snapshots since the last message; parked: postInitPhase_ == 33.
 // Returns true when the drain loop should stop waiting.
-// was 50 ms. Every chain step (a few ms of GSP reply) waited
+// 0.146.8: was 50 ms. Every chain step (a few ms of GSP reply) waited
 // that long, ~35 steps before the window took the screen: the boot logo
 // progress pause. 3 ms still coalesces a reply with its follow-ups.
 constexpr uint32_t kDrainCoalesceMs = 3;

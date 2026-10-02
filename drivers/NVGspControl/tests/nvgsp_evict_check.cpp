@@ -31,7 +31,7 @@ int main() {
     assert(!buildEvictBatch(&empty, 1, w, 64) && !buildEvictBatch(&far, 1, w, 64));
     assert(!buildEvictBatch(c, 0, w, 64));
     assert(evictChunks(0) == 0 && evictChunks(1) == 1 && evictChunks(4ULL << 20) == 2);
-    // A full batch fits the CE ring PB (0x1E0000 bytes) many times over
+    // a full batch fits the CE ring PB (0x1E0000 bytes) many times over
     static_assert((2 + kEvictBatchCopies * kCeCopyWords + 8) * 4 < 0x10000, "batch size");
     printf("nvgsp_evict_check: PASS\n");
     return 0;

@@ -1,28 +1,27 @@
 /*
- * nvkmd_macos: NVK kernel-mode-driver backend for macOS, sitting on the
+ * nvkmd_macos: NVK kernel-mode-driver backend for macOS on top of the
  * NVGspControl kext user client (RTX 4080 / AD103, GSP-RM r570.144).
  *
- * Kernel interface (user-client selectors):
+ * Kernel interface (NVGspControl >= 0.107.0 user-client selectors):
  *    8 peek BAR0 {offset, count}        (PTIMER for GPU timestamps)
  *   17 GR submit async (kernel-built)   18 GR fence wait {seq, timeout_us}
  *   20 vaBind {va, phys, bytes (0 = unbind 2 MiB), flags}
  *   21 execSegments {engine} + n x {u64 va, u32 dwords, u32 flags} -> seq
- *   22 memAlloc {bytes, domain 0 VRAM / 1 SYS / 2 CPU-visible VRAM}
+ *   22 memAlloc {bytes, domain 0 VRAM / 1 SYS / 2 CPU-visible VRAM (0.123.0)}
  *      -> {handle, phys}
  *   23 memFree {handle}        24 vaBindObject {handle, va, kind}
  *   25 vaUnbind {va, bytes}    26 memInfo -> {heap, vram used, sys used}
- *      (older kexts without 25/26: we fall back to per-page 20 and local
- * counts)
- *   27 present {handle, offset, pitch, width, height, format}
- *   28 presentStop: window 0 back to the desktop surface
- *   29 CE fence wait {seq, timeout_us}
- *   map type 0x1000 | handle = CPU mapping of a SYS object
+ *      (25/26: 0.109.0; older kexts fall back to per-page 20 / local counts)
+ *   27 present {handle, offset, pitch, width, height, format}  (0.110.0)
+ *   28 presentStop: window 0 back to the desktop surface       (0.110.0)
+ *   29 CE fence wait {seq, timeout_us}                          (0.112.0)
+ *   map type 0x1000 | handle   = CPU mapping of a SYS object
  *
- * Model: all engines (3D, compute, copy, 2D) share the kext's one GR channel,
- * so submissions run in order and GPU-side waits on our own fences come for
- * free; CPU waits poll the GR fence. Memory and VA granule is 2 MiB (kernel PTE
- * size). Device-local memory can't be CPU-mapped unless BAR1 covers it, so
- * CAN_MAP / GART allocations live in system memory.
+ * Model: all engines (3D, compute, copy, 2D) share the kext's single GR
+ * channel, so submissions execute in order and GPU-side waits on our own
+ * fences are implicit; CPU waits poll the GR fence. Memory and VA granule
+ * is 2 MiB (kernel PTE size). Device-local memory is not CPU-mappable (no
+ * ReBAR/BAR1 path yet), so CAN_MAP / GART allocations live in system memory.
  */
 #include "nvkmd/nvkmd.h"
 #include "nvkmd_macos_submit.h"
@@ -66,11 +65,9 @@ bool nvkmd_macos_has_dgc(struct nvkmd_pdev *pdev);
 
 #define NVKMD_MACOS_ARENA_BASE 0x2800000000ull
 #define NVKMD_MACOS_ARENA_END  0x3000000000ull
-/*
- * Last 4 GiB of the arena: capture/replay (fixed-address) allocations, like
+/* Last 4 GiB of the arena: capture/replay (fixed-address) allocations, like
  * nvkmd_nouveau's replay heap, so replayed addresses never collide with
- * ordinary allocations.
- */
+ * ordinary allocations. */
 #define NVKMD_MACOS_REPLAY_BASE 0x2F00000000ull
 #define NVKMD_MACOS_GRAN       0x200000ull
 /* The kext caps one fence wait at 5 s; longer waits loop. */
@@ -85,12 +82,9 @@ struct nvkmd_macos_pdev {
    uint32_t exec_segment_flags; /* supported selector-21 per-segment flags */
    bool has_mem_info;        /* kext >= 0.109.0 (selectors 25/26) */
    bool use_ce;              /* NVK_MACOS_CE=1: copy-only contexts on the CE ring */
-   uint64_t vram_cpu_B;      /* kext can reach VRAM through BAR1 */
-   /*
-    * NVK_MACOS_GPU_WAIT=1: a GR <-> CE dependency becomes a host semaphore
-    * acquire on the other ring's fence instead of a CPU wait (needs a kext that
-    * exports the fence VAs)
-    */
+   uint64_t vram_cpu_B;      /* kext >= 0.123.0: VRAM reachable through BAR1 */
+   /* NVK_MACOS_GPU_WAIT=1 (kext >= 0.128.0): a GR <-> CE dependency is a
+    * host semaphore acquire on the other ring's fence, not a CPU wait */
    bool gpu_wait;
    uint64_t sem_va[2];       /* GR, CE fence semaphore GPU VAs */
    uint64_t vram_used_local; /* fallback: this process's VRAM objects */
@@ -118,14 +112,12 @@ struct nvkmd_macos_dev {
    struct list_head vram_slabs;       /* VRAM slabs (kext ABI >= 114) */
 };
 
-/*
- * Small host-visible allocations are carved out of 2 MiB system-memory slabs:
- * each kernel object is 2 MiB of wired, physically contiguous memory and the
- * kext has a fixed object table, so one object per VkDeviceMemory would exhaust
- * both long before maxMemoryAllocationCount. VRAM allocations are suballocated
- * too once the kext binds at 64 KiB (ABI >= 114), 64 KiB aligned so kinded
- * image rebinds still work.
- */
+/* Small host-visible allocations are carved out of 2 MiB system-memory
+ * slabs: each kernel object is 2 MiB of wired, physically contiguous
+ * memory and the kext has a fixed object table, so one object per
+ * VkDeviceMemory would exhaust both long before maxMemoryAllocationCount.
+ * VRAM allocations are suballocated too once the kext binds at 64 KiB
+ * (ABI >= 114), 64 KiB aligned so kinded image rebinds still work. */
 #define NVKMD_MACOS_SUB_MAX   (1u << 20)
 #define NVKMD_MACOS_SUB_ALIGN 4096u
 /* util_vma_heap cannot return 0; offsets live above this tag. */
@@ -169,7 +161,7 @@ struct nvkmd_macos_ctx {
    struct nvkmd_ctx base;
    uint8_t engine;          /* enum nvkmd_macos_engine */
    uint32_t last_seq;
-   /* Pending GPU-side waits (pdev->gpu_wait), pushed ahead of the next exec */
+   /* pending GPU-side waits (pdev->gpu_wait), pushed ahead of the next exec */
    uint32_t n_acq;
    struct { uint64_t va; uint32_t seq; } acq[NVKMD_MACOS_ACQ_MAX];
    struct nvkmd_mem *acq_mem;          /* CPU-written push slots */
@@ -216,11 +208,9 @@ struct nvkmd_macos_sync {
    uint64_t tl_done;
 };
 
-/*
- * The sync type is binary, but NVK's per-queue push_stream creates it as a
+/* The sync type is binary, but NVK's per-queue push_stream creates it as a
  * timeline and, on a queue that never pushed, waits for point 0 at destroy.
- * Point 0 of a timeline is always reached.
- */
+ * Point 0 of a timeline is always reached. */
 static inline bool
 macos_sync_trivial(const struct nvkmd_macos_sync *s, uint64_t wait_value)
 {
@@ -293,10 +283,8 @@ kext_va_bind(io_connect_t conn, uint64_t va, uint64_t phys, uint64_t bytes,
                               NULL, NULL) == KERN_SUCCESS;
 }
 
-/*
- * Unbind whole 2 MiB pages [va, va + bytes): one call if the kext has vaUnbind,
- * otherwise one selector-20 call per page.
- */
+/* Unbind whole 2 MiB pages [va, va + bytes): one call on kext >= 0.109.0,
+ * one selector-20 call per page before that. */
 static bool
 kext_va_unbind(io_connect_t conn, uint64_t va, uint64_t bytes)
 {
@@ -411,11 +399,9 @@ macos_sync_wait_many(struct vk_device *device, uint32_t wait_count,
       return VK_SUCCESS;
    }
 
-   /*
-    * WAIT_ANY: each engine's ring is in order, so per engine the oldest
+   /* WAIT_ANY: each engine's ring is in order, so per engine the oldest
     * submitted fence completes first; wait on those in short slices so CPU
-    * signals and late submissions of the other syncs are noticed.
-    */
+    * signals and late submissions of the other syncs are noticed. */
    for (;;) {
       struct nvkmd_macos_sync *oldest[2] = { NULL, NULL };
       for (uint32_t i = 0; i < wait_count; i++) {
@@ -521,12 +507,10 @@ macos_mem_map(struct nvkmd_mem *_mem, struct vk_object_base *log_obj,
       return MACOS_ERR(log_obj, VK_ERROR_MEMORY_MAP_FAILED);
    mach_vm_address_t addr = 0;
    mach_vm_size_t size = 0;
-   /*
-    * IOUserClient::mapClientMemory64 lets the caller's cache bits override the
-    * kext's (kIOMapUserOptionsMask), so BAR1 VRAM must ask for WC itself; with
-    * only kIOMapAnywhere it maps uncached (~2 GB/s writes, 26 Sep).
-    */
-   if (IOConnectMapMemory64(dev->conn, 0x1000 | mem->handle, mach_task_self(),
+   /* IOUserClient::mapClientMemory64 lets the caller's cache bits override the
+    * kext's (kIOMapUserOptionsMask), so BAR1 VRAM must ask for WC itself;
+    * with only kIOMapAnywhere it maps uncached (~2 GB/s writes, 26 Sep). */
+   if (IOConnectMapMemory64(dev->conn, (mem->handle < 0x1000 ? 0x1000 | mem->handle : 0x40000000u | mem->handle), mach_task_self(),
                             &addr, &size,
                             kIOMapAnywhere | (mem->cpu_vram ? kIOMapWriteCombineCache : 0)))
       return MACOS_ERR(log_obj, VK_ERROR_MEMORY_MAP_FAILED);
@@ -540,7 +524,7 @@ macos_mem_unmap(struct nvkmd_mem *_mem, enum nvkmd_mem_map_flags flags, void *ma
    struct nvkmd_macos_mem *mem = container_of(_mem, struct nvkmd_macos_mem, base);
    struct nvkmd_macos_dev *dev =
       container_of(_mem->dev, struct nvkmd_macos_dev, base);
-   IOConnectUnmapMemory64(dev->conn, 0x1000 | mem->handle, mach_task_self(),
+   IOConnectUnmapMemory64(dev->conn, (mem->handle < 0x1000 ? 0x1000 | mem->handle : 0x40000000u | mem->handle), mach_task_self(),
                           (mach_vm_address_t)map);
 }
 
@@ -574,11 +558,9 @@ macos_va_bind_mem(struct nvkmd_va *va, struct vk_object_base *log_obj,
       mem = mem->slab->mem;
    }
    uint64_t addr = va->addr + va_offset_B;
-   /*
-    * The kext binds in dev->gran units (64 KiB, or 2 MiB before ABI 114). When
-    * VA and memory offset share the same phase, bind the enclosing window
-    * (rebinding the same pages is idempotent).
-    */
+   /* The kext binds in dev->gran units (64 KiB, or 2 MiB before ABI 114).
+    * When VA and memory offset share the same phase, bind the enclosing
+    * window (rebinding the same pages is idempotent). */
    const uint64_t gran = dev->gran;
    if (((addr ^ mem_offset_B) & (gran - 1)) != 0) {
       fprintf(stderr, "[nvkmd_macos] bind va 0x%llx / mem off 0x%llx phase mismatch\n",
@@ -616,10 +598,8 @@ macos_va_unbind(struct nvkmd_va *va, struct vk_object_base *log_obj,
                 uint64_t va_offset_B, uint64_t range_B)
 {
    struct nvkmd_macos_dev *dev = container_of(va->dev, struct nvkmd_macos_dev, base);
-   /*
-    * Only whole pages are unbound; partial ranges stay mapped (the neighbouring
-    * sub-allocation may still use the page).
-    */
+   /* Only whole pages are unbound; partial ranges stay mapped (the
+    * neighbouring sub-allocation may still use the page). */
    const uint64_t start = align64(va->addr + va_offset_B, dev->gran);
    const uint64_t end = (va->addr + va_offset_B + range_B) & ~(dev->gran - 1);
    MTRACE("unbind va=0x%llx..0x%llx\n", (unsigned long long)start, (unsigned long long)end);
@@ -672,10 +652,8 @@ macos_ctx_destroy(struct nvkmd_ctx *_ctx)
    FREE(ctx);
 }
 
-/*
- * Host SEM_EXECUTE acquire (ACQ_CIRC_GEQ, 32-bit, TSG switch while waiting) of
- * `seq` at `va`: the same 5-method block the kext's fence release uses.
- */
+/* Host SEM_EXECUTE acquire (ACQ_CIRC_GEQ, 32-bit, TSG switch while waiting)
+ * of `seq` at `va`: the same 5-method block the kext's fence release uses. */
 static uint32_t
 macos_acquire_words(uint32_t *w, uint64_t va, uint32_t seq)
 {
@@ -688,10 +666,8 @@ macos_acquire_words(uint32_t *w, uint64_t va, uint32_t seq)
    return 6;
 }
 
-/*
- * Write the pending acquires into a push slot, returned in seg_va / seg_dw. A
- * slot is reused only after the fence of the submission that used it.
- */
+/* Write the pending acquires into a push slot, returned in seg_va / seg_dw.
+ * A slot is reused only after the fence of the submission that used it. */
 static VkResult
 macos_ctx_build_acquires(struct nvkmd_macos_ctx *ctx, struct vk_object_base *log_obj,
                          uint64_t *seg_va, uint32_t *seg_dw)
@@ -725,11 +701,9 @@ macos_ctx_wait(struct nvkmd_ctx *_ctx, struct vk_object_base *log_obj,
 {
    struct nvkmd_macos_ctx *ctx = container_of(_ctx, struct nvkmd_macos_ctx, base);
    struct nvkmd_macos_dev *dev = container_of(_ctx->dev, struct nvkmd_macos_dev, base);
-   /*
-    * Each engine's ring is in order, so a fence from this context's own engine
-    * is already ordered before what we submit next. A fence from the other
-    * engine (GR <-> CE) has no GPU-side wait here: wait on the CPU.
-    */
+   /* Each engine's ring is in order, so a fence from this context's own
+    * engine is already ordered before what we submit next. A fence from the
+    * other engine (GR <-> CE) has no GPU-side wait here: wait on the CPU. */
    for (uint32_t i = 0; i < wait_count; i++) {
       struct nvkmd_macos_sync *s =
          container_of(waits[i].sync, struct nvkmd_macos_sync, base);
@@ -950,7 +924,7 @@ macos_submem_free(struct nvkmd_mem *_mem)
    simple_mtx_lock(&dev->slab_lock);
    util_vma_heap_free(&slab->heap, NVKMD_MACOS_SLAB_TAG + mem->slab_off, _mem->size_B);
    empty = --slab->users == 0;
-   /* Keep one empty slab around so alloc/free churn doesn't hit the kext */
+   /* keep one empty slab around so alloc/free churn doesn't hit the kext */
    if (empty && !(slab->link.prev == slab->list && slab->link.next == slab->list))
       list_del(&slab->link);
    else
@@ -999,11 +973,9 @@ macos_slab_create(struct nvkmd_macos_dev *dev, struct vk_object_base *log_obj, b
    if (!slab)
       return NULL;
    struct nvkmd_mem *m = NULL;
-   /*
-    * Through nvkmd so the slab is on nvkmd_dev::mems like any object
-    * (nvkmd_mem_unref removes it from there); 2 MiB > SUB_MAX, so this does not
-    * recurse into the suballocator
-    */
+   /* through nvkmd so the slab is on nvkmd_dev::mems like any object
+    * (nvkmd_mem_unref removes it from there); 2 MiB > SUB_MAX, so this
+    * does not recurse into the suballocator */
    if (nvkmd_dev_alloc_mem(&dev->base, log_obj, NVKMD_MACOS_GRAN, NVKMD_MACOS_GRAN,
                            sys ? NVKMD_MEM_GART | NVKMD_MEM_CAN_MAP : NVKMD_MEM_LOCAL,
                            &m) != VK_SUCCESS) {
@@ -1093,11 +1065,9 @@ macos_dev_alloc_mem(struct nvkmd_dev *_dev, struct vk_object_base *log_obj,
    struct nvkmd_macos_dev *dev = container_of(_dev, struct nvkmd_macos_dev, base);
    struct nvkmd_macos_pdev *pdev = container_of(_dev->pdev, struct nvkmd_macos_pdev, base);
    bool sys = (flags & (NVKMD_MEM_CAN_MAP | NVKMD_MEM_GART)) != 0;
-   /*
-    * Mappable device-local memory (the BAR heap type) goes to VRAM inside the
-    * kext's BAR1 window when there is one; small ones stay in the host-visible
-    * slabs
-    */
+   /* 0.123.0: mappable device-local memory (the BAR heap type) goes to VRAM
+    * inside the kext's BAR1 window when there is one; small ones stay in
+    * the host-visible slabs */
    bool cpu_vram = pdev->vram_cpu_B && (flags & NVKMD_MEM_CAN_MAP) &&
                    (flags & (NVKMD_MEM_LOCAL | NVKMD_MEM_VRAM)) && !(flags & NVKMD_MEM_GART) &&
                    size_B > NVKMD_MACOS_SUB_MAX;
@@ -1161,10 +1131,8 @@ macos_dev_create_ctx(struct nvkmd_dev *_dev, struct vk_object_base *log_obj,
       return MACOS_ERR(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
    ctx->base.ops = &macos_ctx_ops;
    ctx->base.dev = _dev;
-   /*
-    * copy-only contexts (transfer queue, NVK's upload queue) can run on the
-    * kext's copy-engine channel, overlapping GR work.
-    */
+   /* 0.112.0: copy-only contexts (transfer queue, NVK's upload queue) can
+    * run on the kext's copy-engine channel, overlapping GR work. */
    ctx->engine = (pdev->use_ce && engines == NVKMD_ENGINE_COPY) ? NVKMD_MACOS_CE
                                                                 : NVKMD_MACOS_GR;
    ctx->gr_state = ctx->engine == NVKMD_MACOS_GR &&
@@ -1173,10 +1141,8 @@ macos_dev_create_ctx(struct nvkmd_dev *_dev, struct vk_object_base *log_obj,
    return VK_SUCCESS;
 }
 
-/*
- * GPU PTIMER (ns, the clock semaphore-release timestamps use): TIME_1 is the
- * high word, TIME_0 the low word; re-read if the high word moved.
- */
+/* GPU PTIMER (ns, the clock semaphore-release timestamps use): TIME_1 is
+ * the high word, TIME_0 the low word; re-read if the high word moved. */
 static uint64_t
 macos_dev_get_gpu_timestamp(struct nvkmd_dev *_dev)
 {
@@ -1232,11 +1198,9 @@ nvkmd_macos_has_dgc(struct nvkmd_pdev *base)
 
 /* ------------------------------------------------------------- present */
 
-/*
- * Zero-copy scan-out of a VRAM object on window 0 (nvk_macos_wsi). Returns once
- * the kext queued the flip; the window channel throttles to one flip per
- * vblank, so the previously presented surface has been latched.
- */
+/* Zero-copy scan-out of a VRAM object on window 0 (nvk_macos_wsi). Returns
+ * once the kext queued the flip; the window channel throttles to one flip
+ * per vblank, so the previously presented surface has been latched. */
 VkResult
 nvkmd_macos_mem_present(struct nvkmd_mem *_mem, uint64_t offset_B,
                         uint32_t pitch_B, uint32_t width, uint32_t height,
@@ -1256,10 +1220,8 @@ nvkmd_macos_mem_present(struct nvkmd_mem *_mem, uint64_t offset_B,
       return VK_SUCCESS;
    fprintf(stderr, "[nvkmd_macos] present handle %u pitch %u %ux%u fmt 0x%x: 0x%x\n",
            mem->handle, pitch_B, width, height, wnd_format, kr);
-   /*
-    * Bad surface parameters: let the app rebuild its swapchain; anything else
-    * (old kext, display not owned, GPU reset) loses the surface
-    */
+   /* bad surface parameters: let the app rebuild its swapchain; anything
+    * else (old kext, display not owned, GPU reset) loses the surface */
    return kr == kIOReturnBadArgument ? VK_ERROR_OUT_OF_DATE_KHR
                                      : VK_ERROR_SURFACE_LOST_KHR;
 }
@@ -1482,29 +1444,25 @@ nvkmd_macos_try_create_pdev(struct vk_object_base *log_obj,
    if (pdev->has_mem_info && heap_B)
       info->vram_size_B = heap_B;
    pdev->base.kmd_info.has_get_vram_used = true;
-   /*
-    * Opt-in until the CE ring path is proven live: without it everything
-    * (copies included) runs in order on the GR channel.
-    */
+   /* Opt-in until the CE ring path is proven live: without it everything
+    * (copies included) runs in order on the GR channel. */
    const char *ce = getenv("NVK_MACOS_CE");
    pdev->use_ce = ce && ce[0] == '1';
    info->has_transfer_queue = pdev->use_ce;
-   /* kexts bind arena pages at 64 KiB */
+   /* 0.114.0 kexts bind arena pages at 64 KiB */
    uint64_t abi = 0;
    svc_number(svc, "NVGspControl-abi", &abi);
    uint64_t exec_flags = 0;
    svc_number(svc, "NVGspControl-exec-segment-flags", &exec_flags);
    pdev->exec_segment_flags = exec_flags & NVKMD_MACOS_EXEC_NO_PREFETCH;
    pdev->bind_gran = abi >= 114 ? 0x10000 : NVKMD_MACOS_GRAN;
-   /*
-    * CPU-visible VRAM (BAR1 window) -> NVK's DEVICE_LOCAL|HOST_VISIBLE memory
-    * type gets a real VRAM heap of that size (a ReBAR-sized BAR1).
-    */
+   /* 0.123.0: CPU-visible VRAM (BAR1 window) -> NVK's DEVICE_LOCAL|HOST_VISIBLE
+    * memory type gets a real VRAM heap of that size (a ReBAR-sized BAR1). */
    if (abi >= 123)
       svc_number(svc, "NVGspControl-vram-cpu-bytes", &pdev->vram_cpu_B);
    if (pdev->vram_cpu_B)
       info->bar_size_B = pdev->vram_cpu_B;
-   /* fence semaphore VAs of the GR and CE rings */
+   /* 0.128.0: fence semaphore VAs of the GR and CE rings */
    const char *gw = getenv("NVK_MACOS_GPU_WAIT");
    if (abi >= 123 && gw && gw[0] == '1' &&
        svc_number(svc, "NVGspControl-gr-sem-va", &pdev->sem_va[0]) &&

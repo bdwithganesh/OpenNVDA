@@ -208,16 +208,12 @@ struct layer_swapchain {
    VkExtent2D extent;
    bool fifo;
    uint64_t last_present_ns;
-   /*
-    * image_count + 1 IOSurfaces so a new frame never overwrites the one
-    * WindowServer may still be compositing
-    */
+   /* image_count + 1 IOSurfaces so a new frame never overwrites the one
+    * WindowServer may still be compositing */
    uint32_t surface_count, next_surface;
    IOSurfaceRef surfaces[NVK_MACOS_LAYER_MAX_IMAGES + 1];
-   /*
-    * Present thread: present_queue = images to show, acquire_queue = images the
-    * app may take (UINT32_MAX = the thread stopped on an error)
-    */
+   /* present thread: present_queue = images to show, acquire_queue = images
+    * the app may take (UINT32_MAX = the thread stopped on an error) */
    struct wsi_queue present_queue, acquire_queue;
    bool queues_ready, thread_started;
    thrd_t thread;
@@ -275,7 +271,7 @@ layer_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
    VkResult result = p_atomic_read(&chain->status);
    if (result < 0)
       return result;
-   /* The present thread hands images back once they are copied out */
+   /* the present thread hands images back once they are copied out */
    result = wsi_queue_pull(&chain->acquire_queue, image_index, info->timeout);
    if (result == VK_TIMEOUT && info->timeout == 0)
       result = VK_NOT_READY;
@@ -289,10 +285,8 @@ layer_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
    return VK_SUCCESS;
 }
 
-/*
- * Wait for the image's rendering, copy it into a free IOSurface, pace FIFO and
- * put the IOSurface on the layer.
- */
+/* Wait for the image's rendering, copy it into a free IOSurface, pace FIFO
+ * and put the IOSurface on the layer. */
 static VkResult
 layer_show_image(struct layer_swapchain *chain, uint32_t image_index)
 {
@@ -369,7 +363,7 @@ layer_swapchain_queue_present(struct wsi_swapchain *wsi_chain, uint32_t image_in
       return status;
    wsi_queue_push(&chain->present_queue, image_index);
 
-   /* The window changed size: keep presenting, ask for a new swapchain */
+   /* the window changed size: keep presenting, ask for a new swapchain */
    uint32_t w = 0, h = 0;
    nvk_macos_layer_size(chain->layer, &w, &h);
    if (w != chain->extent.width || h != chain->extent.height)
@@ -523,10 +517,8 @@ nvk_macos_layer_wsi_init(struct wsi_device *wsi_device, const VkAllocationCallba
    wsi->base.get_present_rectangles = layer_get_present_rectangles;
    wsi->base.create_swapchain = layer_create_swapchain;
 
-   /*
-    * Mesa's Metal backend needs a Metal device, which this machine lacks; keep
-    * it aside so wsi_metal_finish_wsi() frees what it allocated.
-    */
+   /* Mesa's Metal backend needs a Metal device, which this machine lacks;
+    * keep it aside so wsi_metal_finish_wsi() frees what it allocated. */
    wsi->mesa_metal = wsi_device->wsi[VK_ICD_WSI_PLATFORM_METAL];
    wsi_device->wsi[VK_ICD_WSI_PLATFORM_METAL] = &wsi->base;
    return VK_SUCCESS;

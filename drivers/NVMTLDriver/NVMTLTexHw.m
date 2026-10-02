@@ -1,3 +1,4 @@
+#import "NVMTLLog.h"
 #import "NVMTLTexHw.h"
 #import "NVMTLGsp.h"
 #include <os/lock.h>
@@ -22,7 +23,7 @@ static bool poolEnsure(void) {
     if (!nvGspEnsure() || !nvHeapAlloc(bytes + 4096, &cpu, &va)) return false;
     memset(cpu, 0, bytes + 4096);
     gTicUsed[0] = gTscUsed[0] = 1;              // index 0 is never handed out
-    // and it is a real 1x1 texture on a page of zeros: a shader that
+    // 0.6.12: and it is a real 1x1 texture on a page of zeros: a shader that
     // samples an unbound texture (resource id 0) read VA 0 before (MMU fault)
     uint32_t d0[8];
     if (ticBuildDesc(MTLPixelFormatRGBA8Unorm, va + bytes, 256, 1, 1, d0)) memcpy(cpu, d0, kDescBytes);
@@ -69,7 +70,9 @@ static const TicFmt kFmts[] = {
     {MTLPixelFormatRG8Unorm,         0x18, T_UNORM, 2, 3, 0, 7, 0, 0},
     {MTLPixelFormatRG8Snorm,         0x18, T_SNORM, 2, 3, 0, 7, 0, 0},
     {MTLPixelFormatRG8Uint,          0x18, T_UINT,  2, 3, 0, 6, 0, 0},
+    {MTLPixelFormatRG8Sint,          0x18, T_SINT,  2, 3, 0, 6, 0, 0},
     {MTLPixelFormatR16Unorm,         0x1b, T_UNORM, 2, 0, 0, 7, 0, 0},
+    {MTLPixelFormatR16Snorm,         0x1b, T_SNORM, 2, 0, 0, 7, 0, 0},
     {MTLPixelFormatR16Float,         0x1b, T_FLOAT, 2, 0, 0, 7, 0, 0},
     {MTLPixelFormatR16Uint,          0x1b, T_UINT,  2, 0, 0, 6, 0, 0},
     {MTLPixelFormatR16Sint,          0x1b, T_SINT,  2, 0, 0, 6, 0, 0},
@@ -81,23 +84,57 @@ static const TicFmt kFmts[] = {
     {MTLPixelFormatBGRA8Unorm,       0x08, T_UNORM, 4, 3, 2, 5, 0, 1},
     {MTLPixelFormatBGRA8Unorm_sRGB,  0x08, T_UNORM, 4, 3, 2, 5, 1, 1},
     {MTLPixelFormatRGB10A2Unorm,     0x09, T_UNORM, 2, 3, 4, 5, 0, 0},
+    {MTLPixelFormatBGR10A2Unorm,     0x09, T_UNORM, 4, 3, 2, 5, 0, 1},   // 0.8.14: 'l10r' surfaces (WindowServer, 10-bit)
+    // 0.8.16: depth / stencil textures sampled by shaders (shadow maps,
+    // depth2d read / sample_compare). Shaders sample the texture's linear
+    // copy (pitch). Colour layouts preserve the packed texel stride; the
+    // mixed R32_B24G8 layout also supports combined-format comparisons. R001.
+    {MTLPixelFormatDepth32Float,          0x0f, T_FLOAT, 2, 0, 0, 7, 0, 0},   // as R32F
+    {MTLPixelFormatDepth16Unorm,          0x1b, T_UNORM, 2, 0, 0, 7, 0, 0},   // as R16
+    {MTLPixelFormatDepth24Unorm_Stencil8, 0x0d, T_UNORM, 2, 0, 0, 7, 0, 0},   // G8R24: depth in R24
+    {MTLPixelFormatDepth32Float_Stencil8, 0x05, T_FLOAT, 2, 0, 0, 7, 0, 0},   // R32_B24G8: depth float, stencil UINT
+    {MTLPixelFormatStencil8,              0x1d, T_UINT,  2, 0, 0, 6, 0, 0},   // R8 uint
+    {MTLPixelFormatX24_Stencil8,          0x0d, T_UINT,  3, 0, 0, 6, 0, 0},   // G8R24: stencil in G8
+    {MTLPixelFormatX32_Stencil8,          0x05, T_UINT,  3, 0, 0, 6, 0, 0},   // R32_B24G8: stencil in G8
     {MTLPixelFormatRG11B10Float,     0x21, T_FLOAT, 2, 3, 4, 7, 0, 0},
     {MTLPixelFormatRG16Unorm,        0x0c, T_UNORM, 2, 3, 0, 7, 0, 0},
+    {MTLPixelFormatRG16Snorm,        0x0c, T_SNORM, 2, 3, 0, 7, 0, 0},
     {MTLPixelFormatRG16Float,        0x0c, T_FLOAT, 2, 3, 0, 7, 0, 0},
     {MTLPixelFormatRG16Uint,         0x0c, T_UINT,  2, 3, 0, 6, 0, 0},
+    {MTLPixelFormatRG16Sint,         0x0c, T_SINT,  2, 3, 0, 6, 0, 0},
     {MTLPixelFormatR32Float,         0x0f, T_FLOAT, 2, 0, 0, 7, 0, 0},
     {MTLPixelFormatR32Uint,          0x0f, T_UINT,  2, 0, 0, 6, 0, 0},
     {MTLPixelFormatR32Sint,          0x0f, T_SINT,  2, 0, 0, 6, 0, 0},
     {MTLPixelFormatRGBA16Unorm,      0x03, T_UNORM, 2, 3, 4, 5, 0, 0},
+    {MTLPixelFormatRGBA16Snorm,      0x03, T_SNORM, 2, 3, 4, 5, 0, 0},
     {MTLPixelFormatRGBA16Float,      0x03, T_FLOAT, 2, 3, 4, 5, 0, 0},
     {MTLPixelFormatRGBA16Uint,       0x03, T_UINT,  2, 3, 4, 5, 0, 0},
     {MTLPixelFormatRGBA16Sint,       0x03, T_SINT,  2, 3, 4, 5, 0, 0},
     {MTLPixelFormatRG32Float,        0x04, T_FLOAT, 2, 3, 0, 7, 0, 0},
     {MTLPixelFormatRG32Uint,         0x04, T_UINT,  2, 3, 0, 6, 0, 0},
+    {MTLPixelFormatRG32Sint,         0x04, T_SINT,  2, 3, 0, 6, 0, 0},
     {MTLPixelFormatRGBA32Float,      0x01, T_FLOAT, 2, 3, 4, 5, 0, 0},
     {MTLPixelFormatRGBA32Uint,       0x01, T_UINT,  2, 3, 4, 5, 0, 0},
     {MTLPixelFormatRGBA32Sint,       0x01, T_SINT,  2, 3, 4, 5, 0, 0},
+    // 0.8.14: BC block compression (block linear only), 4x4 texels per element
+    {MTLPixelFormatBC1_RGBA,         0x24, T_UNORM, 2, 3, 4, 5, 0, 0},
+    {MTLPixelFormatBC1_RGBA_sRGB,    0x24, T_UNORM, 2, 3, 4, 5, 1, 0},
+    {MTLPixelFormatBC2_RGBA,         0x25, T_UNORM, 2, 3, 4, 5, 0, 0},
+    {MTLPixelFormatBC2_RGBA_sRGB,    0x25, T_UNORM, 2, 3, 4, 5, 1, 0},
+    {MTLPixelFormatBC3_RGBA,         0x26, T_UNORM, 2, 3, 4, 5, 0, 0},
+    {MTLPixelFormatBC3_RGBA_sRGB,    0x26, T_UNORM, 2, 3, 4, 5, 1, 0},
+    {MTLPixelFormatBC4_RUnorm,       0x27, T_UNORM, 2, 0, 0, 7, 0, 0},
+    {MTLPixelFormatBC4_RSnorm,       0x27, T_SNORM, 2, 0, 0, 7, 0, 0},
+    {MTLPixelFormatBC5_RGUnorm,      0x28, T_UNORM, 2, 3, 0, 7, 0, 0},
+    {MTLPixelFormatBC5_RGSnorm,      0x28, T_SNORM, 2, 3, 0, 7, 0, 0},
+    {MTLPixelFormatBC6H_RGBFloat,    0x10, T_FLOAT, 2, 3, 4, 7, 0, 0},
+    {MTLPixelFormatBC6H_RGBUfloat,   0x11, T_FLOAT, 2, 3, 4, 7, 0, 0},
+    {MTLPixelFormatBC7_RGBAUnorm,    0x17, T_UNORM, 2, 3, 4, 5, 0, 0},
+    {MTLPixelFormatBC7_RGBAUnorm_sRGB, 0x17, T_UNORM, 2, 3, 4, 5, 1, 0},
 };
+uint32_t nvFormatBlockDim(MTLPixelFormat fmt) {
+    return fmt >= MTLPixelFormatBC1_RGBA && fmt <= MTLPixelFormatBC7_RGBAUnorm_sRGB ? 4 : 1;
+}
 
 static const TicFmt *ticBuild(MTLPixelFormat fmt, uint64_t va, uint32_t pitch, uint32_t w, uint32_t h,
                               uint32_t d[8]);
@@ -129,6 +166,7 @@ static const TicFmt *ticBuild(MTLPixelFormat fmt, uint64_t va, uint32_t pitch, u
     memset(d, 0, 32);
     put(d, 0, 6, f->comp);
     put(d, 7, 9, f->type); put(d, 10, 12, f->type); put(d, 13, 15, f->type); put(d, 16, 18, f->type);
+    if (fmt == MTLPixelFormatDepth32Float_Stencil8) put(d, 10, 12, T_UINT);
     put(d, 19, 21, f->sx); put(d, 22, 24, f->sy); put(d, 25, 27, f->sz); put(d, 28, 30, f->sw);
     put(d, 37, 63, (va >> 5) & 0x7ffffff);          // ADDRESS_BITS31TO5
     put(d, 64, 79, (va >> 32) & 0xffff);            // ADDRESS_BITS47TO32
@@ -149,11 +187,31 @@ static const TicFmt *ticBuild(MTLPixelFormat fmt, uint64_t va, uint32_t pitch, u
     return f;
 }
 
-// a header as the GPU sees it, for fault dumps
+// 0.8.13: a header as the GPU sees it, for fault dumps
 bool nvTicRead(uint32_t index, uint32_t d[8]) {
     if (!gPoolCpu || index >= kTicCount) return false;
     memcpy(d, gPoolCpu + (size_t)index * kDescBytes, kDescBytes);
     return true;
+}
+
+// 0.8.46: MTLTextureSwizzleChannels on top of the format's own component sources (texture
+// descriptor .swizzle and swizzled views). Each output channel takes zero, one, or the source the
+// format maps R/G/B/A to. RenderBox samples RG8 masks with a swizzle that moves G to alpha; with
+// it ignored alpha read 1 and the App Store icon came out under a full-icon pale overlay.
+void nvTicSwizzle(uint32_t index, MTLPixelFormat fmt, const uint8_t sw[4]) {
+    const TicFmt *f = NULL;
+    for (size_t i = 0; i < sizeof kFmts / sizeof kFmts[0]; ++i)
+        if (kFmts[i].f == fmt) { f = &kFmts[i]; break; }
+    if (!f || !gPoolCpu || !index || index >= kTicCount) return;
+    const uint8_t one = (f->type == T_SINT || f->type == T_UINT) ? 6 : 7;
+    const uint8_t src[6] = { 0, one, f->sx, f->sy, f->sz, f->sw };   // MTLTextureSwizzle Zero One Red Green Blue Alpha
+    uint32_t *d = (uint32_t *)(gPoolCpu + (size_t)index * kDescBytes);
+    os_unfair_lock_lock(&gPoolLock);
+    for (int c = 0; c < 4; ++c) {
+        const uint32_t v = sw[c] < 6 ? src[sw[c]] : 0, lo = 19 + 3 * c;
+        d[0] = (d[0] & ~(7u << lo)) | (v << lo);      // X/Y/Z/W_SOURCE, bits 19..30 of word 0
+    }
+    os_unfair_lock_unlock(&gPoolLock);
 }
 
 void nvTicFree(uint32_t index) {
@@ -170,17 +228,39 @@ static uint32_t ufix48(float v) {
     return (uint32_t)(v * 256.0f + 0.5f);
 }
 
+static uint32_t nvTscAllocAniso(uint32_t minF, uint32_t magF, uint32_t mipF, uint32_t addrU, uint32_t addrV,
+                                uint32_t addrW, bool normalized, float lodMin, float lodMax,
+                                uint32_t compare, uint32_t border, NSUInteger aniso);
 uint32_t nvTscAllocRaw(uint32_t minF, uint32_t magF, uint32_t mipF, uint32_t addrU, uint32_t addrV,
                        uint32_t addrW, bool normalized, float lodMin, float lodMax,
                        uint32_t compare, uint32_t border) {
+    return nvTscAllocAniso(minF, magF, mipF, addrU, addrV, addrW, normalized, lodMin, lodMax, compare, border, 1);
+}
+
+static uint32_t nvTscAllocAniso(uint32_t minF, uint32_t magF, uint32_t mipF, uint32_t addrU, uint32_t addrV,
+                                uint32_t addrW, bool normalized, float lodMin, float lodMax,
+                                uint32_t compare, uint32_t border, NSUInteger aniso) {
     uint32_t d[8] = {0};
     put(d, 0, 2, addrU); put(d, 3, 5, addrV); put(d, 6, 8, addrW);
     if (compare) { put(d, 9, 9, 1); put(d, 10, 12, compare - 1); }
+    // 0.8.16: SRGB_CONVERSION, set always as NVK does: without it sample()
+    // of an sRGB texture returned the stored value (read() was right) and
+    // every Core Image upload (sRGB IOSurface textures) came out washed out
+    put(d, 13, 13, 1);
     put(d, 32 + 0, 32 + 2, magF);
     put(d, 32 + 4, 32 + 5, minF);
     put(d, 32 + 6, 32 + 7, mipF);
     put(d, 32 + 8, 32 + 9, 2);                      // CUBEMAP_INTERFACE_FILTERING AUTO_SPAN_SEAM
     put(d, 32 + 25, 32 + 25, normalized ? 0 : 1);   // FLOAT_COORD_NORMALIZATION
+    // 0.8.19: anisotropic filtering the way NVK sets it: MAX_ANISOTROPY
+    // (1,2,4,6,8,10 -> n/2; 12, 16 own codes), MIN_FILTER ANISO for a linear
+    // minification, TRILIN_OPT as nouveau. It was never set: 16x sampled
+    // like 1x (metal_aniso_test against the M1).
+    if (aniso > 1 && minF == 2) {
+        put(d, 20, 22, aniso >= 16 ? 7 : aniso >= 12 ? 6 : (uint32_t)(aniso >> 1));
+        put(d, 32 + 4, 32 + 5, 3);
+        put(d, 32 + 26, 32 + 30, aniso >= 12 ? 0 : aniso >= 4 ? 6 : 4);
+    }
     put(d, 64 + 0, 64 + 11, ufix48(lodMin));
     put(d, 64 + 12, 64 + 23, ufix48(lodMax));
     // border: 0 transparent black, 1 opaque black, 2 opaque white (Metal order)
@@ -219,9 +299,9 @@ uint32_t nvTscAlloc(MTLSamplerDescriptor *sd) {
         border = sd.borderColor == MTLSamplerBorderColorOpaqueWhite ? 2
                : sd.borderColor == MTLSamplerBorderColorOpaqueBlack ? 1 : 0;
     const uint32_t cmp = sd.compareFunction != MTLCompareFunctionNever ? (uint32_t)sd.compareFunction + 1 : 0;
-    return nvTscAllocRaw(minF, magF, mipF, addrMode(sd.sAddressMode), addrMode(sd.tAddressMode),
-                         addrMode(sd.rAddressMode), sd.normalizedCoordinates, sd.lodMinClamp,
-                         sd.lodMaxClamp, cmp, border);
+    return nvTscAllocAniso(minF, magF, mipF, addrMode(sd.sAddressMode), addrMode(sd.tAddressMode),
+                           addrMode(sd.rAddressMode), sd.normalizedCoordinates, sd.lodMinClamp,
+                           sd.lodMaxClamp, cmp, border, sd.maxAnisotropy);
 }
 
 void nvTscFree(uint32_t index) {
@@ -263,18 +343,25 @@ static uint32_t ilog2ceil(uint32_t v) { uint32_t r = 0; while ((1u << r) < v) r+
 
 void nvTexLayoutInit(NVTexLayout *l, uint32_t w, uint32_t h, uint32_t d, uint32_t layers,
                      uint32_t levels, uint32_t bpp, bool is3D) {
+    nvTexLayoutInitBlk(l, w, h, d, layers, levels, bpp, is3D, 1);
+}
+void nvTexLayoutInitBlk(NVTexLayout *l, uint32_t w, uint32_t h, uint32_t d, uint32_t layers,
+                        uint32_t levels, uint32_t bpp, bool is3D, uint32_t blk) {
     memset(l, 0, sizeof(*l));
+    if (!blk) blk = 1;
+    l->blk = blk;
     l->w = w; l->h = h; l->d = is3D ? d : 1; l->layers = layers ? layers : 1;
     l->levels = levels ? (levels > 16 ? 16 : levels) : 1; l->bpp = bpp;
     uint32_t y = 5, z = is3D ? (getenv("NVMTL_Z0") ? (uint32_t)atoi(getenv("NVMTL_Z0")) : 5) : 0;
     // level 0 clamp
-    const uint32_t hg0 = (h + 7) / 8;
+    const uint32_t hg0 = ((h + blk - 1) / blk + 7) / 8;
     if (ilog2ceil(hg0) < y) y = ilog2ceil(hg0);
     if (ilog2ceil(l->d) < z) z = ilog2ceil(l->d);
     l->y0 = y; l->z0 = z;
     uint64_t off = 0;
     for (uint32_t i = 0; i < l->levels; i++) {
-        const uint32_t lw = w >> i ? w >> i : 1, lh = h >> i ? h >> i : 1, ld = l->d >> i ? l->d >> i : 1;
+        const uint32_t tw = w >> i ? w >> i : 1, th = h >> i ? h >> i : 1;
+        const uint32_t lw = (tw + blk - 1) / blk, lh = (th + blk - 1) / blk, ld = l->d >> i ? l->d >> i : 1;
         uint32_t ly = y, lz = z;
         if (ilog2ceil((lh + 7) / 8) < ly) ly = ilog2ceil((lh + 7) / 8);
         if (ilog2ceil(ld) < lz) lz = ilog2ceil(ld);
@@ -298,6 +385,7 @@ uint32_t nvTicAllocBL(MTLPixelFormat fmt, uint64_t va, uint32_t type, const NVTe
     uint32_t d[8] = {0};
     put(d, 0, 6, f->comp);
     put(d, 7, 9, f->type); put(d, 10, 12, f->type); put(d, 13, 15, f->type); put(d, 16, 18, f->type);
+    if (fmt == MTLPixelFormatDepth32Float_Stencil8) put(d, 10, 12, T_UINT);
     put(d, 19, 21, f->sx); put(d, 22, 24, f->sy); put(d, 25, 27, f->sz); put(d, 28, 30, f->sw);
     put(d, 41, 63, (va >> 9) & 0x7fffff);           // ADDRESS_BITS31TO9
     put(d, 64, 79, (va >> 32) & 0xffff);            // ADDRESS_BITS47TO32
@@ -335,13 +423,21 @@ uint32_t nvTicAllocBL(MTLPixelFormat fmt, uint64_t va, uint32_t type, const NVTe
     return idx;
 }
 
+uint32_t nvFormatIntKind(MTLPixelFormat fmt) {
+    for (size_t i = 0; i < sizeof kFmts / sizeof kFmts[0]; ++i)
+        if (kFmts[i].f == fmt) return kFmts[i].type == T_UINT ? 1 : kFmts[i].type == T_SINT ? 2 : 0;
+    return 0;
+}
+
 uint32_t nvFormatBytes(MTLPixelFormat fmt) {
     for (size_t i = 0; i < sizeof kFmts / sizeof kFmts[0]; ++i) {
         if (kFmts[i].f != fmt) continue;
         switch (kFmts[i].comp) {
         case 0x1d: return 1;
         case 0x18: case 0x1b: return 2;
-        case 0x03: case 0x04: return 8;
+        case 0x24: case 0x27: return 8;                                   // BC1, BC4 blocks
+        case 0x25: case 0x26: case 0x28: case 0x10: case 0x11: case 0x17: return 16;
+        case 0x03: case 0x04: case 0x05: return 8;
         case 0x01: return 16;
         default: return 4;
         }
