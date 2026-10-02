@@ -1,5 +1,6 @@
 nvgsp_cursor_offset: PASS
 nvgsp_cursor_arm: PASS
+nvgsp_cursor_move: PASS
 nvgsp_lut_identity: PASS
 nvgsp_vram_dword_read: PASS
 nvdisplay_window_probe: PASS
@@ -48,6 +49,5 @@ EDID 1.4 name "BenQ PD2705U" ext 1 parsed 1 bad 0 range 50-76 Hz 135-135 kHz 600
   [19] cta-dtd  2560x1440  59.95 Hz pclk 241.500 MHz total 2720x1481 flags 0x1c
   [20] cta-dtd  1920x2160  59.99 Hz pclk 277.250 MHz total 2080x2222 flags 0x14
 nvdisplay_edid_check: OK
-Strict macOS display probe native and x86_64 compile: PASS
-GR context expected address made explicitly uint64 for GCC sign-compare; strict local recheck: PASS
-ArenaMap small-page fixture uses existing value initialization; redundant class memset removed for GCC. Strict local sparse/normal/remap checks: PASS
+Strict macOS display probe native and x86_64 compile: PASS (unchanged probe sources)
+Old actual cursorMove fails the PIO regression; new method and cursorTest result propagation pass.
