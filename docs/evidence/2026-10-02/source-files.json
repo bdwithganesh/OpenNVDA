@@ -43,11 +43,11 @@
     },
     {
       "path": "drivers/NVGspControl/Info.plist",
-      "sha256": "1189511e9455ad8ff7c5a843235a4382ee73405e15420c81ed3496b9c3fca607"
+      "sha256": "e23b521f4b6886c9ffe919c9426d8e5067480fa51387fb15806ed13090498bb5"
     },
     {
       "path": "drivers/NVGspControl/NVGspControl.cpp",
-      "sha256": "963511b95a90dddc6a8ac7efe73a636f56c2eff71e61a70eb816e76b147a05ac"
+      "sha256": "7edcd358a2490e754e91fdcdd179e60b2f551379d48030c2990582f99df28da5"
     },
     {
       "path": "drivers/NVGspControl/NVGspControl.hpp",
@@ -540,6 +540,10 @@
     {
       "path": "tests/test_nvgsp_cursor_arm.py",
       "sha256": "1c565a99929000ada17a300c9e43f1df9afbd899d6edee8ba59cb2d2dd3050b2"
+    },
+    {
+      "path": "tests/test_nvgsp_cursor_move.py",
+      "sha256": "dfc5032968c1f5595c1985de455d081c10dc0fd8d23fb42eefb9dec25f902d3f"
     },
     {
       "path": "tests/test_nvgsp_cursor_offset.py",

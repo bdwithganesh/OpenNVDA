@@ -41,7 +41,7 @@ The current test machine runs Tahoe 26.7. This is the 2 October 2026 checkpoint,
 | **GPU** | NVIDIA GeForce RTX 4080 16 GB (AD103, Ada Lovelace) |
 | **OS / firmware** | macOS Tahoe 26.7 / NVIDIA GSP-RM r570.144 |
 | **Installed stack** | NVGspControl 0.178.27, NVAccelerator 0.5.17, NVMTLDriver 0.8.69, NVDisplay 0.9.6 |
-| **Published control source** | 0.178.29; host checks and kernel SDK build pass, not installed on the test machine yet |
+| **Published control source** | 0.178.30; host checks and kernel SDK build pass, not installed on the test machine yet |
 
 #### 🟢 Checked on the machine
 

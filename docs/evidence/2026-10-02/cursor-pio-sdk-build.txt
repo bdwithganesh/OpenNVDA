@@ -1,0 +1,8 @@
+Compiled diagnostic kext (NOT loaded or runtime-validated): ~/nvbuild-lut-017828/build/kext-NVGspControl-20261002T153947Z-33945
+build_exit=0
+86149846bf4f823009a217068763a858279754c436c194f66848e285cab293a8  ~/nvbuild-lut-017828/build/kext-NVGspControl-20261002T153947Z-33945/NVGspControl.kext/Contents/MacOS/NVGspControl
+NVGspControl::pollStatusLocked stack frame: 6408 bytes (<8192 required)
+7edcd358a2490e754e91fdcdd179e60b2f551379d48030c2990582f99df28da5  drivers/NVGspControl/NVGspControl.cpp
+f175df77b295655c649ca73da65911fb3c3fe50a260c38cff6c0ddbdecfdf60b  drivers/NVGspControl/NVGspControl.hpp
+e23b521f4b6886c9ffe919c9426d8e5067480fa51387fb15806ed13090498bb5  drivers/NVGspControl/Info.plist
+0.178.30

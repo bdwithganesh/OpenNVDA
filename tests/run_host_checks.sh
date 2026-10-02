@@ -8,7 +8,7 @@ python3 - <<'PY'
 import subprocess
 
 checks = [
-    'nvgsp_cursor_offset', 'nvgsp_cursor_arm', 'nvgsp_lut_identity',
+    'nvgsp_cursor_offset', 'nvgsp_cursor_arm', 'nvgsp_cursor_move', 'nvgsp_lut_identity',
     'nvgsp_vram_dword_read', 'nvdisplay_window_probe', 'nvdisplay_cursor_probe',
     'nvdisplay_cursor_setup', 'nvdisplay_crc_probe', 'nvdisplay_output_probe',
     'nvgsp_context_clear', 'nvaccel_stamp_watchdog', 'nvgsp_rpc_ownership',

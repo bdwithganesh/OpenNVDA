@@ -4056,24 +4056,35 @@ IOReturn NVGspControl::cursorTest(UInt32 op) {
     cursorVisible_ = true;
     r = cursorImage(img, 0, 0);
     IOFree(img, 64 * 64 * 4);
-    if (r == kIOReturnSuccess) cursorMove(64, 64);
+    if (r == kIOReturnSuccess) r = cursorMove(64, 64);
     setProperty("NVGspControl-cursor-test", static_cast<UInt32>(r), 32);
     return r;
 }
 
 IOReturn NVGspControl::cursorMove(SInt32 x, SInt32 y) {
     // Cursor PIO (user area 0x6D8000 + head*0x1000): hot-spot point out, then
-    // UPDATE (nvkms MoveCursorC3). Free (0x008) must be non-zero.
+    // UPDATE (nvkms MoveCursorC3). Each store needs its own free-space check.
     if (!cursorReady_ || !pci_) return kIOReturnNotReady;
     IOMemoryMap *map = sharedBar0Map(pci_);
     if (!map || map->getLength() < 0x6D9000) { if (map) map->release(); return kIOReturnNoMemory; }
     Bar0Io bar0{map};
-    UInt32 fr = 0;
-    for (UInt32 i = 0; i < 100 && bar0.read(0x6D8008, &fr) && !fr; ++i) IODelay(10);
-    bar0.write(0x6D8208, (static_cast<UInt32>(y & 0xffff) << 16) | static_cast<UInt32>(x & 0xffff));
-    bar0.write(0x6D8200, 0);
+    const auto waitFree = [&bar0]() -> IOReturn {
+        for (UInt32 i = 0; i < 100; ++i) {
+            UInt32 space = 0;
+            if (!bar0.read(0x6D8008, &space)) return kIOReturnIOError;
+            if (space & 0x3fU) return kIOReturnSuccess;
+            IOSleep(1);
+        }
+        return kIOReturnTimeout;
+    };
+    IOReturn result = waitFree();
+    if (result == kIOReturnSuccess &&
+        !bar0.write(0x6D8208, (static_cast<UInt32>(y & 0xffff) << 16) |
+                              static_cast<UInt32>(x & 0xffff))) result = kIOReturnIOError;
+    if (result == kIOReturnSuccess) result = waitFree();
+    if (result == kIOReturnSuccess && !bar0.write(0x6D8200, 0)) result = kIOReturnIOError;
     map->release();
-    return kIOReturnSuccess;
+    return result;
 }
 
 // 0.87.0: GSP LibOS log buffer read-out (LOGINIT 0, LOGINTR 1, LOGRM 2,
