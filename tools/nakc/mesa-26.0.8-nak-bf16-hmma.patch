@@ -1,0 +1,96 @@
+--- a/src/nouveau/compiler/nak/ir.rs
++++ b/src/nouveau/compiler/nak/ir.rs
+@@ -3485,6 +3485,13 @@
+             HmmaSize::M16N8K4 => write!(f, ".m16n8k4"),
+         }
+     }
++}
++
++/// HMMA multiplicand type (F16 on sm75+, BF16 on sm80+)
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum HmmaSrcType {
++    F16,
++    BF16,
+ }
+ 
+ #[repr(C)]
+@@ -3494,7 +3501,7 @@
+     pub dst: Dst,
+ 
+     pub mat_size: HmmaSize,
+-    pub src_type: FloatType,
++    pub src_type: HmmaSrcType,
+     pub dst_type: FloatType,
+ 
+     #[src_type(SSA)]
+@@ -3505,9 +3512,10 @@
+     fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         write!(
+             f,
+-            "hmma{}{} {} {} {}",
++            "hmma{}{}{} {} {} {}",
+             self.mat_size,
+             self.dst_type,
++            if self.src_type == HmmaSrcType::BF16 { ".bf16" } else { "" },
+             self.srcs[0],
+             self.srcs[1],
+             self.srcs[2],
+--- a/src/nouveau/compiler/nak/from_nir.rs
++++ b/src/nouveau/compiler/nak/from_nir.rs
+@@ -3814,13 +3814,17 @@
+                             val => unreachable!("unsupported HMMA type: {val}"),
+                         };
+ 
+-                        assert_eq!(flags.a_type(), GLSL_TYPE_FLOAT16);
+-                        assert_eq!(flags.b_type(), GLSL_TYPE_FLOAT16);
++                        let src_type = match flags.a_type() {
++                            GLSL_TYPE_FLOAT16 => HmmaSrcType::F16,
++                            GLSL_TYPE_BFLOAT16 => HmmaSrcType::BF16,
++                            val => unreachable!("Invalid HMMA a_type: {val}"),
++                        };
++                        assert_eq!(flags.a_type(), flags.b_type());
+                         assert!(!flags.sat());
+                         b.push_op(OpHmma {
+                             dst: dst.clone().into(),
+                             dst_type: dst_type,
+-                            src_type: FloatType::F16,
++                            src_type: src_type,
+                             mat_size: mat_size,
+                             srcs: [cmat_a, cmat_b, cmat_c],
+                         });
+--- a/src/nouveau/compiler/nak/sm70_encode.rs
++++ b/src/nouveau/compiler/nak/sm70_encode.rs
+@@ -3989,10 +3989,12 @@
+         e.set_field(
+             82..84,
+             match self.src_type {
+-                FloatType::F16 => 0u8,
+-                // FloatType::BF16 => 1u8,
+-                // FloatType::TF32 => 2u8,
+-                _ => unreachable!("unsupported src type!"),
++                HmmaSrcType::F16 => 0u8,
++                HmmaSrcType::BF16 => {
++                    assert!(e.sm >= 80);
++                    1u8
++                }
++                // TF32 => 2
+             },
+         )
+     }
+--- a/src/nouveau/compiler/nak/sm80_instr_latencies.rs
++++ b/src/nouveau/compiler/nak/sm80_instr_latencies.rs
+@@ -145,10 +145,12 @@
+             // let in for documentation purposes
+             Op::Hmma(h) => match (h.mat_size, h.dst_type, h.src_type) {
+                 // (HmmaSize::M16N8K8, FloatType::F32, FloatType::TF32) => MMA_2x_collect,
+-                (HmmaSize::M16N8K8, FloatType::F32, FloatType::F16) => {
++                (HmmaSize::M16N8K8, FloatType::F32, HmmaSrcType::F16) => {
+                     MMA_1x_collect
+                 }
+-                // (HmmaSize::M16N8K8, FloatType::F32, FloatType::BF16) => MMA_1x_collect,
++                (HmmaSize::M16N8K8, FloatType::F32, HmmaSrcType::BF16) => {
++                    MMA_1x_collect
++                }
+                 // (HmmaSize::M16N8K4, FloatType::F32, FloatType::TF32) => MMA_1x_collect,
+                 (HmmaSize::M16N8K8, FloatType::F16, _) => MMA_1x_collect,
+                 (HmmaSize::M16N8K16, _, _) => MMA_2x_collect,

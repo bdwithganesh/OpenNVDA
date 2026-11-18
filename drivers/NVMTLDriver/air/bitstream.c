@@ -16,6 +16,7 @@ static uint64_t fixed(rd *r, unsigned n) {
 }
 
 static uint64_t vbr(rd *r, unsigned n) {
+    if (!n || n > 32) { r->bad = 1; return 0; }
     const uint64_t hi = 1ull << (n - 1);
     uint64_t v = 0;
     for (unsigned shift = 0; shift < 64 && !r->bad; shift += n - 1) {
@@ -39,22 +40,35 @@ typedef struct { uint32_t id; abbrev_list list; } info_entry;
 typedef struct { info_entry *e; uint32_t n; } blockinfo;
 
 static abbrev_list *info_for(blockinfo *bi, uint32_t id, int make) {
+    if (!bi) return NULL;
     for (uint32_t i = 0; i < bi->n; ++i) if (bi->e[i].id == id) return &bi->e[i].list;
-    if (!make) return NULL;
-    bi->e = realloc(bi->e, (bi->n + 1) * sizeof(*bi->e));
+    if (!make || bi->n >= 4096) return NULL;
+    info_entry *e = realloc(bi->e, (bi->n + 1) * sizeof(*bi->e));
+    if (!e) return NULL;
+    bi->e = e;
     memset(&bi->e[bi->n], 0, sizeof(info_entry));
     bi->e[bi->n].id = id;
     return &bi->e[bi->n++].list;
 }
 
-static void push_abbrev(abbrev_list *l, abbrev a) {
-    if (l->n == l->cap) { l->cap = l->cap ? l->cap * 2 : 8; l->a = realloc(l->a, l->cap * sizeof(abbrev)); }
+static int push_abbrev(abbrev_list *l, abbrev a) {
+    if (!l) return -1;
+    if (l->n == l->cap) {
+        const uint32_t cap = l->cap ? l->cap * 2 : 8;
+        if (cap < l->cap || cap > (1u << 20)) return -1;
+        abbrev *p = realloc(l->a, cap * sizeof(abbrev));
+        if (!p) return -1;
+        l->a = p; l->cap = cap;
+    }
     l->a[l->n++] = a;
+    return 0;
 }
 
 static int read_abbrev(rd *r, abbrev *out) {
     const uint32_t n = (uint32_t)vbr(r, 5);
+    if (n > (1u << 16)) return -1;
     out->ops = calloc(n ? n : 1, sizeof(abbrev_op));
+    if (!out->ops) return -1;
     out->n = 0;
     for (uint32_t i = 0; i < n && !r->bad; ++i) {
         abbrev_op op = {0, 0};
@@ -66,11 +80,12 @@ static int read_abbrev(rd *r, abbrev *out) {
             else if (e == 3) op.kind = OP_ARRAY;
             else if (e == 4) op.kind = OP_CHAR6;
             else if (e == 5) op.kind = OP_BLOB;
-            else return -1;
+            else { free(out->ops); out->ops = NULL; out->n = 0; return -1; }
         }
         out->ops[out->n++] = op;
     }
-    return r->bad ? -1 : 0;
+    if (r->bad) { free(out->ops); out->ops = NULL; out->n = 0; return -1; }
+    return 0;
 }
 
 static uint64_t scalar(rd *r, const abbrev_op *op) {
@@ -87,9 +102,16 @@ static uint64_t scalar(rd *r, const abbrev_op *op) {
 }
 
 typedef struct { uint64_t *v; uint32_t n, cap; } u64vec;
-static void u64push(u64vec *v, uint64_t x) {
-    if (v->n == v->cap) { v->cap = v->cap ? v->cap * 2 : 16; v->v = realloc(v->v, v->cap * 8); }
+static int u64push(u64vec *v, uint64_t x) {
+    if (v->n == v->cap) {
+        const uint32_t cap = v->cap ? v->cap * 2 : 16;
+        if (cap < v->cap || cap > (1u << 22)) return -1;
+        uint64_t *p = realloc(v->v, (size_t)cap * 8);
+        if (!p) return -1;
+        v->v = p; v->cap = cap;
+    }
     v->v[v->n++] = x;
+    return 0;
 }
 
 static int read_record(rd *r, uint32_t id, const abbrev *a, bc_record *rec) {
@@ -98,26 +120,32 @@ static int read_record(rd *r, uint32_t id, const abbrev *a, bc_record *rec) {
     if (!a) {                                        /* UNABBREV_RECORD */
         rec->code = (uint32_t)vbr(r, 6);
         const uint32_t n = (uint32_t)vbr(r, 6);
-        for (uint32_t i = 0; i < n && !r->bad; ++i) u64push(&ops, vbr(r, 6));
+        if (n > (1u << 20)) { free(ops.v); return -1; }
+        for (uint32_t i = 0; i < n && !r->bad; ++i)
+            if (u64push(&ops, vbr(r, 6))) { free(ops.v); return -1; }
     } else {
         int first = 1;
         for (uint32_t i = 0; i < a->n && !r->bad; ++i) {
             const abbrev_op *op = &a->ops[i];
             uint64_t v;
             if (op->kind == OP_ARRAY) {
-                if (i + 1 >= a->n) return -1;
+                if (i + 1 >= a->n) { free(ops.v); return -1; }
                 const uint32_t n = (uint32_t)vbr(r, 6);
+                if (n > (1u << 20)) { free(ops.v); return -1; }
                 const abbrev_op *elt = &a->ops[++i];
                 for (uint32_t k = 0; k < n && !r->bad; ++k) {
                     v = scalar(r, elt);
-                    if (first) { rec->code = (uint32_t)v; first = 0; } else u64push(&ops, v);
+                    if (first) { rec->code = (uint32_t)v; first = 0; }
+                    else if (u64push(&ops, v)) { free(ops.v); return -1; }
                 }
                 continue;
             }
             if (op->kind == OP_BLOB) {
                 const uint32_t n = (uint32_t)vbr(r, 6);
                 align32(r);
-                if (r->pos + (size_t)n * 8 > r->bits) return -1;
+                if (r->pos > r->bits || n > (r->bits - r->pos) / 8) {
+                    free(ops.v); return -1;
+                }
                 rec->blob = r->p + (r->pos >> 3);
                 rec->blob_len = n;
                 r->pos += (size_t)n * 8;
@@ -125,7 +153,8 @@ static int read_record(rd *r, uint32_t id, const abbrev *a, bc_record *rec) {
                 continue;
             }
             v = scalar(r, op);
-            if (first) { rec->code = (uint32_t)v; first = 0; } else u64push(&ops, v);
+            if (first) { rec->code = (uint32_t)v; first = 0; }
+            else if (u64push(&ops, v)) { free(ops.v); return -1; }
         }
     }
     (void)id;
@@ -134,9 +163,13 @@ static int read_record(rd *r, uint32_t id, const abbrev *a, bc_record *rec) {
     return r->bad ? -1 : 0;
 }
 
-static void add_order(bc_block *b, int32_t v) {
-    b->order = realloc(b->order, (b->norder + 1) * sizeof(int32_t));
+static int add_order(bc_block *b, int32_t v) {
+    if (!b || b->norder >= (1u << 24)) return -1;
+    int32_t *p = realloc(b->order, (size_t)(b->norder + 1) * sizeof(int32_t));
+    if (!p) return -1;
+    b->order = p;
     b->order[b->norder++] = v;
+    return 0;
 }
 
 static int read_block(rd *r, bc_block *b, unsigned width, blockinfo *bi, int depth) {
@@ -158,11 +191,13 @@ static int read_block(rd *r, bc_block *b, unsigned width, blockinfo *bi, int dep
             const unsigned w = (unsigned)vbr(r, 4);
             align32(r);
             fixed(r, 32);                            /* length in words */
-            b->blocks = realloc(b->blocks, (b->nblocks + 1) * sizeof(bc_block));
+            bc_block *blocks = realloc(b->blocks, (size_t)(b->nblocks + 1) * sizeof(bc_block));
+            if (!blocks) return -1;
+            b->blocks = blocks;
             bc_block *c = &b->blocks[b->nblocks];
             memset(c, 0, sizeof(*c));
             c->id = id;
-            add_order(b, -(int32_t)b->nblocks - 1);
+            if (add_order(b, -(int32_t)b->nblocks - 1)) return -1;
             ++b->nblocks;
             if (read_block(r, c, w, bi, depth + 1)) return -1;
             if (inherited) inherited = info_for(bi, b->id, 0);   /* BLOCKINFO may have grown it */
@@ -172,10 +207,10 @@ static int read_block(rd *r, bc_block *b, unsigned width, blockinfo *bi, int dep
             abbrev a;
             if (read_abbrev(r, &a)) return -1;
             if (b->id == BC_BLOCKINFO) {
-                if (info_target == ~0u) return -1;
-                push_abbrev(info_for(bi, info_target, 1), a);
+                if (info_target == ~0u) { free(a.ops); return -1; }
+                if (push_abbrev(info_for(bi, info_target, 1), a)) { free(a.ops); return -1; }
                 inherited = info_for(bi, b->id, 0);
-            } else push_abbrev(&local, a);
+            } else if (push_abbrev(&local, a)) { free(a.ops); return -1; }
             continue;
         }
         const abbrev *a = NULL;
@@ -193,14 +228,17 @@ static int read_block(rd *r, bc_block *b, unsigned width, blockinfo *bi, int dep
             free(rec.ops);
             continue;
         }
-        b->records = realloc(b->records, (b->nrecords + 1) * sizeof(bc_record));
+        bc_record *records = realloc(b->records, (size_t)(b->nrecords + 1) * sizeof(bc_record));
+        if (!records) { free(rec.ops); return -1; }
+        b->records = records;
         b->records[b->nrecords] = rec;
-        add_order(b, (int32_t)b->nrecords);
+        if (add_order(b, (int32_t)b->nrecords)) return -1;
         ++b->nrecords;
     }
 }
 
 int bc_parse(const uint8_t *data, size_t len, bc_block *root, char *err, size_t errlen) {
+    if (!root) return -1;
     memset(root, 0, sizeof(*root));
     root->id = ~0u;
     if (len >= 20 && data[0] == 0xde && data[1] == 0xc0 && data[2] == 0x17 && data[3] == 0x0b) {
@@ -231,11 +269,13 @@ int bc_parse(const uint8_t *data, size_t len, bc_block *root, char *err, size_t 
         const unsigned w = (unsigned)vbr(&r, 4);
         align32(&r);
         fixed(&r, 32);
-        root->blocks = realloc(root->blocks, (root->nblocks + 1) * sizeof(bc_block));
+        bc_block *blocks = realloc(root->blocks, (size_t)(root->nblocks + 1) * sizeof(bc_block));
+        if (!blocks) { snprintf(err, errlen, "block table allocation failed"); rc = -1; break; }
+        root->blocks = blocks;
         bc_block *c = &root->blocks[root->nblocks];
         memset(c, 0, sizeof(*c));
         c->id = id;
-        add_order(root, -(int32_t)root->nblocks - 1);
+        if (add_order(root, -(int32_t)root->nblocks - 1)) { rc = -1; break; }
         ++root->nblocks;
         if (read_block(&r, c, w, &bi, 0)) {
             snprintf(err, errlen, "malformed block %u near bit %zu", id, r.pos);

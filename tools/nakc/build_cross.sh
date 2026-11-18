@@ -9,7 +9,7 @@ OUT=${2:?out dir}
 R=$(cd "$(dirname "$0")/../.." && pwd)
 B=$M/build-nak-x86
 SRC=$(mktemp -d)
-cp $R/tools/nakc/*.c $R/tools/nakc/*.h $R/drivers/NVMTLDriver/air/*.[ch] $SRC/
+cp $R/tools/nakc/*.c $R/tools/nakc/*.h $R/drivers/nvidia-metal-drivers-macos/NVMTLDriver/air/*.[ch] $SRC/
 LIBS=(src/nouveau/compiler/libnak.a src/nouveau/compiler/libnak_rs.a
       src/compiler/spirv/libvtn.a src/compiler/nir/libnir.a
       src/compiler/libcompiler.a src/nouveau/headers/libnvidia_headers_c.a

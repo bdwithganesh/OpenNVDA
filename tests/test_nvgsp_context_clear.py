@@ -6,8 +6,10 @@ The fixture also checks that a failed clear prevents promotion, keeps global
 non-initialized buffers intact, and frees the request allocation.
 """
 import argparse
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -99,8 +101,11 @@ def main():
     with tempfile.TemporaryDirectory(prefix='nvgsp-context-clear-') as tmp:
         cpp,exe=Path(tmp)/'check.cpp',Path(tmp)/'check'
         cpp.write_text(MOCK+block+TAIL)
-        subprocess.run(['clang++','-std=c++17','-Wall','-Wextra','-Werror',
-                        '-Wno-unused-variable','-fsanitize=undefined',str(cpp),'-o',str(exe)],check=True)
+        extra = []
+        if sys.platform.startswith('win'):
+            extra = ['-include', str(Path(__file__).with_name('win_bzero.h'))]
+        subprocess.run([os.environ.get('CXX', 'clang++'),'-std=c++17','-Wall','-Wextra','-Werror',
+                        '-Wno-unused-variable','-fsanitize=undefined',*extra,str(cpp),'-o',str(exe)],check=True)
         subprocess.run([str(exe)],timeout=20,check=True)
 
 if __name__ == '__main__':

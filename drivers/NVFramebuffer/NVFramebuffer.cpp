@@ -1,46 +1,146 @@
-// Minimal IOFramebuffer for the RTX 4080 (10DE:2704), the very first step of the GPU driver.
+// Minimal IOFramebuffer for the RTX 4080 (10DE:2704) - milestone 1 of the GPU driver.
 //
-// Neither GPU on this board has a macOS driver, so WindowServer never starts and no installer GUI shows up;
-// the boot just stops printing after the last driver message. WindowServer doesn't need Metal, only an
-// IOFramebuffer provider (that's why macOS gives you a desktop on plain framebuffers under QEMU/VMware,
-// software rendered). So we publish the linear surface the UEFI GOP already set up, the same surface all the
-// verbose boot text gets drawn on.
+// Neither GPU on this board has a macOS driver, so WindowServer never starts and no installer GUI can
+// appear; the boot simply stops printing after the last driver message. WindowServer does not require
+// Metal, only an IOFramebuffer provider (this is why macOS shows a desktop on plain framebuffers under
+// QEMU/VMware, software-rendered). So we publish the linear surface the UEFI GOP already programmed -
+// the very surface every verbose boot line has been drawn on.
 //
-// What NVFBProbe measured on this machine:
-//   console relocated to 0x1890000000; 3840x2160, depth 32, rowBytes 16384 (stride padded to 4096 px)
-//   BAR1 phys=0x1890000000 len=0x10000000, so the console lives at BAR1 + 0
-//   cmd=0x0003, memory/IO decode already on.
-// Geometry is still read at runtime, not hardcoded; the numbers above are just what we expect.
+// Measured on this machine by NVFBProbe (evidence/kext-nvfbprobe-20260921-1):
+//   console relocated to 0x1890000000 ; 3840x2160, depth 32, rowBytes 16384 (stride padded to 4096 px)
+//   BAR1 phys=0x1890000000 len=0x10000000  -> the console lives at BAR1 + 0
+//   cmd=0x0003, so memory/IO decode is already enabled.
+// Geometry is still read at runtime rather than hardcoded; the numbers above are the expected values.
 //
-// Scope: scan-out of the existing mode only. No mode setting, no GSP, no acceleration, and on purpose no
-// BAR0 registers.
+// Scope: scan-out of the existing mode only. No mode setting, no GSP, no acceleration - those are later
+// milestones. This deliberately does not touch BAR0 registers.
 //
-// A lot of debugging code lives in here because this box has no serial port and the verbose console is
-// useless once WindowServer grabs the display (or fails to). Short story of how it went:
-//  - First we traced through NVRAM (survives a hard reset, readable from Windows with
-// tools/read_apple_nvram.ps1): nvfb-trace (which IOFramebuffer entry points got called), nvfb-beat (uptime
-// heartbeat), nvfb-ps (processes), nvfb-mnt (mounts), nvfb-dmesg0 (graphics/root lines from the message
-// buffer), nvfb-pci0..4 (every IOPCIDevice with BARs, link status, bridge windows, and the first bytes of
-// BAR0 for NVMe/xHCI) and nvfb-stor (boot-uuid vs every IOMedia).
-//  - That showed root never got mounted ("Still waiting for root device") because one NVMe controller failed
-// the CAP MPS check; its BAR was sitting on the second Promontory's GPIO. SSDT-PT2R fixed it and root mounts
-// now.
-//  - Then the NVRAM store filled up: deletes only flip a header bit and writes need append space that UEFI
-// only reclaims at boot. So NVRAM writing is off by default now (boot-arg nvfb-nvram=1 turns it on), and
-// every variable this driver ever made gets deleted. Status goes to the console instead.
-//  - Next a HUD drawn straight into the scan-out buffer, with a lock-free 1 Hz tick so a frozen screen and a
-// frozen kernel can be told apart, plus callback entry/return marks, the last IOKit publish/match events,
-// the registry busy state, per-process property reads, user clients per key process and task counters for
-// WindowServer.
-//  - All that showed the machine freezing around T=9-28 s, and not in the display path. For a channel that
-// doesn't go through the GPU we added a UDP log to the Mac build host (tools/udp_log_receiver.py) on its own
-// real-time kernel thread, with a proper NIC pick (name "en", Ethernet, sane MTU; the first try grabbed XHC0
-// with MTU 0 and hit an assertion in ip_output_list).
-//  - Finally everything that touches the machine went behind boot-arg nvfb-diag=1. With it all off the
-// machine still stopped, even earlier, so the polling was never the cause. The quiet path now only prints
-// "alive t=<n>s" on the console every second (the NVRAM beat thread stopped coming back after a few writes).
-// NVRAM writes, when enabled, are change-driven and capped (about 40 KB per boot at worst) to go easy on the
-// flash, and need OpenCore's Booter/Quirks/DisableVariableWrite off.
+// NVRAM trace. This machine has no serial port, and the verbose console stops being useful the moment
+// WindowServer takes the display (or fails to). NVRAM survives a hard reset and is readable from Windows
+// (tools/read_apple_nvram.ps1), so it is the only persistent channel available. Two variables:
+//   nvfb-trace  which IOFramebuffer entry points the system called, and which attribute selectors it
+//               asked for with our result - i.e. how far IOGraphics and WindowServer got with us.
+//   nvfb-beat   uptime heartbeat, so a static screen can be told apart from a hung kernel.
+//   nvfb-ps     running processes (pid:name) - whether launchd, WindowServer etc. ever ran, and
+//               whether something is crash-looping (its pid keeps changing).
+//   nvfb-mnt    mounted filesystems, i.e. whether and from where root was mounted.
+//   nvfb-dmesg0 kernel message buffer lines about graphics, userspace bring-up and root, from the
+//               whole buffer (one 2 KB variable, captured once).
+//   nvfb-pci0..4  every IOPCIDevice: ids, class, command register, BARs as programmed and as IOKit
+//               mapped them, PCIe link status, bridge bus/memory windows, attached drivers - and for
+//               NVMe/xHCI controllers the first 8 bytes of BAR0 (NVMe CAP, xHCI capability regs).
+//   nvfb-stor   /chosen boot-uuid and root-matching, plus every IOMedia (BSD name, size, content,
+//               UUID, owning PCI device): what the kernel waits for versus what it can see.
+// 0.3.0 found root is never mounted ("Still waiting for root device", only kernel_task running), and
+// one NVMe controller fails `(CAP & kNVMe_CAP_MPS_Min_Mask) == 0`. 0.4.0 measured which and why (the
+// EVM BAR sat on the second Promontory's GPIO), and SSDT-PT2R fixed it: root now mounts.
+// 0.5.0 proved the NVRAM store is exhausted: its deletes of the stale probe variables took effect,
+// but every write failed. Deletes only flip a header bit; writes need append space, which UEFI can
+// only reclaim at boot time. So 0.6.0 stops writing NVRAM (unless boot-arg nvfb-nvram=1), deletes every
+// variable this driver ever created, and reports on the console instead: root now mounts, WindowServer
+// has not taken the display, so the verbose text screen is still visible and can be photographed.
+//   Every 30 s: "NVFB <uptime>s procs=N ws=<pid> hidd=<pid> ... | fb uc=.. op=.. ..." (pid or -).
+//   When the process set changes (at most 6 times): the full pid:name list.
+//   newUserClient/open are printed before calling IOFramebuffer, which releases the console.
+// 0.7.0 adds a HUD drawn straight into the scan-out buffer (top-right corner), because the 0.6.0 boot
+// showed no console status line at all after userspace started - either the kernel stopped, or the
+// console stopped drawing. The HUD separates those: a 1 Hz tick redraws an uptime counter and a
+// blinking square without taking any lock, so if it keeps moving the kernel is alive; a separate 5 s
+// probe (process list, key IOKit services) feeds it, and AGE shows whether that probe itself is stuck.
+// 0.7.0 showed the kernel itself stops at T~9-10 s (the HUD froze too), right as the auxiliary kext
+// collection loads. 0.8.0 probes every second and adds a third line naming which auxiliary-collection
+// drivers have attached, so the last snapshot before a freeze names the drivers that were starting.
+// 0.8.0 (with X86PlatformPlugin blocked) froze at T=9 again, with no auxiliary driver attached yet and
+// WindowServer already running (pid 233). IOGraphics-598 IOFramebuffer::open() starts by disabling the
+// console (kPEDisableScreen) and then calls back into this driver many times. 0.9.0 marks every callback
+// on entry - before calling IOFramebuffer - and redraws the HUD synchronously there, so after a freeze
+// the screen shows the last callback entered (LAST=xx>) or returned from (LAST=xx<).
+// 0.9.0 froze at T=9 with N=0: not one framebuffer callback ran, so the freeze is not in the display
+// path. 0.10.0 subscribes to IOKit's publish and matched notifications for every service, keeps the
+// last six in a ring with millisecond timestamps, and shows them on the HUD - so the frozen screen
+// names the last services that appeared (P) or finished matching (M) before the machine stopped.
+// 0.10.0 ran to at least 16.6 s, but the scrolling console overwrote the top-right HUD, leaving one ring
+// line. 0.11.0 moves the HUD into a full-width band at the bottom and shrinks the kernel console's height
+// so it never draws there - the same kPEDisableScreen / kPEEnableScreen sequence IOFramebuffer uses on a
+// mode change (XNU initialize_screen remaps the physical buffer and rebuilds the text grid). With the
+// wider band the HUD shows all callback counters and the last 16 service events.
+// 0.11.0 showed the machine alive at 46 s (disk-image services still appearing), but every photo caught
+// the band mid-repaint: each draw refilled all 3840x448 pixels and several threads drew at once. 0.12.0
+// repaints only lines whose text changed, lets one thread draw at a time (the others skip), refills the
+// whole band only on the first draw and every 5 s, and adds a line with the newest processes.
+// 0.12.0 showed userspace alive at 28 s (55 processes, WindowServer pid 233 since ~8 s) but WindowServer
+// never connected, and PUB=589 vs MAT=587: two services were published whose matching never finished.
+// A driver stuck in probe/start keeps IOKit busy, and anything waiting for the registry to go quiet waits
+// with it. 0.13.0 keeps every published-but-unmatched service (retained, so its busy count can be read),
+// shows the registry root's busy count, and records which user processes read this framebuffer's
+// properties - i.e. whether WindowServer ever looked at it.
+// 0.13.0 measured BUSY=4 at the registry root at 29 s (IOKit not quiet), PUB 589 vs MAT 586, and no
+// WindowServer read among the recent property reads; its pending list was useless because the
+// notifier's initial delivery of every existing service filled it (374 dropped). 0.14.0 drops that list
+// and instead walks the whole service plane once a second, listing the busy leaves - services whose
+// busy count is non-zero while none of their children is busy, i.e. where the outstanding work sits.
+// Property reads are tallied per process so a single WindowServer read cannot scroll away.
+// 0.14.0: root BUSY=4 with zero busy services under it (616 walked) - the units sit on the root itself
+// (the getBusyState vtable slot was checked against the 23G93 kernel: slot 197, offset 0x628, matches),
+// and no WindowServer property read at all. 0.15.0 also lists the IOKit user clients each key process
+// has opened (from IOUserClientCreator), which shows how far WindowServer got through IOKit.
+// 0.15.0: WindowServer had opened zero user clients (and its pid was 276, where every earlier boot showed
+// 233). 0.16.0 answers "blocked or looping?": per-second task counters (context switches, Mach messages,
+// syscalls, live-thread CPU time via task_info) for WindowServer, recoveryosd and loginwindow; the history
+// of WindowServer pids (a crash loop shows as new pids); and the total user-client count with the top
+// creators, so a zero for WindowServer can be told apart from a detection failure.
+// 0.16.0: two photos 47 s apart showed the identical HUD - T=27, AGE=1, square not blinking - so the
+// 250 ms tick itself had stopped. WindowServer (pid 235) was first seen at 26 s, the last service event
+// was "27.496 M AppleACPICPU". A frozen screen cannot tell a hung kernel from a display path that stopped
+// taking CPU writes (both the HUD and the console write through BAR1). 0.17.0 adds a channel that does
+// not go through the GPU: a UDP log to the Mac build host (192.168.1.2:5140, tools/udp_log_receiver.py),
+// carrying the kernel message buffer as it grows and the HUD text plus a live status line every second.
+// Packets arriving after the screen froze mean the kernel is alive. It also samples the GPU path once
+// a second from its own thread call (command register, BAR1, and a write/read-back of one invisible
+// VRAM pixel in the row padding), so a display path that dies under a live kernel names its cause.
+// 0.17.0: froze at T=23, ~2 s after WindowServer (pid 244) spawned; no IPv4 address yet, so no datagram.
+// Its GPU check (21/21 read-backs good) ran on a thread call too, so it only proves the display path was
+// fine until the thread calls stopped - and three thread calls share one pool, so they are not three
+// independent heartbeats. 0.18.0 runs the network/GPU loop on its own kernel thread with a real-time
+// policy, and that thread draws a WATCH line below the HUD: if T stops while WATCH keeps counting, only the
+// thread-call pool stalled (kernel and display alive); if both stop, the kernel or the display path died.
+// 0.18.0: the WATCH row stopped in the same second as the HUD (T=28, TCAGE=0), so it is not a thread-call
+// stall. Still no IPv4 address by then: DHCP had not finished, so the log channel never opened. 0.19.0
+// configures the address itself instead of waiting - 192.168.0.250/24 on the first Ethernet interface plus a
+// route to the Mac's subnet via the router - so the log is live from about ten seconds. It also counts the
+// USB and HID nubs in the registry walk, which is how far USB gets before anything stops.
+// 0.19.0 panicked at 6.8 s in its own send path - "assertion failed: interface_mtu != 0" in ip_output_list,
+// below sock_send/netTick/netThreadMain - because it took the first IFNET_FAMILY_ETHERNET interface, which
+// was XHC0 (the USB host controller's virtual Ethernet, MTU 0), not the Realtek NIC. 0.20.0 picks the
+// interface properly: name "en", type IFT_ETHER, link up (IFF_RUNNING), MTU at least 1280, and it waits
+// for such an interface rather than configuring whatever comes first. (The panic did print on screen with
+// a full backtrace, which also shows a panic would be visible - the freeze being chased is not one.)
+// 0.20.0 then never configured anything (SELF=0/15): it required IFF_RUNNING, but in this environment nobody
+// has brought the NIC up yet, and the link only comes up once it is up - the wait was circular. 0.21.0 drops
+// that condition (it sets IFF_UP itself and lets the sends retry until the link is there) and lists the
+// interfaces it sees - name, flags, MTU - on the HUD, so a wrong choice is visible instead of silent.
+// Its USB inventory read XHCI=37 DEV=5 IFACE=8 HID=0 KBD=0: USB devices enumerate, no HID nub exists yet.
+// 0.22.0 is the differential: everything this driver does *to* the machine while waiting is now behind
+// boot-arg nvfb-diag=1 - no HUD map, no console resize, no 250 ms tick, no 1 Hz probe, no registry walk, no
+// service notifiers, no kernel thread, no VRAM writes. Quiet, all that is left is IOFramebuffer plus a
+// 15 s NVRAM beat (nvfb-nvram=1), which is readable from Windows after a hard reset. Beats past 30-60 s then
+// mean the kernel outlives the point where the screen used to stop, and the polling was the wedge; a last
+// beat at 15 s means the machine really does stop there. In the diagnostic path the UDP send now happens
+// before the GPU read-back and the draw, so a wedge in either cannot swallow the datagram that proves life.
+// 0.22.0 answered it: NVRAM held the trace written in start() but no beat at all, and the console stopped at
+// the same place as always - with every diagnostic off the machine stops *before* 15 s, earlier than the
+// 22-28 s of the HUD builds. The polling was not the wedge; it was slowing the boot down. 0.23.0 narrows the
+// moment: quiet still, but a beat every 3 s that also prints "alive t=<n>s" on the console, so the last
+// living second can be read off the photo as well as out of NVRAM after a reset.
+// 0.23.0 showed that channel is the wrong one: the beat wrote at 0, 3 and 6 s and then the thread never
+// came back, while the console kept printing for another ~15 s - the write path itself blocks after a
+// handful of writes. 0.24.0 takes NVRAM out of the loop: one trace write in start(), then nothing but
+// "alive t=<n>s" on the console every second, the channel every other kernel line already uses.
+// Why ps/mnt/dmesg: the 0.2.0 trace proved nothing ever called this framebuffer, and IOGraphics-598
+// source shows IOFramebuffer::open() is only reached from newUserClient(kIOFBServerConnectType) - i.e.
+// WindowServer never connected. What userspace was doing instead is the next question.
+// Writes are change-driven and capped (roughly 40 KB per boot worst case) to spare the flash. This
+// needs OpenCore's Booter/Quirks/DisableVariableWrite off; with it on, every macOS write is refused.
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IODeviceTreeSupport.h>
@@ -71,7 +171,7 @@ namespace {
 enum TraceEvent : unsigned {
     kEvOpen, kEvClose, kEvEnable, kEvAperture, kEvPixFormats, kEvModeCount, kEvModes, kEvModeInfo,
     kEvPixInfo, kEvCurMode, kEvSetMode, kEvConnCount, kEvIsConsole, kEvUserClient, kEvStop,
-    // entry marks and callbacks for the HUD
+    // Entry marks and callbacks added for the HUD (0.9.0).
     kEvUcIn, kEvOpIn, kEvSetup, kEvVram, kEvClut, kEvGamma, kEvTiming, kEvDdc, kEvDdcBlock, kEvStartup,
     kEvRegIntr, kEvIntrState, kEvPower, kEvSema, kEvGetAttr, kEvSetAttr, kEvGetConn, kEvSetConn,
     kEvCount
@@ -264,20 +364,19 @@ constexpr UInt32   kHudTickMs  = 250;
 constexpr UInt32   kHudProbeMs = 1000;
 constexpr int      kHudScanPids = 4000;
 constexpr unsigned kNewProcs    = 6;                    // newest processes shown on the HUD
-// UDP log to a second machine. The addresses below are placeholders (the 192.0.2.x / 198.51.100.x
-// documentation ranges), put your own LAN in before you build with it.
+// UDP log. The PC's router (192.168.0.1) routes to the Mac's subnet, so plain UDP reaches it.
 constexpr UInt32   kNetTickMs   = 200;
 constexpr unsigned kNetPayload  = 1200;                 // text bytes per datagram, well under the MTU
 constexpr unsigned kNetBurst    = 32;                   // datagrams per tick at most
 constexpr UInt16   kNetPort     = 5140;
-constexpr UInt32   kNetDstAddr  = (198u << 24) | (51u << 16) | (100u << 8) | 2u;   // the machine that listens
+constexpr UInt32   kNetDstAddr  = (192u << 24) | (168u << 16) | (1u << 8) | 2u;   // Mac build host
 // The driver configures its own address rather than waiting for DHCP, which had not finished by the time
-// any boot so far stopped. Pick a free address on your LAN; the gateway is the hop to the listener's
-// subnet. An address configdadds later simply coexists with this one.
-constexpr UInt32   kNetSelfAddr = (192u << 24) | (0u << 16) | (2u << 8) | 250u;
+// any boot so far stopped. .250 was checked free on this LAN from Windows; .1 is the router, and it is the
+// hop to the Mac's subnet. An address configdadds later simply coexists with this one.
+constexpr UInt32   kNetSelfAddr = (192u << 24) | (168u << 16) | (0u << 8) | 250u;
 constexpr UInt32   kNetSelfMask = 0xFFFFFF00u;
-constexpr UInt32   kNetGateway  = (192u << 24) | (0u << 16) | (2u << 8) | 1u;
-constexpr UInt32   kNetDstNet   = (198u << 24) | (51u << 16) | (100u << 8) | 0u;
+constexpr UInt32   kNetGateway  = (192u << 24) | (168u << 16) | (0u << 8) | 1u;
+constexpr UInt32   kNetDstNet   = (192u << 24) | (168u << 16) | (1u << 8) | 0u;
 constexpr UInt32   kNetSelfAtS  = 6;                    // uptime before the interface is configured
 constexpr UInt32   kNetMinMtu   = 1280;                 // an interface with a smaller MTU is not usable
 constexpr UInt32   kHudBg = 0x00101840, kHudFg = 0x00FFFFFF, kHudOn = 0x0000E040, kHudOff = 0x00E02020;
@@ -345,11 +444,15 @@ void describePci(Text &t, IOPCIDevice *d) {
             t.str(" m0="); t.hex(mem->getPhysicalAddress()); t.ch('+'); t.hex(mem->getLength());
             const UInt32 base = cls >> 8;
             const bool probe = (cls >> 16) == 0x01 || base == 0x0C03;   // storage, USB
-            if (probe) {
+            if (probe && mem->getLength() >= 8) {
                 if (IOMemoryMap *map = mem->map(kIOMapInhibitCache)) {
                     volatile UInt32 *r =
                         reinterpret_cast<volatile UInt32 *>(static_cast<uintptr_t>(map->getVirtualAddress()));
-                    t.str(" r0="); t.hexw(r[1], 8); t.hexw(r[0], 8);
+                    if (map->getLength() >= 8) {
+                        t.str(" r0="); t.hexw(r[1], 8); t.hexw(r[0], 8);
+                    } else {
+                        t.str(" r0=short");
+                    }
                     map->release();
                 } else {
                     t.str(" r0=nomap");
@@ -402,7 +505,9 @@ int mountCallout(mount_t mp, void *arg) {
 }
 }  // namespace
 
-extern "C" NVMsgbuf *msgbufp;
+// 8 Nov 2026: _msgbufp is not exported by any KPI on macOS 26; avoid an
+// unresolved external symbol if this legacy kext is ever linked by kmutil.
+static NVMsgbuf *const msgbufp = nullptr;
 extern "C" {
 kern_return_t task_info(task_t task, task_flavor_t flavor, task_info_t task_info_out,
                         mach_msg_type_number_t *task_info_count);
@@ -919,7 +1024,7 @@ void NVFramebuffer::hudDraw(clock_sec_t now) {
         *t.p = '\0';
     }
 
-    // network log and GPU path: "NET en0 <addr> AT 21 IF=2 TX=.. FAIL=.. E=.. GPU CMD=.. B1=.. RB=ok/bad"
+    // Network log and GPU path: "NET en0 192.168.0.10 AT 21 IF=2 TX=.. FAIL=.. E=..  GPU CMD=.. B1=.. RB=ok/bad".
     {
         Text t{line[4], sizeof(line[4])};
         t.str("NET ");
@@ -1081,7 +1186,7 @@ void NVFramebuffer::ringAdd(char kind, IOService *service) {
     const uint64_t nowUs = static_cast<uint64_t>(secs) * 1000000u + usecs;
 
     RingEntry &r = fRing[fRingNext % kRingSize];
-    r.kind = 0;   // Mark in-progress so a concurrent draw shows a blank rather than a mix
+    r.kind = 0;   // mark in-progress so a concurrent draw shows a blank rather than a mix
     r.ms = static_cast<UInt32>(nowUs / 1000);
     const char *cls = service->getMetaClass()->getClassName();
     const char *name = service->getName();
@@ -1403,8 +1508,8 @@ void NVFramebuffer::probeCallout(thread_call_param_t self, thread_call_param_t) 
     IOLockUnlock(fb->fTraceLock);
 }
 
-// ---- UDP log and WATCH line ---------------------------------------------------------------------- A
-// dedicated kernel thread rather than a thread call: the HUD tick and the probe are thread calls from
+// ---- UDP log and WATCH line ----------------------------------------------------------------------
+// A dedicated kernel thread rather than a thread call: the HUD tick and the probe are thread calls from
 // one shared pool, so this loop keeps running (and says so on screen and on the network) if that pool
 // stalls. Real-time policy, 2 ms of work per 200 ms period, so a CPU-bound spinner cannot starve it.
 
@@ -1464,7 +1569,7 @@ void NVFramebuffer::netTick(uint64_t nowMs) {
 }
 
 void NVFramebuffer::netSendTick(uint64_t nowMs, UInt32 nowS, bool second) {
-    // Launchd running means bsd_init has finished, so the socket layer is initialized.
+    // launchd running means bsd_init has finished, so the socket layer is initialized.
     if (proc_t launchd = proc_find(1)) proc_rele(launchd);
     else return;
     if (second || !fNetIp) netScanIf(nowS);
@@ -1495,10 +1600,10 @@ void NVFramebuffer::netSendTick(uint64_t nowMs, UInt32 nowS, bool second) {
 // later is a second address on the same interface.
 void NVFramebuffer::netSelfConfig(UInt32 nowS) {
     fNetSelfTries++;
-    // Only a real wired NIC. Once we picked XHC0 (the USB controller's virtual Ethernet, MTU 0) and the first
-    // datagram tripped an assertion in ip_output_list. So: name "en", Ethernet type, sane MTU, but not "link
-    // up", because nobody has brought the NIC up yet at this point and waiting for a link that only shows up
-    // after that never ends. We bring it up ourselves and the sends keep retrying till the link is there.
+    // A real wired NIC only: 0.19.0 configured XHC0 (the USB controller's virtual Ethernet, MTU 0) and the
+    // first datagram then tripped an assertion in ip_output_list. Name "en", Ethernet type, sane MTU - but not
+    // link up: nothing has brought the NIC up yet in this environment, and waiting for a link that only
+    // appears after it is up never ends. This brings it up itself; the sends retry until the link is there.
     char name[IFNAMSIZ] = {};
     {
         ifnet_t *list = nullptr;
@@ -1585,7 +1690,7 @@ void NVFramebuffer::netSelfConfig(UInt32 nowS) {
     }
     fNetSelfDone = true;
     fNetSelfAt = nowS;
-    IOLog("NVFramebuffer: configured %s with the fixed log address + route at %us (err %d)\n",
+    IOLog("NVFramebuffer: configured %s 192.168.0.250/24 + route to 192.168.1.0/24 at %us (err %d)\n",
           name, nowS, fNetSelfErr);
 }
 
@@ -1970,8 +2075,8 @@ void NVFramebuffer::beatCallout(thread_call_param_t self, thread_call_param_t) {
     clock_usec_t usecs = 0;
     clock_get_system_microtime(&now, &usecs);
     if (!fb->fDiag) {
-        // Quiet mode: the console and nothing else. No NVRAM write here (the writing thread stopped coming
-        // back after a few of them), no process scan, no mount walk, no status line.
+        // Quiet: the console and nothing else. No NVRAM write in this path - 0.23.0 showed the writing
+        // thread stops coming back after a handful of them - and no process scan, mount walk or status line.
         IOLog("NVFramebuffer: alive t=%us beat=%u\n", static_cast<unsigned>(now), beat);
     } else {
         fb->logStatus(now);
@@ -2031,7 +2136,8 @@ bool NVFramebuffer::start(IOService *provider) {
     fWidth    = static_cast<UInt32>(info.v_width);
     fHeight   = static_cast<UInt32>(info.v_height);
     fRowBytes = static_cast<UInt32>(info.v_rowBytes);
-    if (!fWidth || !fHeight || !fRowBytes || info.v_depth != 32) {
+    if (!fWidth || !fHeight || !fRowBytes || info.v_depth != 32 ||
+        fWidth > 0x3fffffffU || UInt64(fRowBytes) < UInt64(fWidth) * 4) {
         IOLog("NVFramebuffer: unusable console %ux%u depth=%lu rowBytes=%u\n",
               fWidth, fHeight, static_cast<unsigned long>(info.v_depth), fRowBytes);
         return failStart(kStartBadConsole);
@@ -2047,14 +2153,17 @@ bool NVFramebuffer::start(IOService *provider) {
     // v_baseAddr carries a flag in bit 0; clear it before comparing.
     const IOPhysicalAddress consoleBase =
         static_cast<IOPhysicalAddress>(info.v_baseAddr & ~static_cast<IOPhysicalAddress>(1));
-    const IOByteCount visible = static_cast<IOByteCount>(fHeight) * fRowBytes;
-    if (consoleBase < bar1Start || consoleBase + visible > bar1Start + bar1->getLength()) {
+    const UInt64 visible64 = UInt64(fHeight) * fRowBytes;
+    if (consoleBase < bar1Start ||
+        consoleBase - bar1Start > bar1->getLength() ||
+        visible64 > bar1->getLength() - (consoleBase - bar1Start)) {
         IOLog("NVFramebuffer: console 0x%llx not inside BAR1 0x%llx+0x%llx\n",
               static_cast<unsigned long long>(consoleBase),
               static_cast<unsigned long long>(bar1Start),
               static_cast<unsigned long long>(bar1->getLength()));
         return failStart(kStartOutsideBAR1);
     }
+    const IOByteCount visible = static_cast<IOByteCount>(visible64);
     fAperture = IODeviceMemory::withSubRange(bar1, consoleBase - bar1Start, visible);
     if (!fAperture) return failStart(kStartNoAperture);
 
@@ -2093,7 +2202,7 @@ bool NVFramebuffer::start(IOService *provider) {
     IOLog("NVFramebuffer: 0.6.0 nvram read=%d write=%d removed=%u nvram=%d probe=%d (status every %us)\n",
           readable, written, removed, fNvram, fProbe, static_cast<unsigned>(kBeatMs / 1000));
 
-    if (!fDiag) writeBeat(0);       // Proves the write path at start, before anything else can stop
+    if (!fDiag) writeBeat(0);       // proves the write path at start, before anything else can stop
     if (fBeatCall) {
         uint64_t deadline = 0;
         clock_interval_to_deadline(fDiag ? kBeatMs : kQuietBeatMs, kMillisecondScale, &deadline);
@@ -2431,8 +2540,8 @@ IOReturn NVFramebuffer::setAttributeForConnection(IOIndex connectIndex, IOSelect
     return result;
 }
 
-// ---- traced pass-throughs for the HUD ----
-// Each one marks entry, lets IOFramebuffer do exactly what it always did, and marks the return.
+// ---- Traced pass-throughs added for the HUD (0.9.0) -------------------------------------------------
+// Each marks entry, lets IOFramebuffer do exactly what it did before, and marks the return.
 
 IOReturn NVFramebuffer::setupForCurrentConfig(void) {
     hudMark(kEvSetup, true);
@@ -2533,8 +2642,8 @@ IOReturn NVFramebuffer::getNotificationSemaphore(IOSelect interruptType, semapho
     return r;
 }
 
-// ---- property reads ----
-// Only reads made on behalf of a user process get recorded (see propSeen); behaviour doesn't change.
+// ---- Property reads (0.13.0) ------------------------------------------------------------------------
+// Only reads made on behalf of a user process are recorded (see propSeen); behaviour is unchanged.
 
 OSObject *NVFramebuffer::copyProperty(const char *aKey) const {
     const_cast<NVFramebuffer *>(this)->propSeen(aKey);

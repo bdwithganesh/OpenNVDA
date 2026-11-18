@@ -19,9 +19,11 @@ public:
     // Allocate outside an interrupt or gated workloop. A contiguous buffer is
     // required for WPR metadata, signature, bootloader and radix table root.
     // The large firmware image should use scattered pages instead.
-    bool allocate(size_t size, bool contiguous, IOMapper *mapper = nullptr) {
+    bool allocate(size_t size, bool contiguous, IOMapper *mapper = nullptr,
+                  uint32_t commandAlignment = 4096) {
         lastError_ = 0;
-        if (memory_ || !size || size > UINT32_MAX || (size & 4095)) {
+        if (memory_ || !size || size > UINT32_MAX || (size & 4095) ||
+            (commandAlignment!=1 && commandAlignment!=4096)) {
             lastError_ = 1;
             return false;
         }
@@ -39,7 +41,7 @@ public:
 
         command_ = IODMACommand::withSpecification(
             kIODMACommandOutputHost64, 48, 0, IODMACommand::kMapped,
-            0, 4096, mapper);
+            0, commandAlignment, mapper);
         if (!command_) { lastError_ = 4; release(); return false; }
         if (command_->setMemoryDescriptor(memory_) != kIOReturnSuccess) {
             lastError_ = 5; release(); return false;
@@ -65,6 +67,26 @@ public:
                command_->synchronize(kIODirectionOut) == kIOReturnSuccess;
     }
 
+    // Access the actual prepared DMA command buffer, including bounce pages.
+    // Never synchronize the whole descriptor while the device owns adjacent
+    // queue fields: an Out copy could overwrite a concurrently published PUT.
+    bool readDeviceRange(size_t offset, void *data, size_t length) const {
+        if (!command_ || !data || !length || offset > size_ || length > size_-offset)
+            return false;
+        __sync_synchronize();
+        const bool ok=command_->readBytes(offset,data,length)==length;
+        __sync_synchronize();
+        return ok;
+    }
+    bool writeDeviceRange(size_t offset, const void *data, size_t length) {
+        if (!command_ || !data || !length || offset > size_ || length > size_-offset)
+            return false;
+        __sync_synchronize();
+        const bool ok=command_->writeBytes(offset,data,length)==length;
+        __sync_synchronize();
+        return ok;
+    }
+
     uint64_t busAddress() const { return contiguous_ ? baseBusAddress_ : 0; }
     bool busPage(size_t index, uint64_t *address) const {
         if (!address || index >= size_ / 4096) return false;
@@ -73,6 +95,7 @@ public:
         return *address != 0;
     }
     size_t size() const { return size_; }
+    IOBufferMemoryDescriptor *descriptor() const { return memory_; }
     uint32_t lastError() const { return lastError_; }
     void *bytes() const { return memory_ ? memory_->getBytesNoCopy() : nullptr; }
     bool syncToDevice() const {

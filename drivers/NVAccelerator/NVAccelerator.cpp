@@ -94,31 +94,107 @@ public:
     // children only; NVDisplay sits under NVGspControl, so hand it over
     bool start(IOPCIDevice *pci) override;
     bool started_ = false;
-    void attachNVDisplay();
+    unsigned attachNVDisplay();
+    void activatePipe(unsigned idx, IOFramebuffer *fb);
+    // 0.5.34: NVDisplay 1.3.0 does not publish the display until an
+    // IOAccelerator is registered, so keep looking for it here.
+    thread_call_t fbRetry_ = nullptr;
+    unsigned fbTries_ = 0;
+    bool fbDone_ = false;
+    static void fbRetryCallout(thread_call_param_t p, thread_call_param_t);
+    void scheduleFbRetry();
 };
 OSDefineMetaClassAndStructors(NVAccelDisplayMachine, IOAccelDisplayMachine)
 
 bool NVAccelDisplayMachine::start(IOPCIDevice *pci) {
     NVALOG("display machine: start");
-    if (!IOAccelDisplayMachine::start(pci)) return false;
+    // 0.5.23: the family did not call this (its start only iterates PCI
+    // children for framebuffers and NVDisplay is not a child), so the machine
+    // was left un-started and the family's user client reported no display
+    // pipes ("System set to use IOP but no display pipes are present",
+    // WindowServer). Call the family's start ourselves, then add NVDisplay.
+    const bool base = IOAccelDisplayMachine::start(pci);
+    NVALOG("display machine: base start %s", base ? "true" : "false");
+    if (!attachNVDisplay()) scheduleFbRetry();     // 0.5.34: display may come later
     started_ = true;
-    attachNVDisplay();
     return true;
 }
 
-void NVAccelDisplayMachine::attachNVDisplay() {
+void NVAccelDisplayMachine::scheduleFbRetry() {
+    if (fbDone_ || fbTries_ >= 90) return;
+    if (!fbRetry_) fbRetry_ = thread_call_allocate(&NVAccelDisplayMachine::fbRetryCallout, this);
+    if (!fbRetry_) return;
+    UInt64 deadline = 0;
+    clock_interval_to_deadline(2, kSecondScale, &deadline);
+    thread_call_enter_delayed(fbRetry_, deadline);
+}
+
+void NVAccelDisplayMachine::fbRetryCallout(thread_call_param_t p, thread_call_param_t) {
+    NVAccelDisplayMachine *m = static_cast<NVAccelDisplayMachine *>(p);
+    if (!m) return;
+    if (m->attachNVDisplay()) {
+        NVALOG("display machine: framebuffer arrived after %u tries", m->fbTries_);
+        m->fbDone_ = true;
+        return;
+    }
+    ++m->fbTries_;
+    if (m->fbTries_ >= 90) NVALOG("display machine: no framebuffer after %u tries, giving up", m->fbTries_);
+    else m->scheduleFbRetry();
+}
+
+// 0.5.27: the framebuffers this GPU composites for, NVDisplay first (pipe 0,
+// AGDC framebuffer 0), then every other IOFramebuffer (the Hyper-V synthetic
+// display). With the accelerator up, WindowServer gives each display that has
+// a display pipe the Metal compositor and the rest the software one; mixing
+// them aborted every WindowServer started after the accelerator (flattened
+// window surfaces made by CompositorMetal reached CompositorSW's SWContext,
+// which never tracks them: push_surface "found != slist->end ()").
+// Returns the count; each entry is retained. Empty without NVDisplay.
+static unsigned nvCopyFramebuffers(IOFramebuffer **out, unsigned max) {
+    unsigned n = 0;
     OSDictionary *match = IOService::serviceMatching("NVDisplay");
-    IOService *svc = match ? IOService::copyMatchingService(match) : nullptr;
+    IOFramebuffer *nv = OSDynamicCast(IOFramebuffer, match ? IOService::copyMatchingService(match) : nullptr);
     OSSafeReleaseNULL(match);
-    IOFramebuffer *fb = OSDynamicCast(IOFramebuffer, svc);
-    const bool ok = fb && ((uintptr_t)found_framebuffer(fb) & 0xff);   // returns bool
-    NVALOG("display machine: NVDisplay %p, found_framebuffer %s", fb, ok ? "true" : "false");
+    if (!nv || !max) { OSSafeReleaseNULL(nv); return 0; }
+    out[n++] = nv;
+    match = IOService::serviceMatching("IOFramebuffer");
+    OSIterator *it = match ? IOService::getMatchingServices(match) : nullptr;
+    OSSafeReleaseNULL(match);
+    while (OSObject *o = it ? it->getNextObject() : nullptr) {
+        IOFramebuffer *fb = OSDynamicCast(IOFramebuffer, o);
+        if (!fb || fb == nv || fb->metaCast("NVDisplay") || n >= max) continue;
+        fb->retain();
+        out[n++] = fb;
+    }
+    OSSafeReleaseNULL(it);
+    return n;
+}
+
+unsigned NVAccelDisplayMachine::attachNVDisplay() {
+    if (fbDone_) return 1;
+    IOFramebuffer *fbs[2] = {};
+    const unsigned nfb = nvCopyFramebuffers(fbs, 2);
+    for (unsigned i = 0; i < nfb; ++i) {
+        const bool ok = (uintptr_t)found_framebuffer(fbs[i]) & 0xff;   // returns bool
+        NVALOG("display machine: framebuffer %u %s %p, found_framebuffer %s", i, fbs[i]->getMetaClass()->getClassName(),
+               fbs[i], ok ? "true" : "false");
+    }
+    // 0.5.26: without a framebuffer driver the pipe still exists and the mode
+    // query below dereferenced fb (panic at attachNVDisplay+0x154)
+    if (!nfb) return 0;
     // 0.2.4: the pipe comes after the framebuffer went online, so it never saw
     // that notification: tell it, then check what WindowServer will see
     const unsigned count = ioaf2DmFramebufferCount(this);
-    IOAccelDisplayPipe *pipe = count ? ioaf2DmDisplayPipe(this, 0) : nullptr;
+    for (unsigned i = 0; i < count && i < nfb; ++i) activatePipe(i, fbs[i]);
+    for (unsigned i = 0; i < nfb; ++i) OSSafeReleaseNULL(fbs[i]);
+    fbDone_ = true;
+    return nfb;
+}
+
+void NVAccelDisplayMachine::activatePipe(unsigned idx, IOFramebuffer *fb) {
+    IOAccelDisplayPipe *pipe = ioaf2DmDisplayPipe(this, idx);
     bool active = pipe && (((uintptr_t)ioaf2PipeIsActive(pipe)) & 0xff);
-    NVALOG("display machine: %u framebuffer(s), pipe 0 %p, active %d", count, pipe, active);
+    NVALOG("display machine: pipe %u %p, active %d", idx, pipe, active);
     if (pipe && !active) {
         // displayModeDidChange registers the framebuffer's VBL interrupt and
         // runs init_framebuffer_resource, which marks the pipe active; the
@@ -141,7 +217,6 @@ void NVAccelDisplayMachine::attachNVDisplay() {
             NVALOG("display machine: init_framebuffer_resource %d, active %d", r, active);
         }
     }
-    OSSafeReleaseNULL(svc);
 }
 
 // ---------------------------------------------------------------- display pipe
@@ -174,11 +249,33 @@ extern void ioaf2SignalTxnInterrupt(IOAccelDisplayPipe *p, void *ref)
 extern void *ioaf2SysMemWithMD(IOGraphicsAccelerator2 *a, IOAccelResource2 *r, IOMemoryDescriptor *md)
     __asm("__ZN16IOAccelSysMemory20withMemoryDescriptorEP22IOGraphicsAccelerator2P16IOAccelResource2P18IOMemoryDescriptor");
 
+// 0.5.37: a transaction's colour state (IOAcceleratorFamily2, KDK 26.7.2
+// set_pipe_postgamma_table and friends): +0x38 points at the tables (+0
+// pre-gamma, +8 post-gamma, +0x40 + 0x70 * plane plane gamma), each an
+// IOAccelDisplayPipeGammaTable2 (+0x10 data, +0x18 size); +0x48 holds the
+// dirty bits (0x4 << plane plane gamma, 0x20 pre, 0x80 post, 0x400 post-CSC
+// VID). Table data: {u32 count, 12 bytes, count x {float r, g, b, pad}}.
+static constexpr unsigned kTxnColor = 0x38, kTxnDirty = 0x48;
+static constexpr UInt64 kDirtyPostGamma = 0x80, kDirtyColorOther = 0x4 | 0x8 | 0x20 | 0x400;
+static constexpr UInt32 kGamma = 1024;   // entries CoreDisplay sends and the OLUT takes
+
+// [0, 1] float bits -> UNORM16 with integer maths (kernel code keeps off the FPU)
+static UInt16 unorm16(UInt32 f) {
+    const UInt32 e = (f >> 23) & 0xff;
+    if (f & 0x80000000u) return 0;
+    if (e >= 127) return 0xffff;
+    const UInt32 sh = 150 - e;                    // value = mantissa * 2^-sh
+    if (sh >= 48) return 0;
+    const UInt64 m = (f & 0x7fffffu) | 0x800000u;
+    return static_cast<UInt16>((m * 65535u + (1ULL << (sh - 1))) >> sh);
+}
+
 class NVAccelDisplayPipe : public IOAccelDisplayPipe {
     OSDeclareDefaultStructors(NVAccelDisplayPipe)
     IOFramebuffer *fb_ = nullptr;
     IOGraphicsAccelerator2 *accel_ = nullptr;   // not retained (it owns us)
     IOBufferMemoryDescriptor *fbMem_ = nullptr;   // 0.2.9: sysmem framebuffer resource backing
+    IOMemoryDescriptor *fbScan_ = nullptr;        // 0.5.33: the live aperture as the FB resource
     IOMemoryMap *map_ = nullptr;
     UInt32 fbRowBytes_ = 0, fbHeight_ = 0, fbWidthBytes_ = 0;
     UInt64 copies_ = 0, empty_ = 0, lastFormat_ = 0;
@@ -192,9 +289,25 @@ class NVAccelDisplayPipe : public IOAccelDisplayPipe {
     // "nvgsp-flip-copy"); the CPU copy stays as the fallback. NVRAM
     // nvaccel-ceflip=0 keeps the CPU copy.
     UInt64 apBus_ = 0;
+    // 0.5.30: the native615 display pipeline scans out from a VRAM surface;
+    // NVGspControl publishes it ("NVGspControl-display615-scanout-phys") and
+    // repairs the flip into it instead of into the framebuffer aperture (the
+    // CPU copy into VRAM was 3.3 s for 4K, the copy engine takes ~8 ms).
+    UInt64 scanoutBus_ = 0;
     IOService *gsp_ = nullptr;
     int ceFlip_ = -1;
+    // 0.5.27: a framebuffer that is not NVDisplay (Hyper-V synthetic video):
+    // its aperture is not reachable by our copy engine, CPU copy only
+    bool foreign_ = false;
+    // 0.5.37: with the GPU colour pass gone, CoreDisplay's colour arrives as
+    // the transaction's pipe post-gamma table; the head OLUT applies it
+    void applyPostGamma(IOAccelDisplayPipeTransaction2 *t);
+    UInt16 *gamma_ = nullptr;          // 3 x kGamma (R, G, B planes), the nvgsp-gamma-set layout
+    UInt64 gammaHash_ = 0, gammaSets_ = 0, gammaFails_ = 0, colorOther_ = 0;
+    IOReturn gammaLast_ = 0;
     UInt64 ceFlips_ = 0, ceFails_ = 0;
+    UInt64 ceRetryAt_ = 0;   // 0.5.20: after a boot-time burst of failures, retry CE later
+    IOReturn ceLastErr_ = 0;
     // 0.5.1: vsync. The CPU copy went into the live scan-out buffer at any
     // point of the frame, so the beam showed half old, half new (glitches,
     // tearing). Now the copy starts right after a vblank: 1.5 ms for a 4K
@@ -231,6 +344,23 @@ class NVAccelDisplayPipe : public IOAccelDisplayPipe {
     IOAccelDisplayPipeTransaction2 *volatile pendingTxn_ = nullptr;   // queued, not copied yet
     IOAccelDisplayPipeTransaction2 *volatile copyingTxn_ = nullptr;   // being copied now
     UInt64 asyncFlips_ = 0, skippedFlips_ = 0;
+    // 0.5.19: frame-pacing diagnostics. Every copy is one presented frame:
+    // record the submit->copy latency and the copy-to-copy interval in a
+    // 256-entry ring, plus aggregates, and publish them on the accelerator
+    // so userspace can measure compositor smoothness without kernel logs.
+    UInt64 stSubmits_ = 0, stCopies_ = 0, stNoCopy_ = 0;
+    UInt64 stLastSubmit_ = 0, stLastCopy_ = 0, stSubmitAt_ = 0;
+    UInt64 stSumSubmitGap_ = 0, stMaxSubmitGap_ = 0, stSubmitGaps_ = 0;
+    UInt64 stSumCopyGap_ = 0, stMaxCopyGap_ = 0, stCopyGaps_ = 0;
+    UInt64 stLate20_ = 0, stLate33_ = 0;
+    UInt64 stSumLat_ = 0, stMaxLat_ = 0, stLatCount_ = 0;
+    UInt32 stRingHead_ = 0;
+    UInt32 stIntervalRing_[256] = {};
+    UInt32 stLatencyRing_[256] = {};
+    void statsReset();
+    void statsSubmit();
+    void statsCopy();
+    void statsPublish();
     static void flipCallout(thread_call_param_t self, thread_call_param_t);
     UInt64 renderWaits_ = 0;
     // 0.5.13: the last frame on screen, put back after a GPU reset wiped the
@@ -313,6 +443,7 @@ bool NVAccelDisplayPipe::init(IOGraphicsAccelerator2 *a, IOAccelDisplayMachine *
     if (!IOAccelDisplayPipe::init(a, m, fb, idx)) { NVALOG("IOAccelDisplayPipe::init failed"); return false; }
     fb_ = fb;
     if (fb_) fb_->retain();
+    foreign_ = !(fb_ && fb_->metaCast("NVDisplay"));
     accel_ = a;
     return true;
 }
@@ -322,19 +453,45 @@ void *NVAccelDisplayPipe::initFramebufferResource(unsigned int idx, IOAccelResou
     // IOAccelSysMemory never prepared: "failed to wire down system map");
     // submitTransaction copies whatever is flipped into the aperture
     OSSafeReleaseNULL(fbMem_);
+    OSSafeReleaseNULL(fbScan_);
     IODeviceMemory *ap = fb_ ? fb_->getApertureRange(kIOFBSystemAperture) : nullptr;
     const IOByteCount len = ap ? ap->getLength() : 0;
+    if (!len) { OSSafeReleaseNULL(ap); return nullptr; }
+    // 0.5.33: the family hands this resource to whoever composites the display
+    // without a GPU (SkyLight's Software compositor writes the frame straight
+    // into the "framebuffer resource"). Wrapping a private buffer therefore
+    // threw the software-composited desktop away: the screen stayed black with
+    // a strip of stale VRAM under it, while the display tick kept copying a
+    // black aperture. When the aperture IS WindowServer's system-memory
+    // framebuffer (the native615 case), wrap the aperture itself, so a
+    // software-composited frame lands in the memory the tick presents.
+    UInt64 fbPhys = 0;
+    if (IOService *g = gspService()) {
+        OSObject *o = g->copyProperty("NVGspControl-display615-fb-phys");
+        if (OSNumber *n = OSDynamicCast(OSNumber, o)) fbPhys = n->unsigned64BitValue();
+        OSSafeReleaseNULL(o);
+    }
+    const bool liveAperture = fbPhys && ap->getPhysicalAddress() == fbPhys;
+    IOMemoryDescriptor *md = nullptr;
+    if (liveAperture) {
+        ap->retain();
+        fbScan_ = ap;                      // the live scan-out aperture
+        md = fbScan_;
+    } else {
+        fbMem_ = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared, len, PAGE_SIZE);
+        if (fbMem_) bzero(fbMem_->getBytesNoCopy(), len);
+        md = fbMem_;
+    }
     OSSafeReleaseNULL(ap);
-    if (len) fbMem_ = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared, len, PAGE_SIZE);
-    if (fbMem_) bzero(fbMem_->getBytesNoCopy(), len);
-    void *mem = fbMem_ && accel_ ? ioaf2SysMemWithMD(accel_, res, fbMem_) : nullptr;
-    NVALOG("display pipe: framebuffer resource %u -> memory %s (%llu bytes)", idx, mem ? "ok" : "FAILED",
-           fbMem_ ? (unsigned long long)fbMem_->getLength() : 0ULL);
+    void *mem = md && accel_ ? ioaf2SysMemWithMD(accel_, res, md) : nullptr;
+    NVALOG("display pipe: framebuffer resource %u -> memory %s (%llu bytes, %s)", idx, mem ? "ok" : "FAILED",
+           static_cast<unsigned long long>(len), liveAperture ? "live aperture" : "private buffer");
     return mem;
 }
 
 void *NVAccelDisplayPipe::destroyFramebufferResource(unsigned int, IOAccelResource2 *) {
     OSSafeReleaseNULL(fbMem_);
+    OSSafeReleaseNULL(fbScan_);
     return nullptr;
 }
 
@@ -350,7 +507,11 @@ IOMemoryMap *NVAccelDisplayPipe::surfaceMap(IOMemoryDescriptor *md) {
         OSSafeReleaseNULL(slot->md);
     }
     if (md->prepare(kIODirectionOut) != kIOReturnSuccess) return nullptr;
-    IOMemoryMap *m = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly);
+    // 0.5.29: cached. CoreDisplay's swap-chain surfaces are write-combined, and
+    // the default (the surface's own) cache mode made the CPU read of a 4K
+    // frame take 3.3 s (flip-latency-avg 3.37e9 ns). Only the GPU writes these
+    // pages (snooped sysmem), so a write-back view stays coherent.
+    IOMemoryMap *m = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly | kIOMapCopybackCache);
     if (!m) { md->complete(); return nullptr; }
     md->retain();
     *slot = SurfMap{md, m, ++surfTick_};
@@ -386,6 +547,101 @@ void NVAccelDisplayPipe::onVblank(void *ref, UInt32 count, UInt64) {
     if (p->pendingTxn_ && p->flipCall_) thread_call_enter(p->flipCall_);   // 0.5.7
 }
 
+// 0.5.19: frame pacing. Uptime nanoseconds for the published rings.
+void NVAccelDisplayPipe::statsReset() {
+    stSubmits_ = stCopies_ = stNoCopy_ = 0;
+    stLastSubmit_ = stLastCopy_ = stSubmitAt_ = 0;
+    stSumSubmitGap_ = stMaxSubmitGap_ = stSubmitGaps_ = 0;
+    stSumCopyGap_ = stMaxCopyGap_ = stCopyGaps_ = 0;
+    stLate20_ = stLate33_ = 0;
+    stSumLat_ = stMaxLat_ = stLatCount_ = 0;
+    stRingHead_ = 0;
+    bzero(stIntervalRing_, sizeof(stIntervalRing_));
+    bzero(stLatencyRing_, sizeof(stLatencyRing_));
+    statsPublish();
+}
+
+void NVAccelDisplayPipe::statsSubmit() {
+    const UInt64 now = mach_absolute_time();
+    if (stLastSubmit_) {
+        UInt64 ns = 0;
+        absolutetime_to_nanoseconds(now - stLastSubmit_, &ns);
+        stSumSubmitGap_ += ns;
+        if (ns > stMaxSubmitGap_) stMaxSubmitGap_ = ns;
+        ++stSubmitGaps_;
+    }
+    stLastSubmit_ = now;
+    stSubmitAt_ = now;
+    ++stSubmits_;
+}
+
+void NVAccelDisplayPipe::statsCopy() {
+    const UInt64 now = mach_absolute_time();
+    UInt64 lat = 0, gap = 0;
+    if (stSubmitAt_ && now > stSubmitAt_) absolutetime_to_nanoseconds(now - stSubmitAt_, &lat);
+    if (stLastCopy_ && now > stLastCopy_) absolutetime_to_nanoseconds(now - stLastCopy_, &gap);
+    if (lat) {
+        stSumLat_ += lat; ++stLatCount_;
+        if (lat > stMaxLat_) stMaxLat_ = lat;
+    }
+    if (gap) {
+        stSumCopyGap_ += gap; ++stCopyGaps_;
+        if (gap > stMaxCopyGap_) stMaxCopyGap_ = gap;
+        if (gap > 20000000ULL) ++stLate20_;
+        if (gap > 33000000ULL) ++stLate33_;
+    }
+    stLastCopy_ = now;
+    stSubmitAt_ = 0;
+    ++stCopies_;
+    const UInt32 i = stRingHead_++ & 255;
+    stIntervalRing_[i] = static_cast<UInt32>(gap > 0xffffffffULL ? 0xffffffffULL : gap);
+    stLatencyRing_[i] = static_cast<UInt32>(lat > 0xffffffffULL ? 0xffffffffULL : lat);
+    statsPublish();
+}
+
+void NVAccelDisplayPipe::statsPublish() {
+    if (!accel_) return;
+    if (foreign_) {                                   // 0.5.27: the NVDisplay pipe owns the flip statistics
+        accel_->setProperty("NVAccelerator-flip-copies-foreign", stCopies_, 64);
+        return;
+    }
+    accel_->setProperty("NVAccelerator-flip-submits", stSubmits_, 64);
+    accel_->setProperty("NVAccelerator-flip-copies", stCopies_, 64);
+    accel_->setProperty("NVAccelerator-flip-skipped", skippedFlips_, 64);
+    accel_->setProperty("NVAccelerator-flip-render-waits", renderWaits_, 64);
+    accel_->setProperty("NVAccelerator-flip-async", asyncFlips_, 64);
+    accel_->setProperty("NVAccelerator-flip-ce", ceFlips_, 64);
+    accel_->setProperty("NVAccelerator-flip-ce-fails", ceFails_, 64);
+    accel_->setProperty("NVAccelerator-flip-ce-retry-at", ceRetryAt_, 64);
+    accel_->setProperty("NVAccelerator-flip-ce-last-err", static_cast<UInt32>(ceLastErr_), 32);
+    accel_->setProperty("NVAccelerator-flip-apbus", apBus_, 64);
+    accel_->setProperty("NVAccelerator-flip-fb-rowbytes", fbRowBytes_, 32);
+    accel_->setProperty("NVAccelerator-flip-fb-widthbytes", fbWidthBytes_, 32);
+    accel_->setProperty("NVAccelerator-flip-fb-height", fbHeight_, 32);
+    accel_->setProperty("NVAccelerator-flip-empty", empty_, 64);
+    accel_->setProperty("NVAccelerator-gamma-sets", gammaSets_, 64);          // 0.5.37
+    accel_->setProperty("NVAccelerator-gamma-fails", gammaFails_, 64);
+    accel_->setProperty("NVAccelerator-gamma-last", static_cast<UInt32>(gammaLast_), 32);
+    accel_->setProperty("NVAccelerator-color-other", colorOther_, 64);
+    accel_->setProperty("NVAccelerator-flip-submit-avg-ns",
+                        stSubmitGaps_ ? stSumSubmitGap_ / stSubmitGaps_ : 0, 64);
+    accel_->setProperty("NVAccelerator-flip-submit-max-ns", stMaxSubmitGap_, 64);
+    accel_->setProperty("NVAccelerator-flip-interval-avg-ns",
+                        stCopyGaps_ ? stSumCopyGap_ / stCopyGaps_ : 0, 64);
+    accel_->setProperty("NVAccelerator-flip-interval-max-ns", stMaxCopyGap_, 64);
+    accel_->setProperty("NVAccelerator-flip-late20", stLate20_, 64);
+    accel_->setProperty("NVAccelerator-flip-late33", stLate33_, 64);
+    accel_->setProperty("NVAccelerator-flip-latency-avg-ns",
+                        stLatCount_ ? stSumLat_ / stLatCount_ : 0, 64);
+    accel_->setProperty("NVAccelerator-flip-latency-max-ns", stMaxLat_, 64);
+    accel_->setProperty("NVAccelerator-flip-vbl-waits", vblWaits_, 64);
+    accel_->setProperty("NVAccelerator-flip-vbl-timeouts", vblTimeouts_, 64);
+    OSData *d = OSData::withBytes(stIntervalRing_, sizeof(stIntervalRing_));
+    if (d) { accel_->setProperty("NVAccelerator-flip-intervals", d); d->release(); }
+    OSData *l = OSData::withBytes(stLatencyRing_, sizeof(stLatencyRing_));
+    if (l) { accel_->setProperty("NVAccelerator-flip-latencies", l); l->release(); }
+}
+
 // 0.5.7: the queued flip, right after a vblank (thread call, not the
 // interrupt workloop: the copy takes ~1.5 ms for a 4K frame)
 void NVAccelDisplayPipe::flipCallout(thread_call_param_t param, thread_call_param_t) {
@@ -412,6 +668,7 @@ void NVAccelDisplayPipe::flipCallout(thread_call_param_t param, thread_call_para
     p->pendingSince_ = 0;
     if (f.md) {
         p->copySurface(f.md, f.bpr, f.size, f.fmt);
+        p->statsCopy();                               // 0.5.19
         if (p->lastFlip_.md != f.md) {                // 0.5.13
             f.md->retain();
             if (p->lastFlip_.md) p->lastFlip_.md->release();
@@ -528,6 +785,7 @@ void NVAccelDisplayPipe::waitVblank() {
 }
 
 bool NVAccelDisplayPipe::flipOnCopyEngine(IOMemoryDescriptor *md, UInt64 bpr, UInt32 rows, UInt32 n) {
+    if (foreign_) return false;
     if (ceFlip_ < 0) {
         ceFlip_ = 1;
         if (IORegistryEntry *o = IORegistryEntry::fromPath("/options", gIODTPlane)) {
@@ -538,15 +796,40 @@ bool NVAccelDisplayPipe::flipOnCopyEngine(IOMemoryDescriptor *md, UInt64 bpr, UI
         gspService();
     }
     if (ceFlip_ != 1 || !gsp_ || !apBus_ || !md) return false;
+    // 0.5.31: the copy engine path needs the kernel to accept the VRAM
+    // scan-out destination AND to submit a multi-line batch on the native615
+    // maintenance channel (NVGspControl 0.180.171+). Until it publishes that,
+    // the CPU copy into the (now cached) sysmem aperture is the path, and
+    // displayCopyTick615 puts it on the screen.
+    {
+        bool ready = false;
+        OSObject *o = gsp_->copyProperty("NVGspControl-flipcopy-native615");
+        if (OSNumber *n = OSDynamicCast(OSNumber, o)) ready = n->unsigned32BitValue() != 0;
+        OSSafeReleaseNULL(o);
+        if (!ready) return false;
+    }
+    // 0.5.30: read the VRAM scan-out surface once
+    if (!scanoutBus_) {
+        OSObject *o = gsp_->copyProperty("NVGspControl-display615-scanout-phys");
+        if (OSNumber *num = OSDynamicCast(OSNumber, o)) scanoutBus_ = num->unsigned64BitValue();
+        OSSafeReleaseNULL(o);
+        if (scanoutBus_) NVALOG("display pipe: flips go to the VRAM scan-out 0x%llx", scanoutBus_);
+    }
+    // 0.5.20: do not disable the copy engine for the whole session because
+    // the first frames at boot failed (GSP rings still warming up, aperture
+    // not mapped yet). Retry every 256 presented frames; a later success
+    // clears the retry state.
+    if (ceRetryAt_ && copies_ < ceRetryAt_) return false;
     NVGspFlipCopy f{};
     f.version = 1; f.rows = rows; f.src = md; f.srcOffset = 0;
     f.srcRowBytes = static_cast<UInt32>(bpr); f.widthBytes = n;
-    f.dstBus = apBus_; f.dstRowBytes = fbRowBytes_;
+    f.dstBus = scanoutBus_ ? scanoutBus_ : apBus_; f.dstRowBytes = fbRowBytes_;
     const IOReturn r = gsp_->callPlatformFunction("nvgsp-flip-copy", false, &f, nullptr, nullptr, nullptr);
-    if (r == kIOReturnSuccess) { ++ceFlips_; return true; }
+    ceLastErr_ = r;
+    if (r == kIOReturnSuccess) { ++ceFlips_; ceRetryAt_ = 0; ceFails_ = 0; return true; }
     // a few failures in a row: stay on the CPU copy
     if (++ceFails_ <= 8) NVALOG("display pipe: copy-engine flip failed 0x%x, CPU copy", r);
-    if (ceFails_ > 32 && ceFlips_ == 0) ceFlip_ = 0;
+    if (ceFails_ > 32 && ceFlips_ == 0) { ceRetryAt_ = copies_ + 256; ceFails_ = 0; }
     return false;
 }
 
@@ -568,7 +851,9 @@ void NVAccelDisplayPipe::free() {
     OSSafeReleaseNULL(gsp_);
     dropSurfaces();
     OSSafeReleaseNULL(fbMem_);
+    OSSafeReleaseNULL(fbScan_);
     OSSafeReleaseNULL(map_);
+    if (gamma_) { IOFree(gamma_, 3 * kGamma * sizeof(UInt16)); gamma_ = nullptr; }   // 0.5.37
     OSSafeReleaseNULL(fb_);
     IOAccelDisplayPipe::free();
 }
@@ -583,35 +868,95 @@ bool NVAccelDisplayPipe::mapFramebuffer() {
         fb_->getPixelInformation(mode, depth, kIOFBSystemAperture, &info) != kIOReturnSuccess)
         return false;
     const UInt32 rows = info.activeHeight, rb = info.bytesPerRow;
+    if (!rows || rb < 4 || info.activeWidth == 0 ||
+        UInt64(rb) < UInt64(info.activeWidth) * (info.bitsPerPixel / 8) ||
+        info.bitsPerPixel < 8)
+        return false;
     if (map_ && rows == fbHeight_ && rb == fbRowBytes_) return true;
     OSSafeReleaseNULL(map_);
     IODeviceMemory *mem = fb_->getApertureRange(kIOFBSystemAperture);
     if (!mem) return false;
-    map_ = mem->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
+    // 0.5.31: the native615 aperture is WindowServer's *system-memory*
+    // framebuffer (NVGspControl publishes its address as display615-fb-phys),
+    // not VRAM behind BAR1. Mapping that range write-combined made every store
+    // a separate bus transaction: 33 MB took 3.3 s (flip-latency-avg 3.37e9 ns,
+    // "copy 3298060 us avg"). Cached stores take ~1 ms (userland: 28-34 GB/s
+    // into the same 4K IOSurface). Only this CPU writes the aperture and the
+    // display tick reads it with the copy engine as COHERENT_SYSMEM, so a
+    // write-back view stays coherent; anything else keeps write-combining.
+    UInt64 fbPhys = 0;
+    if (IOService *g = gspService()) {
+        OSObject *o = g->copyProperty("NVGspControl-display615-fb-phys");
+        if (OSNumber *n = OSDynamicCast(OSNumber, o)) fbPhys = n->unsigned64BitValue();
+        OSSafeReleaseNULL(o);
+    }
+    const bool sysmemAperture = fbPhys && mem->getPhysicalAddress() == fbPhys;
+    // kIOMapDefaultCache is 0 and means "no cache attribute" for a physical
+    // range, i.e. uncached stores; cacheable system memory needs
+    // kIOMapCopybackCache explicitly. If the platform refuses the cacheable
+    // map, stay on write-combined rather than losing the display.
+    if (sysmemAperture) map_ = mem->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache);
+    if (!map_) map_ = mem->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
     apBus_ = mem->getPhysicalAddress();
     mem->release();
     if (!map_) return false;
-    fbRowBytes_ = rb; fbHeight_ = rows; fbWidthBytes_ = info.activeWidth * (info.bitsPerPixel / 8);
+    NVALOG("display pipe: scan-out aperture 0x%llx %s", apBus_, sysmemAperture ? "sysmem (cacheable map)" : "device (WC map)");
+    fbRowBytes_ = rb; fbHeight_ = rows;
+    fbWidthBytes_ = static_cast<UInt32>(UInt64(info.activeWidth) * (info.bitsPerPixel / 8));
     NVALOG("display pipe: scan-out %ux%u, %u bytes/row, %u bpp, %llu bytes mapped", info.activeWidth, rows, rb,
            info.bitsPerPixel, map_->getLength());
     return true;
 }
 
+void NVAccelDisplayPipe::applyPostGamma(IOAccelDisplayPipeTransaction2 *t) {
+    const uint8_t *tb = reinterpret_cast<const uint8_t *>(t);
+    const UInt64 dirty = *reinterpret_cast<const UInt64 *>(tb + kTxnDirty);
+    if (dirty & kDirtyColorOther) ++colorOther_;      // not applied, counted (NVAccelerator-color-other)
+    if (!(dirty & kDirtyPostGamma)) return;
+    const uint8_t *st = *reinterpret_cast<const uint8_t *const *>(tb + kTxnColor);
+    const uint8_t *tbl = st ? *reinterpret_cast<const uint8_t *const *>(st + 8) : nullptr;
+    const UInt32 *d = tbl ? *reinterpret_cast<const UInt32 *const *>(tbl + 0x10) : nullptr;
+    const UInt64 size = tbl ? *reinterpret_cast<const UInt64 *>(tbl + 0x18) : 0;
+    const UInt32 n = (d && size >= 0x10) ? d[0] : 0;
+    if (n < 2 || n > 0x20000 || size < 0x10 + 16ULL * n) { ++gammaFails_; return; }
+    const UInt32 *e = d + 4;
+    UInt64 h = 0xcbf29ce484222325ULL ^ n;             // FNV-1a: the same table is re-sent on many commits
+    for (UInt32 i = 0; i < n * 4; ++i) h = (h ^ e[i]) * 0x100000001b3ULL;
+    if (h == gammaHash_ && gammaLast_ == kIOReturnSuccess) return;
+    if (!gamma_ && !(gamma_ = static_cast<UInt16 *>(IOMalloc(3 * kGamma * sizeof(UInt16))))) { ++gammaFails_; return; }
+    for (UInt32 i = 0; i < kGamma; ++i) {
+        const UInt32 j = (i * (n - 1) + (kGamma - 1) / 2) / (kGamma - 1);
+        for (UInt32 c = 0; c < 3; ++c) gamma_[c * kGamma + i] = unorm16(e[j * 4 + c]);
+    }
+    IOService *g = gspService();
+    gammaLast_ = g ? g->callPlatformFunction("nvgsp-gamma-set", false, gamma_,
+                                             reinterpret_cast<void *>(static_cast<uintptr_t>(kGamma)), nullptr, nullptr)
+                   : kIOReturnNotReady;
+    gammaHash_ = h;
+    if (gammaLast_ == kIOReturnSuccess) ++gammaSets_; else ++gammaFails_;
+    NVALOG("display pipe: post-gamma %u entries -> 0x%x (r/g/b mid %04x %04x %04x)", n, gammaLast_,
+           gamma_[kGamma / 2], gamma_[kGamma + kGamma / 2], gamma_[2 * kGamma + kGamma / 2]);
+}
+
 IOReturn NVAccelDisplayPipe::submitTransaction(IOAccelDisplayPipeTransaction2 *t) {
+    if (t && !foreign_) applyPostGamma(t);            // 0.5.37
     void *surf = t ? ioaf2TxnPlaneSurface(t, 0, 0) : nullptr;
     if (tr(7)) NVALOG("display pipe: submitTransaction %p surface %p", t, surf);
-    if (!mapFramebuffer()) { if (tr(7)) NVALOG("display pipe: scan-out map failed"); return kIOReturnSuccess; }
+    if (!mapFramebuffer()) { if (tr(7)) NVALOG("display pipe: scan-out map failed"); return kIOReturnIOError; }
     IOMemoryDescriptor *md = nullptr;
     UInt64 bpr = 0, size = 0;
     UInt32 fmt = 0;
     if (surf) {
         md = iosurfMemory(surf, this);
         bpr = iosurfBytesPerRow(surf); size = iosurfAllocSize(surf); fmt = iosurfPixelFormat(surf);
+    } else if (fbScan_) {                 // 0.5.33: the frame already is the scan-out aperture
+        ++empty_;
+        return kIOReturnSuccess;
     } else if (fbMem_) {                 // a flip of the framebuffer resource itself
         ++empty_;
         md = fbMem_; bpr = fbRowBytes_; size = fbMem_->getLength(); fmt = 'BGRA';
     }
-    if (!md || !bpr) return kIOReturnSuccess;
+    if (!md || !bpr) return kIOReturnBadArgument;
     if (asyncFlip_ < 0) {                            // 0.5.7
         asyncFlip_ = 1;
         if (IORegistryEntry *o = IORegistryEntry::fromPath("/options", gIODTPlane)) {
@@ -630,9 +975,11 @@ IOReturn NVAccelDisplayPipe::submitTransaction(IOAccelDisplayPipeTransaction2 *t
     // without vblanks there is nothing to start the copy: do it here
     if (asyncFlip_ != 1 || !setupVsync()) {
         waitVblank();
+        statsSubmit();                                 // 0.5.19
         if (flipLock_) IOLockLock(flipLock_);
         copySurface(md, bpr, size, fmt);
         if (flipLock_) IOLockUnlock(flipLock_);
+        statsCopy();                                   // 0.5.19
         return kIOReturnSuccess;
     }
     md->retain();
@@ -646,8 +993,14 @@ IOReturn NVAccelDisplayPipe::submitTransaction(IOAccelDisplayPipeTransaction2 *t
     pendingTxn_ = t;                                  // the replaced one now reads complete
     IOLockUnlock(flipLock_);
     if (dropped) dropped->release();
+    statsSubmit();                                    // 0.5.19
+    // 0.5.35: the backstop was a flat 25 ms, and the measured flip latency was
+    // 28 ms - i.e. every frame was presented by the backstop, not by a vblank
+    // (the display interrupt is synthetic on this runtime). Copy 4 ms after the
+    // submit instead; renderDone() still holds the frame back while the GPU is
+    // drawing it, so this only removes dead time.
     UInt64 deadline = 0;                              // 0.5.8: copy even if no vblank comes
-    clock_interval_to_deadline(25, kMillisecondScale, &deadline);
+    clock_interval_to_deadline(4, kMillisecondScale, &deadline);
     thread_call_enter_delayed(flipBackstop_, deadline);
     return kIOReturnSuccess;
 }
@@ -655,6 +1008,7 @@ IOReturn NVAccelDisplayPipe::submitTransaction(IOAccelDisplayPipeTransaction2 *t
 // Copy one surface into the scan-out memory. Caller holds flipLock_ (when
 // there is one): surf_ and the copy statistics are shared with flipCallout.
 void NVAccelDisplayPipe::copySurface(IOMemoryDescriptor *md, UInt64 bpr, UInt64 size, UInt32 fmt) {
+    if (!bpr || !fbRowBytes_ || !map_) return;
     UInt32 rows = fbHeight_;
     if (bpr * rows > size) rows = (UInt32)(size / bpr);
     const UInt32 n = (UInt32)(bpr < fbWidthBytes_ ? bpr : fbWidthBytes_);
@@ -780,10 +1134,40 @@ OSDefineMetaClassAndStructors(NVAccelTask, IOAccelTask)
 class NVGraphicsDeviceControl : public AppleGraphicsDeviceControl {
     OSDeclareDefaultStructors(NVGraphicsDeviceControl)
     UInt32 logged_ = 0, sub711_ = 0;
-    IOService *fb_ = nullptr;   // NVDisplay, handed to AGDC as the one framebuffer
+    // 0.5.27: the framebuffers handed to AGDC, NVDisplay first (nvCopyFramebuffers)
+    IOFramebuffer *fbs_[2] = {};
+    unsigned nfb_ = 0;
+    void loadFramebuffers() { if (!nfb_) nfb_ = nvCopyFramebuffers(fbs_, 2); }
     IOService *provider_ = nullptr;
+    UInt16 gpuVendor_ = 0x10de, gpuDevice_ = 0x2704;
+    // 0.5.36: IOPresentment builds the display pipeline capabilities from the
+    // 0x711 sub-queries (0x1 CSC, 0x2 gamma, 0x4 linearization, 0x8 pipeline
+    // scaler, 0x10 plane scaler, 0x20 rotation, 0x80 queue, ...). A reply can
+    // be replaced without a rebuild: bytes from offset 8 (entry count, then
+    // the entries) come from an administrator's setProperties
+    // ("NVAGDC-711-override" = {"<sub decimal>" = data}), else from the
+    // NVGspControl property "NVGspControl-agdc-711" (same form).
+    static constexpr unsigned kOverrides = 16;
+    OSData *ovr_[kOverrides] = {};
+    IOLock *ovrLock_ = nullptr;
+    static int subBit(UInt32 sub) { return (sub && !(sub & (sub - 1)) && sub < (1u << kOverrides)) ? __builtin_ctz(sub) : -1; }
+    bool applyOverride(UInt32 sub, uint8_t *o, unsigned long osz);
 public:
-    void setProvider(IOService *p) { provider_ = p; }
+    IOReturn setProperties(OSObject *properties) override;
+    void free() override {
+        for (auto &d : ovr_) OSSafeReleaseNULL(d);
+        if (ovrLock_) { IOLockFree(ovrLock_); ovrLock_ = nullptr; }
+        AppleGraphicsDeviceControl::free();
+    }
+    void setProvider(IOService *p) {
+        provider_ = p;
+        if (p) {
+            OSNumber *v = OSDynamicCast(OSNumber, p->getProperty("NVGspControl-gpu-vendor"));
+            OSNumber *d = OSDynamicCast(OSNumber, p->getProperty("NVGspControl-gpu-device"));
+            if (v) gpuVendor_ = static_cast<UInt16>(v->unsigned32BitValue());
+            if (d) gpuDevice_ = static_cast<UInt16>(d->unsigned32BitValue());
+        }
+    }
 public:
     void *vendor_doDeviceAttribute(unsigned int attr, unsigned long *in, unsigned long inSize, unsigned long *out,
                                    unsigned long *outSize, IOExternalMethodArguments *args) override;
@@ -795,6 +1179,65 @@ public:
     }
 };
 OSDefineMetaClassAndStructors(NVGraphicsDeviceControl, AppleGraphicsDeviceControl)
+
+IOReturn NVGraphicsDeviceControl::setProperties(OSObject *properties) {
+    OSDictionary *d = OSDynamicCast(OSDictionary, properties);
+    OSDictionary *m = d ? OSDynamicCast(OSDictionary, d->getObject("NVAGDC-711-override")) : nullptr;
+    if (!m) return AppleGraphicsDeviceControl::setProperties(properties);
+    if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+        return kIOReturnNotPrivileged;
+    if (!ovrLock_ && !(ovrLock_ = IOLockAlloc())) return kIOReturnNoMemory;
+    OSData *next[kOverrides] = {};
+    bool ok = true;
+    if (OSCollectionIterator *it = OSCollectionIterator::withCollection(m)) {
+        while (OSSymbol *k = OSDynamicCast(OSSymbol, it->getNextObject())) {
+            OSData *v = OSDynamicCast(OSData, m->getObject(k));
+            UInt32 sub = 0;
+            for (const char *c = k->getCStringNoCopy(); *c >= '0' && *c <= '9' && sub < 0x10000; ++c) sub = sub * 10 + UInt32(*c - '0');
+            const int b = subBit(sub);
+            if (b < 0 || !v || v->getLength() > 0x196c - 8) { ok = false; break; }
+            v->retain();
+            OSSafeReleaseNULL(next[b]);
+            next[b] = v;
+        }
+        it->release();
+    }
+    if (!ok) {
+        for (auto &x : next) OSSafeReleaseNULL(x);
+        return kIOReturnBadArgument;
+    }
+    // an empty dictionary clears every override
+    IOLockLock(ovrLock_);
+    for (unsigned i = 0; i < kOverrides; ++i) { OSSafeReleaseNULL(ovr_[i]); ovr_[i] = next[i]; }
+    IOLockUnlock(ovrLock_);
+    IOLog("NVAccelerator: AGDC 0x711 overrides set (%u entries)\n", m->getCount());
+    return kIOReturnSuccess;
+}
+
+bool NVGraphicsDeviceControl::applyOverride(UInt32 sub, uint8_t *o, unsigned long osz) {
+    const int b = subBit(sub);
+    if (b < 0 || !o || osz != 0x196c) return false;
+    OSData *v = nullptr;
+    if (ovrLock_) {
+        IOLockLock(ovrLock_);
+        if ((v = ovr_[b])) v->retain();
+        IOLockUnlock(ovrLock_);
+    }
+    if (!v && provider_) {
+        char key[12];
+        snprintf(key, sizeof key, "%u", sub);
+        if (OSDictionary *g = OSDynamicCast(OSDictionary, provider_->getProperty("NVGspControl-agdc-711")))
+            if ((v = OSDynamicCast(OSData, g->getObject(key)))) v->retain();
+    }
+    if (!v) return false;
+    const bool fits = v->getLength() <= osz - 8;
+    if (fits) {
+        bzero(o + 8, osz - 8);
+        memcpy(o + 8, v->getBytesNoCopy(), v->getLength());
+    }
+    v->release();
+    return fits;
+}
 
 void *NVGraphicsDeviceControl::vendor_doDeviceAttribute(unsigned int attr, unsigned long *in, unsigned long inSize,
                                                         unsigned long *out, unsigned long *outSize,
@@ -808,7 +1251,8 @@ void *NVGraphicsDeviceControl::vendor_doDeviceAttribute(unsigned int attr, unsig
             bzero(o, 0x2c);
             *reinterpret_cast<UInt32 *>(o) = 0x10000;
             memcpy(o + 4, "NVIDIA", 6);
-            *reinterpret_cast<UInt32 *>(o + 0x24) = 0x270410de;   // vendor 0x10de, device 0x2704
+            *reinterpret_cast<UInt32 *>(o + 0x24) =
+                (static_cast<UInt32>(gpuVendor_) << 16) | gpuDevice_;
             *reinterpret_cast<UInt32 *>(o + 0x28) = 1;            // a real GPU (Paravirt says 2)
             r = kIOReturnSuccess;
         }
@@ -827,22 +1271,26 @@ void *NVGraphicsDeviceControl::vendor_doDeviceAttribute(unsigned int attr, unsig
     case 0x3:                            // 4 bytes: Paravirt returns a global flag word, 0 here
         if (osz == 4 && o) { *reinterpret_cast<UInt32 *>(o) = 0; r = kIOReturnSuccess; }
         break;
-    case 0x980:                          // 0xdc bytes: one framebuffer (masks as Paravirt builds them)
+    case 0x980:                          // 0xdc bytes: the framebuffers (masks as Paravirt builds them)
         if (osz == 0xdc && o) {
             bzero(o, 0xdc);
-            const UInt64 mask = 1ULL << 1;   // ((1 << n) - 1) * 2 with n = 1
-            for (int k = 0; k < 4; ++k) *reinterpret_cast<UInt64 *>(o + 8 * k) = mask;
-            for (int k = 0; k < 5; ++k) *reinterpret_cast<UInt32 *>(o + 0x20 + 4 * k) = 1;
             // 0.3.3: pointers, not IDs; AGDC turns 0x34 (the GPU) and the 0x3c
             // framebuffer list into registry IDs itself (an ID here panicked it)
-            if (!fb_) {
-                OSDictionary *m = IOService::serviceMatching("NVDisplay");
-                fb_ = m ? IOService::copyMatchingService(m) : nullptr;   // retained
-                OSSafeReleaseNULL(m);
-            }
+            loadFramebuffers();
+            const UInt32 n = nfb_ ? nfb_ : 1;
+            const UInt64 mask = ((1ULL << n) - 1) * 2;
+            for (int k = 0; k < 4; ++k) *reinterpret_cast<UInt64 *>(o + 8 * k) = mask;
+            for (int k = 0; k < 5; ++k) *reinterpret_cast<UInt32 *>(o + 0x20 + 4 * k) = n;
+            // 0.5.26: the GPU (our provider, as Paravirt's getProvider()) and the
+            // framebuffer list must be objects. AGDC's filtered_doDeviceAttribute
+            // (KDK 26.7.2) turns 0x34 and 0x3c[0x30] into registry IDs before it
+            // copies the reply out, so no pointer reaches user space. Nulls here
+            // left IOPresentment's device map with F:0x0 (err:gms): a WindowServer
+            // started with the accelerator present found no display pipe and
+            // aborted in CA::OGL::Context::push_surface (transient surface not found).
             *reinterpret_cast<IOService **>(o + 0x34) = getProvider();
-            *reinterpret_cast<IOService **>(o + 0x3c) = fb_;
-            if (!fb_) *reinterpret_cast<UInt32 *>(o + 0x30) = 0;
+            for (unsigned i = 0; i < nfb_; ++i) *reinterpret_cast<IOService **>(o + 0x3c + 8 * i) = fbs_[i];
+            *reinterpret_cast<UInt32 *>(o + 0x30) = nfb_;
             r = kIOReturnSuccess;
         }
         break;
@@ -851,21 +1299,28 @@ void *NVGraphicsDeviceControl::vendor_doDeviceAttribute(unsigned int attr, unsig
         break;
     case 0x925:                          // 12 bytes: {fb index + 1, ?, flag}; Paravirt copies a per-fb byte
         if (osz == 0xc && o && in && inSize == 0xc) {
-            const UInt32 idx = *reinterpret_cast<const UInt32 *>(in);
-            IOLog("NVAccelerator: AGDC 0x925 in %08x %08x %08x\n", idx, reinterpret_cast<const UInt32 *>(in)[1],
-                  reinterpret_cast<const UInt32 *>(in)[2]);
-            if (idx <= 1) { *reinterpret_cast<UInt32 *>(o + 8) = 1; r = kIOReturnSuccess; }
+            // `in` is not guaranteed 8-byte aligned; copy the three words out
+            // instead of dereferencing a misaligned UInt32 pointer.
+            UInt32 vals[3] = {};
+            __builtin_memcpy(vals, in, sizeof vals);
+            const UInt32 idx = vals[0];
+            IOLog("NVAccelerator: AGDC 0x925 in %08x %08x %08x\n", idx, vals[1], vals[2]);
+            if (idx <= (nfb_ ? nfb_ : 1)) { *reinterpret_cast<UInt32 *>(o + 8) = 1; r = kIOReturnSuccess; }
         }
         break;
     case 0x711: {                        // 0x196c bytes: {fb index, sub-command, payload}
         const uint8_t *ib = reinterpret_cast<const uint8_t *>(in);
         const UInt32 idx = (ib && inSize >= 8) ? *reinterpret_cast<const UInt32 *>(ib) : ~0u;
         const UInt32 sub = (ib && inSize >= 8) ? *reinterpret_cast<const UInt32 *>(ib + 4) : ~0u;
-        if (o && osz == 0x196c && ib && ib != o) memcpy(o, ib, 0x196c);
+        // 0.180.12: the old check only required 8 input bytes and then copied
+        // the full 0x196c-byte request out of the caller's buffer.
+        if (o && osz == 0x196c && ib && ib != o && inSize >= 0x196c)
+            memcpy(o, ib, 0x196c);
         // per-display query, answered the way Paravirt's framebuffer does
         auto u32 = [o](unsigned off) -> UInt32 & { return *reinterpret_cast<UInt32 *>(o + off); };
         auto u64 = [o](unsigned off) -> UInt64 & { return *reinterpret_cast<UInt64 *>(o + off); };
-        if (o && osz == 0x196c && idx == 0) {
+        loadFramebuffers();
+        if (o && osz == 0x196c && idx < (nfb_ ? nfb_ : 1)) {
             r = kIOReturnSuccess;
             switch (sub) {
             case 0x1:
@@ -873,8 +1328,15 @@ void *NVGraphicsDeviceControl::vendor_doDeviceAttribute(unsigned int attr, unsig
                 u64(0x24) = 0; u32(0x2c) = 0x30300; u64(0x30) = 0x3f800000bf800000ULL;   // -1.0f, 1.0f
                 break;
             case 0x2:
-                u32(0x08) = 1; u32(0x0c) = 5; u64(0x10) = 0; u64(0x18) = 0x8000000000ULL; u32(0x20) = 0;
-                u64(0x24) = 0; u64(0x2c) = 0x3f80000000000000ULL; u64(0x34) = 0;
+                // 0.5.37: one gamma entry at 0xc {flags, u64 plane mask, float
+                // non-atomic period, type, fixed format, u64 configuration,
+                // float min, float max, u64 max size}. Paravirt's plane mask 0
+                // meant "no plane gamma": CoreDisplay's IsEOTFSupportedInHW
+                // failed (reason 0x20000) and its GPU colour pass ran on every
+                // frame. Plane 0 now has a 3-channel 10-bit (type 0x80) table
+                // of kGamma entries; the pipe applies it as the head OLUT.
+                u32(0x08) = 1; u32(0x0c) = 5; u64(0x10) = 1; u64(0x18) = 0x8000000000ULL; u32(0x20) = 0;
+                u64(0x24) = 0; u64(0x2c) = 0x3f80000000000000ULL; u64(0x34) = kGamma;
                 break;
             case 0x4:
                 u32(0x08) = 1; bzero(o + 0xc, 0x30);
@@ -884,7 +1346,7 @@ void *NVGraphicsDeviceControl::vendor_doDeviceAttribute(unsigned int attr, unsig
                 break;
             case 0x10: {   // current timing, two identical descriptors (0x28, 0x1b0)
                 UInt32 w = 3840, h = 2160;
-                if (IOFramebuffer *fb = OSDynamicCast(IOFramebuffer, fb_)) {
+                if (IOFramebuffer *fb = idx < nfb_ ? fbs_[idx] : nullptr) {
                     IODisplayModeID mode = 0; IOIndex depth = 0; IOPixelInformation pi{};
                     if (fb->getCurrentDisplayMode(&mode, &depth) == kIOReturnSuccess &&
                         fb->getPixelInformation(mode, depth, kIOFBSystemAperture, &pi) == kIOReturnSuccess &&
@@ -892,11 +1354,19 @@ void *NVGraphicsDeviceControl::vendor_doDeviceAttribute(unsigned int attr, unsig
                         w = pi.activeWidth; h = pi.activeHeight;
                     }
                 }
+                // 0.5.36: this is the plane scaler (one entry at 0xc: up count
+                // 0x28 + entries, down count 0x1b0 + entries). An entry is
+                // {height, width, max height, max width, pixel formats, ...}:
+                // IOPresentment turns it into CoreDisplay's {min w, min h,
+                // max w, max h}. Width first read min 2160 x 3840, so even a
+                // 1:1 4K plane failed "upscaling/downscaling to endpoint" and
+                // CoreDisplay ran its GPU colour pass on every frame. min = max
+                // = the mode: 1:1 only, the pipe copies and cannot scale.
                 u32(0x08) = 1; bzero(o + 0xc, 0x1c);
                 static const unsigned kBase[2] = {0x28u, 0x1b0u};
                 for (unsigned base : kBase) {
-                    u64(base) = 1; u32(base + 0x08) = w; u32(base + 0x0c) = h;
-                    u32(base + 0x10) = w; u32(base + 0x14) = h; u32(base + 0x18) = 0x10000;
+                    u64(base) = 1; u32(base + 0x08) = h; u32(base + 0x0c) = w;
+                    u32(base + 0x10) = h; u32(base + 0x14) = w; u32(base + 0x18) = 0x10000;
                     bzero(o + base + 0x1c, 0x16c);
                 }
                 break;
@@ -918,6 +1388,7 @@ void *NVGraphicsDeviceControl::vendor_doDeviceAttribute(unsigned int attr, unsig
                 break;
             }
         }
+        if (o && idx < (nfb_ ? nfb_ : 1) && applyOverride(sub, o, osz)) r = kIOReturnSuccess;   // 0.5.36
         if (sub711_ < 16) { ++sub711_; IOLog("NVAccelerator: AGDC 0x711 fb %u sub 0x%x -> 0x%x\n", idx, sub, r); }
         break;
     }
@@ -1054,9 +1525,47 @@ IOService *NVAccelerator::probe(IOService *provider, SInt32 *score) {
 // new_resource blocks in acceleratorWaitEnabled() (27 Sep: metal_test hung in
 // newBufferWithLength). We are usable as soon as start succeeds.
 extern void ioaf2EnableAccelerator(IOGraphicsAccelerator2 *a) __asm("__ZN22IOGraphicsAccelerator217enableAcceleratorEv");
+// The family's display re-probe (IOGraphicsAccelerator2 vtable [229]); bound by
+// its mangled name so a vtable-slot mismatch cannot redirect the call.
+extern IOReturn ioaf2RequestProbe(IOGraphicsAccelerator2 *a, UInt32 options)
+    __asm("__ZN22IOGraphicsAccelerator212requestProbeEj");
+// IOFramebuffer finds its accelerator by walking the registry for class
+// "IOAccelerator" (KDK 26.7.2, IOFramebuffer::probeAccelerator). Our NVDA
+// starts ~40 s before NVAccelerator exists, so it never had one; without it
+// CoreDisplay reports "Unable to find display pipe for IOFB service /
+// regID: <NVDA>" and WindowServer never submits a display transaction.
+extern void ioafbProbeAccelerator(IOFramebuffer *fb)
+    __asm("__ZN13IOFramebuffer16probeAcceleratorEv");
 
 void NVAccelerator::okCallout(thread_call_param_t self, thread_call_param_t) {
-    static_cast<NVAccelerator *>(self)->setProperty("NVAccelerator-alive-60s", true);
+    NVAccelerator *a = static_cast<NVAccelerator *>(self);
+    a->setProperty("NVAccelerator-alive-60s", true);
+    // 0.5.28: WindowServer looks the GPU up exactly once, before this
+    // accelerator exists (live 15:14:38 "gpu 0x9a50 accel 0x000000000", accel
+    // up 15:14:56), so it never submits a display transaction. Give the
+    // framebuffer its accelerator after the fact, then nudge the family's
+    // display re-probe. Done from this callout, not from start(), because the
+    // family's probe takes the accelerator lock. NVRAM nvaccel-reprobe=0 off.
+    if (!a->dm_ || !a->dm_->started_) return;
+    if (IORegistryEntry *o = IORegistryEntry::fromPath("/options", gIODTPlane)) {
+        if (OSData *d = OSDynamicCast(OSData, o->getProperty("nvaccel-reprobe")))
+            if (d->getLength() >= 1 && static_cast<const char *>(d->getBytesNoCopy())[0] == '0') {
+                o->release();
+                return;
+            }
+        o->release();
+    }
+    if (OSDictionary *m = IOService::serviceMatching("NVDisplay")) {
+        IOService *svc = IOService::copyMatchingService(m);
+        m->release();
+        if (IOFramebuffer *fb = OSDynamicCast(IOFramebuffer, svc)) {
+            ioafbProbeAccelerator(fb);
+            NVALOG("framebuffer %s: probeAccelerator", fb->getName());
+        }
+        if (svc) svc->release();
+    }
+    const IOReturn r = ioaf2RequestProbe(a, 0x00000001 /* kIOFBUserRequestProbe */);
+    NVALOG("reprobe after accelerator up: 0x%x", r);
 }
 
 bool NVAccelerator::start(IOService *provider) {
@@ -1103,14 +1612,23 @@ bool NVAccelerator::start(IOService *provider) {
         return false;
     }
     setProperty("NVAccelerator-version", KEXT_BUNDLE_VERSION);   // from Info.plist (build_kext.sh)
+    // 0.5.25: IOGraphicsAccelerator2::start advertises IOAccelerator2D.plugin
+    // through IOCFPlugInTypes. WindowServer then loads that plugin for this
+    // service, its Start() opens the service with connect type 2, the family
+    // answers kIOReturnUnsupported (the 0xccf display-pipe gate is false) and
+    // CA subsequently aborts in CA::OGL::Context::push_surface on a null
+    // flatten surface. Until the type-2 2D client is implemented, do not
+    // advertise the plugin: WindowServer then keeps the software surface path
+    // that works when the accelerator appears after it started.
+    removeProperty("IOCFPlugInTypes");
     if (stampGpuVa_) nativeStart();
     ioaf2EnableAccelerator(this);
     setProperty("NVAccelerator-enabled-at-start", true);
     // 0.2.2: the family did not start the display machine on the PCI device
     // (NVDisplay is not a child of it): give it NVDisplay ourselves
     if (dm_ && !dm_->started_) {
-        NVALOG("display machine not started by the family: attaching NVDisplay");
-        dm_->attachNVDisplay();
+        NVALOG("display machine not started by the family: starting it with NVDisplay");
+        dm_->start(static_cast<IOPCIDevice *>(provider));
     }
     // 0.2.3: the family publishes DisplayPipeSupported=No when start finds no
     // pipe; with NVDisplay's pipe in place say what the NVIDIA web driver
@@ -1149,6 +1667,12 @@ bool NVAccelerator::start(IOService *provider) {
         thread_call_enter_delayed(okCall_, deadline);
     }
     startStats();                                    // 0.5.1: native or not
+    // 0.5.18: the IOAccelerator is registered and the display pipe is up.
+    // Let NVGspControl's boot hold release WindowServer, so SkyLight starts
+    // on the Metal compositor instead of the firmware-screen software path.
+    if (gsp_)
+        gsp_->callPlatformFunction("nvgsp-boot-hold-release", false,
+                                   nullptr, nullptr, nullptr, nullptr);
     NVALOG("started");
     return true;
 }
@@ -1228,7 +1752,7 @@ public:
     IOReturn externalMethod(unsigned int sel, IOExternalMethodArguments *a, IOExternalMethodDispatch *,
                             OSObject *, void *) override {
         if (sel == 0x4E5654) {   // 'NVT' (0.4.7): this client's tag for native kernel commands
-            if (!a || a->scalarOutputCount != 1) return kIOReturnBadArgument;
+            if (!a || a->scalarOutputCount != 1 || !a->scalarOutput) return kIOReturnBadArgument;
             UInt64 generation = 0;
             IOExternalMethodArguments valid{};
             valid.scalarOutput = &generation; valid.scalarOutputCount = 1;
@@ -1540,13 +2064,16 @@ public:
         auto *sub = *reinterpret_cast<NVChannelSubmit **>(reinterpret_cast<UInt8 *>(desc) + 0x20);
         if (!sub || !accel_ || !accel_->gsp_) return nullptr;
         const NVExecKernelCommand *c = sub->cmd;
+        if (!c || !c->n || c->n > kNVExecMaxSegs) return nullptr;
         UInt64 va[kNVExecMaxSegs];
         UInt32 dw[kNVExecMaxSegs], fl[kNVExecMaxSegs];
         for (UInt32 i = 0; i < c->n; ++i) { va[i] = c->seg[i].va; dw[i] = c->seg[i].dwords; fl[i] = c->seg[i].flags; }
         NVGspKernelSubmit ks{};
         ks.version = 1; ks.engine = engine_; ks.owner = sub->owner; ks.n = c->n;
         ks.va = va; ks.dwords = dw; ks.flags = fl;
-        ks.stampVa = sub->stamp.idx >= 0 ? accel_->stampGpuVa_ + UInt64(sub->stamp.idx) * 4 : 0;
+        if (sub->stamp.idx < -1 || sub->stamp.idx > 1) return nullptr;
+        ks.stampVa = sub->stamp.idx >= 0
+            ? accel_->stampGpuVa_ + UInt64(sub->stamp.idx) * 4 : 0;
         ks.stampValue = sub->stamp.value;
         if (sub->stamp.idx >= 0 && sub->stamp.idx < 2) accel_->beginNativeStamp(sub->stamp.idx);
         sub->result = accel_->gsp_->callPlatformFunction("nvgsp-submit-stamp", false, &ks, nullptr, nullptr, nullptr);

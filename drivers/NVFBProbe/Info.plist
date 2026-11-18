@@ -7,8 +7,8 @@
 <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 <key>CFBundleName</key><string>NVFBProbe</string>
 <key>CFBundlePackageType</key><string>KEXT</string>
-<key>CFBundleShortVersionString</key><string>0.3.9</string>
-<key>CFBundleVersion</key><string>0.3.9</string>
+<key>CFBundleShortVersionString</key><string>0.3.10</string>
+<key>CFBundleVersion</key><string>0.3.10</string>
 <key>OSBundleRequired</key><string>Root</string>
 <key>IOKitPersonalities</key><dict><key>RTX 4080 framebuffer survey</key><dict>
 <key>CFBundleIdentifier</key><string>org.local.macosdevicelab.NVFBProbe</string>

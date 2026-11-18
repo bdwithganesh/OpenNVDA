@@ -45,6 +45,11 @@
 @property (nonatomic) uint32_t rtReadMask;  // 0.8.40: fragment: [[color(n)]] inputs (framebuffer fetch), bit n
 @property (nonatomic) uint32_t rtReadDword; // push dword of attachment 0's texture handle (2 dwords each)
 @property (nonatomic) BOOL sampleShading; // fragment sample_id / per-sample interpolation
+// 0.9.18: GL-originated compute functions (Apple's GL renderer emulates
+// tessellation and transform feedback with compute kernels) carry the GL
+// plugin's return blob here; NVMTLComputeReflection exposes it as
+// pluginReturnData, matching what the render path does for VS/FS.
+@property (nonatomic) NSData *glPluginRet;
 @end
 
 // Fragment function. v1: constant color only (parsed). 0.3.0: `raster` is

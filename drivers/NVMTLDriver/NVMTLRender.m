@@ -8,6 +8,7 @@
 #import <Metal/Metal.h>
 #import "NVMTLCompiler.h"
 #import "NVMTLGsp.h"
+extern uint64_t nvNullVa(void);
 
 static NSString *kRasterGLSL(bool bgra) {
     NSString *pack = bgra ?
@@ -80,6 +81,7 @@ bool nvRenderDraw(NVMTLKernel *vs, const float fsColor[4],
                   NSUInteger vStart, NSUInteger vCount, bool bgra,
                   const uint32_t *idx, NSUInteger idxCount) {
     if (!vs || !vs.isVertex) { NSLog(@"NVMTLRender: no vertex kernel"); return false; }
+    if (vStart > 0xffffffffULL) { NSLog(@"NVMTLRender: vertexStart out of native range"); return false; }
     const NSUInteger tri = idx ? idxCount : vCount;
     if (!idx && idxCount) { NSLog(@"NVMTLRender: idxCount without idx"); return false; }
     if (tri % 3) { NSLog(@"NVMTLRender: index/vertex count not a multiple of 3"); return false; }
@@ -90,18 +92,24 @@ bool nvRenderDraw(NVMTLKernel *vs, const float fsColor[4],
     const uint64_t sv = nvStageVa();
     // 1. Vertex stage: transform vCount verts to clip float4s.
     uint64_t stageOff = 0;
+    if (vs.nbuf > 28) { NSLog(@"NVMTLRender: too many vertex bufs"); return false; }
     uint32_t push[64] = {0};
     const uint32_t nPush = vs.nbuf * 2 + 5; // bufs + out(u64) + vstart + vcount + iid
     if (nPush > 64) { NSLog(@"NVMTLRender: too many vertex bufs"); return false; }
     for (NSUInteger i = 0; i < vbufs.count && i < vs.nbuf; i++) {
         NSDictionary *be = vbufs[i];
-        if ((id)be == [NSNull null]) continue;
+        if ((id)be == [NSNull null]) {
+            const uint64_t nv = nvNullVa();
+            if (!nv) { NSLog(@"NVMTLRender: null vertex page unavailable"); return false; }
+            push[2 * i] = (uint32_t)nv; push[2 * i + 1] = (uint32_t)(nv >> 32);
+            continue;
+        }
         id<MTLBuffer> b = be[@"buf"];
         NSUInteger off = [be[@"off"] unsignedIntegerValue];
         uint8_t *c = b.contents;
         if (!c || off >= b.length) { NSLog(@"NVMTLRender: bad vertex buf"); return false; }
         NSUInteger len = b.length - off;
-        if (stageOff + len > NVGSP_GR_VBUF_MAX)
+        if (len > NVGSP_GR_VBUF_MAX - stageOff)
             { NSLog(@"NVMTLRender: vertex staging overflow"); return false; }
         memcpy(st + NVGSP_GR_VBUF + stageOff, c + off, len);
         const uint64_t va = sv + NVGSP_GR_VBUF + stageOff;
@@ -116,7 +124,13 @@ bool nvRenderDraw(NVMTLKernel *vs, const float fsColor[4],
     uint32_t block[3] = {256, 1, 1};
     // Guard: VS writes OUT[gid] for gid < grid*block; over-launch writes
     // past vCount but inside the 64 KiB VSOUT for vCount <= 4093.
-    if (vCount > 4093 || vCount == 0) { NSLog(@"NVMTLRender: vertexCount %lu out of v1 range", (unsigned long)vCount); return false; }
+    const uint32_t voutSlots = vs.voutStride ? vs.voutStride : 1;
+    if (vCount == 0 || voutSlots > 16 ||
+        vCount > ((64u * 1024u) / 4u) / voutSlots) {
+        NSLog(@"NVMTLRender: vertexCount %lu / stride %u out of v1 range",
+              (unsigned long)vCount, voutSlots);
+        return false;
+    }
     const uint32_t *code = vs.code.bytes;
     if (!nvGrLaunch(code, (uint32_t)(vs.code.length / 4), vs.regs, vs.slm, vs.smem, vs.barriers,
                     push, nPush, grid, block)) {

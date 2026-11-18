@@ -7,24 +7,31 @@
 /* ------------------------------------------------------------- NAL units */
 
 int h264_next_nal(const uint8_t *buf, size_t len, size_t *pos, h264_nal *nal) {
-    size_t i = *pos;
-    while (i + 3 <= len && !(buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1)) ++i;
-    if (i + 3 > len) { *pos = len; return 0; }
-    const size_t start = i + 3;
-    size_t end = start;
-    while (end + 3 <= len && !(buf[end] == 0 && buf[end + 1] == 0 &&
-                               (buf[end + 2] == 1 || buf[end + 2] == 0)))
-        ++end;
-    if (end + 3 > len) end = len;
-    size_t trimmed = end;
-    while (trimmed > start && buf[trimmed - 1] == 0) --trimmed;   /* trailing_zero_8bits */
-    *pos = end;
-    if (trimmed == start) return h264_next_nal(buf, len, pos, nal);
-    nal->data = buf + start;
-    nal->size = trimmed - start;
-    nal->type = buf[start] & 0x1f;
-    nal->ref_idc = (buf[start] >> 5) & 3;
-    return 1;
+    if (!buf || !pos || !nal) return 0;
+    // 0.180.12: skip empty NALs with a loop. The recursive version used one
+    // stack frame per consecutive start code and could be driven into stack
+    // exhaustion by a few hundred KiB of 00 00 01 triples.
+    for (;;) {
+        if (*pos >= len) return 0;
+        size_t i = *pos;
+        while (i + 3 <= len && !(buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1)) ++i;
+        if (i + 3 > len) { *pos = len; return 0; }
+        const size_t start = i + 3;
+        size_t end = start;
+        while (end + 3 <= len && !(buf[end] == 0 && buf[end + 1] == 0 &&
+                                   (buf[end + 2] == 1 || buf[end + 2] == 0)))
+            ++end;
+        if (end + 3 > len) end = len;
+        size_t trimmed = end;
+        while (trimmed > start && buf[trimmed - 1] == 0) --trimmed;   /* trailing_zero_8bits */
+        *pos = end;
+        if (trimmed == start) continue;
+        nal->data = buf + start;
+        nal->size = trimmed - start;
+        nal->type = buf[start] & 0x1f;
+        nal->ref_idc = (buf[start] >> 5) & 3;
+        return 1;
+    }
 }
 
 size_t h264_unescape(const uint8_t *src, size_t n, uint8_t *dst, size_t cap) {
@@ -214,7 +221,7 @@ int h264_parse_sps(const uint8_t *nal, size_t size, h264_sps *out) {
     s.constraint_flags = (int)h264_u(&b, 8);
     s.level_idc = (int)h264_u(&b, 8);
     s.id = (int)h264_ue(&b);
-    if (s.id >= H264_MAX_SPS) return -1;
+    if (s.id < 0 || s.id >= H264_MAX_SPS) return -1;
     s.chroma_format_idc = 1;
     s.bit_depth_luma = s.bit_depth_chroma = 8;
     flat_matrix(s.scaling4, s.scaling8);
@@ -231,17 +238,17 @@ int h264_parse_sps(const uint8_t *nal, size_t size, h264_sps *out) {
                                  NULL, NULL);
     }
     s.log2_max_frame_num = (int)h264_ue(&b) + 4;
-    if (s.log2_max_frame_num > 16) return -1;
+    if (s.log2_max_frame_num < 4 || s.log2_max_frame_num > 16) return -1;
     s.poc_type = (int)h264_ue(&b);
     if (s.poc_type == 0) {
         s.log2_max_poc_lsb = (int)h264_ue(&b) + 4;
-        if (s.log2_max_poc_lsb > 16) return -1;
+        if (s.log2_max_poc_lsb < 4 || s.log2_max_poc_lsb > 16) return -1;
     } else if (s.poc_type == 1) {
         s.delta_pic_order_always_zero_flag = (int)h264_u(&b, 1);
         s.offset_for_non_ref_pic = h264_se(&b);
         s.offset_for_top_to_bottom_field = h264_se(&b);
         s.num_ref_frames_in_poc_cycle = (int)h264_ue(&b);
-        if (s.num_ref_frames_in_poc_cycle > 255) return -1;
+        if (s.num_ref_frames_in_poc_cycle < 0 || s.num_ref_frames_in_poc_cycle > 255) return -1;
         for (int i = 0; i < s.num_ref_frames_in_poc_cycle; ++i)
             s.offset_for_ref_frame[i] = h264_se(&b);
     } else if (s.poc_type != 2) {
@@ -267,8 +274,13 @@ int h264_parse_sps(const uint8_t *nal, size_t size, h264_sps *out) {
         s.crop_bottom = (int)h264_ue(&b) * uy;
     }
     if (h264_u(&b, 1)) parse_vui(&b, &s);
-    if (b.err || s.max_num_ref_frames > 16 || s.pic_width_in_mbs > 512 ||
-        s.frame_height_in_mbs > 512)
+    if (b.err || s.max_num_ref_frames < 0 || s.max_num_ref_frames > 16 ||
+        s.pic_width_in_mbs <= 0 || s.pic_width_in_mbs > 512 ||
+        s.pic_height_in_map_units <= 0 || s.frame_height_in_mbs <= 0 ||
+        s.frame_height_in_mbs > 512 || s.width <= 0 || s.height <= 0 ||
+        s.crop_left < 0 || s.crop_right < 0 || s.crop_top < 0 || s.crop_bottom < 0 ||
+        s.crop_left > s.width || s.crop_right > s.width - s.crop_left ||
+        s.crop_top > s.height || s.crop_bottom > s.height - s.crop_top)
         return -1;
     s.valid = 1;
     *out = s;
@@ -285,7 +297,9 @@ int h264_parse_pps(const uint8_t *nal, size_t size, const h264_sps *sps_table, h
     memset(&p, 0, sizeof(p));
     p.id = (int)h264_ue(&b);
     p.sps_id = (int)h264_ue(&b);
-    if (p.id >= H264_MAX_PPS || p.sps_id >= H264_MAX_SPS || !sps_table[p.sps_id].valid) return -1;
+    if (p.id < 0 || p.id >= H264_MAX_PPS || p.sps_id < 0 ||
+        p.sps_id >= H264_MAX_SPS || !sps_table || !sps_table[p.sps_id].valid)
+        return -1;
     const h264_sps *s = &sps_table[p.sps_id];
     p.entropy_coding_mode_flag = (int)h264_u(&b, 1);
     p.bottom_field_pic_order_in_frame_present_flag = (int)h264_u(&b, 1);
@@ -293,7 +307,9 @@ int h264_parse_pps(const uint8_t *nal, size_t size, const h264_sps *sps_table, h
     if (p.num_slice_groups != 1) return -2;   /* FMO (baseline/extended only): unsupported */
     p.num_ref_idx_l0_default_active = (int)h264_ue(&b) + 1;
     p.num_ref_idx_l1_default_active = (int)h264_ue(&b) + 1;
-    if (p.num_ref_idx_l0_default_active > 32 || p.num_ref_idx_l1_default_active > 32) return -1;
+    if (p.num_ref_idx_l0_default_active < 1 || p.num_ref_idx_l0_default_active > 32 ||
+        p.num_ref_idx_l1_default_active < 1 || p.num_ref_idx_l1_default_active > 32)
+        return -1;
     p.weighted_pred_flag = (int)h264_u(&b, 1);
     p.weighted_bipred_idc = (int)h264_u(&b, 2);
     p.pic_init_qp = 26 + h264_se(&b);
@@ -349,6 +365,7 @@ static void skip_pred_weight(h264_bits *b, const h264_slice *sl, int chroma) {
 
 int h264_parse_slice(const uint8_t *nal, size_t size, const h264_sps *sps_table,
                      const h264_pps *pps_table, h264_slice *out) {
+    if (!nal || !size || !sps_table || !pps_table || !out) return -1;
     /* the header fits in the first bytes; bound the unescape work */
     uint8_t rbsp[RBSP_CAP];
     h264_bits b;
@@ -361,7 +378,8 @@ int h264_parse_slice(const uint8_t *nal, size_t size, const h264_sps *sps_table,
     sl.first_mb_in_slice = (int)h264_ue(&b);
     sl.slice_type = (int)(h264_ue(&b) % 5);
     sl.pps_id = (int)h264_ue(&b);
-    if (sl.pps_id >= H264_MAX_PPS || !pps_table[sl.pps_id].valid) return -1;
+    if (sl.first_mb_in_slice < 0 || sl.pps_id < 0 ||
+        sl.pps_id >= H264_MAX_PPS || !pps_table[sl.pps_id].valid) return -1;
     const h264_pps *p = &pps_table[sl.pps_id];
     const h264_sps *s = &sps_table[p->sps_id];
     if (!s->valid) return -1;
@@ -393,7 +411,8 @@ int h264_parse_slice(const uint8_t *nal, size_t size, const h264_sps *sps_table,
             if (st == H264_SLICE_B) sl.num_ref_idx_active[1] = (int)h264_ue(&b) + 1;
         }
     }
-    if (sl.num_ref_idx_active[0] > 32 || sl.num_ref_idx_active[1] > 32) return -1;
+    if (sl.num_ref_idx_active[0] < 1 || sl.num_ref_idx_active[0] > 32 ||
+        sl.num_ref_idx_active[1] < 1 || sl.num_ref_idx_active[1] > 32) return -1;
     if (st != H264_SLICE_I && st != H264_SLICE_SI) skip_ref_list_mod(&b);
     if (st == H264_SLICE_B) skip_ref_list_mod(&b);
     if ((p->weighted_pred_flag && (st == H264_SLICE_P || st == H264_SLICE_SP)) ||
@@ -427,6 +446,7 @@ int h264_parse_slice(const uint8_t *nal, size_t size, const h264_sps *sps_table,
 
 int h264_dpb_frames(const h264_sps *s) {
     int frames;
+    if (!s || s->pic_width_in_mbs <= 0 || s->frame_height_in_mbs <= 0) return 1;
     if (s->bitstream_restriction_flag) {
         frames = s->max_dec_frame_buffering;
     } else {
@@ -445,7 +465,8 @@ int h264_dpb_frames(const h264_sps *s) {
         case 51: case 52: mbs = 184320; break;
         default: mbs = 696320; break;   /* 6.x and unknown: largest */
         }
-        frames = mbs / (s->pic_width_in_mbs * s->frame_height_in_mbs);
+        const int64_t denom = (int64_t)s->pic_width_in_mbs * s->frame_height_in_mbs;
+        frames = denom > 0 ? (int)(mbs / denom) : 1;
     }
     if (frames < s->max_num_ref_frames) frames = s->max_num_ref_frames;
     if (frames < 1) frames = 1;

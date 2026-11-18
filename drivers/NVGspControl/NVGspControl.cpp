@@ -1,15 +1,27 @@
 #include "NVGspControl.hpp"
+#include "NVGPUProfiles.h"
 #include "../NVGspCore/NVGspExec.hpp"
 #include "../NVGspCore/NVGspKernelApi.hpp"
 #include "../NVGspCore/NVGspBooterUnloadBlob.hpp"
+#include "../NVGspCore/NVGspDmaBuffer.hpp"
+#include "../NVGspCore/NVGspSysmemFlush.hpp"
+#include "../NVGspCore/NVGspGmcHs.hpp"
+#include "../NVGspCore/NVGspControlAbi615.hpp"
+#include "../NVGspCore/NVGspLifecycle615.hpp"
+#include "../NVGspCore/NVGspInitQueueReset.hpp"
+#include "../NVGspCore/NVGspDiagnostic615.hpp"
+#include "../NVGspCore/NVGspSmRate615.hpp"
+#include "../NVGspCore/NVGspPramin615.hpp"
+#include "../NVGspCore/NVGspNative615State.hpp"
+#include "../NVGspCore/NVGspUnlock.hpp"
 #include "../NVGspCore/NVGspGrContext.hpp"
-#include "../NVGspCore/NVGspDisplayLut.hpp"
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include <sys/proc.h>
+#include <stdarg.h>
 
 #define super IOService
 OSDefineMetaClassAndStructors(NVGspControl, IOService)
@@ -21,6 +33,11 @@ namespace {
 // their map->release(): sharedBar0Map() hands out a retained reference.
 IOMemoryMap *gBar0Map = nullptr;
 IOPCIDevice *gBar0Pci = nullptr;
+// 0.180.12: a unique non-client owner for objects that could not be unbound
+// or un-presented during close. The user-client pointer may be reused; this
+// tombstone makes the leaked object unreachable by any later client while
+// stop() can still release it.
+const char kLeakedObjectOwner = 0;
 
 IOMemoryMap *sharedBar0Map(IOPCIDevice *pci) {
     if (!pci) return nullptr;
@@ -63,17 +80,31 @@ struct Bar0Io {
     void delay(uint32_t usec) { IODelay(usec); }
 };
 
-bool resetPulse(Bar0Io &io, uint32_t engine, uint32_t hwcfg2) {
+bool resetPulse(Bar0Io &io, uint32_t engine, uint32_t hwcfg2,
+                unsigned iterations = 5000) {
     uint32_t scratch = 0;
     if (!io.write(engine, 1)) return false;
     for (unsigned i = 0; i < 10; ++i) if (!io.read(engine, &scratch)) return false;
     if (!io.write(engine, 0)) return false;
     for (unsigned i = 0; i < 10; ++i) if (!io.read(engine, &scratch)) return false;
-    for (unsigned i = 0; i < 5000; ++i) {
+    for (unsigned i = 0; i < iterations; ++i) {
         if (io.read(hwcfg2, &scratch) && !(scratch & (1U << 12))) return true;
         IODelay(10);
     }
     return false;
+}
+
+// 0.178.40: NV_PBUS_PCI_NV_20 (BAR0+0x1850) bit 0 is the ROM shadow/access
+// enable. The EFI reference sets it before reading the VBIOS at BAR0+0x300000.
+// A PCIe FLR clears it, which made the post-FLR executeBoot fail with
+// exec-vbios-ok=No even after memory decode was restored.
+bool enableRomShadow(Bar0Io &io, UInt32 *beforeOut) {
+    UInt32 before = 0;
+    if (!io.read(0x1850, &before) || before == 0xffffffffU) return false;
+    if (beforeOut) *beforeOut = before;
+    if (!io.write(0x1850, before | 1U)) return false;
+    IODelay(1000);
+    return true;
 }
 
 bool read32(IOMemoryMap *map, IOByteCount offset, UInt32 *value) {
@@ -425,6 +456,44 @@ bool praminWriteWords(IOPCIDevice *pci, UInt64 physicalAddress,
     return true;
 }
 
+// 0.180.11: read `count` dwords at physicalAddress through the same 64 KiB
+// PRAMIN window dance as praminWriteWords. Used to inspect a RAMHT slot
+// before overwriting it; a hand-built write can otherwise clobber a GSP-RM
+// object that happens to hash to the same slot.
+bool praminReadWords(IOPCIDevice *pci, UInt64 physicalAddress,
+                     UInt32 *words, UInt32 count) {
+    if (!pci || !words || !count || (physicalAddress & 3)) return false;
+    while (count) {
+        const UInt64 room = (0x10000ULL - (physicalAddress & 0xffffULL)) / 4;
+        const UInt32 n = static_cast<UInt32>(room < count ? room : count);
+        IOMemoryMap *map = pci ? sharedBar0Map(pci) : nullptr;
+        if (!map || map->getLength() < 0x00710000) {
+            if (map) map->release();
+            return false;
+        }
+        Bar0Io bar0{map};
+        UInt32 windowBefore = 0, observed = 0, restored = 0;
+        bool ok = bar0.read(0x1700, &windowBefore);
+        const UInt32 programmed = (windowBefore & 0xfc000000U) |
+            static_cast<UInt32>((physicalAddress >> 16) & 0x00ffffffU);
+        ok = ok && bar0.write(0x1700, programmed) &&
+            bar0.read(0x1700, &observed) &&
+            ((observed & 0x03ffffffU) == (programmed & 0x03ffffffU));
+        const UInt32 base = 0x00700000 +
+            static_cast<UInt32>(physicalAddress & 0xffffULL);
+        for (UInt32 i = 0; ok && i < n; ++i)
+            ok = bar0.read(base + i * 4, &words[i]);
+        const bool restoreOk = bar0.write(0x1700, windowBefore) &&
+            bar0.read(0x1700, &restored) && restored == windowBefore;
+        map->release();
+        if (!ok || !restoreOk) return false;
+        physicalAddress += UInt64(n) * 4;
+        words += n;
+        count -= n;
+    }
+    return true;
+}
+
 // 0.40.0: read-only GR hang diagnostics under one BAR0 map: VF MMU
 // fault ADDR_LO/HI, INST_LO/HI, INFO, STATUS (0xBB3080..94, tu102/ga102
 // dev_vm.h at FULL_PHYS_OFFSET 0xB80000), PGRAPH status/intr/exception
@@ -567,7 +636,38 @@ void NVGspControl::gspDoorbell(void *ctx) {
     volatile UInt32 *reg = reinterpret_cast<volatile UInt32 *>(
         static_cast<uintptr_t>(self->doorbellMap_->getVirtualAddress()) + 0x110c00);
     OSSynchronizeIO();
-    *reg = 0;
+    // msgq v2: NV_PGSP_QUEUE_HEAD(0) is the monotonic command-queue write
+    // pointer (messages), not a level doorbell.
+    *reg = self->init_.txSequence();
+    OSSynchronizeIO();
+}
+
+UInt32 NVGspControl::gspQueueTail(void *ctx) {
+    auto *self = static_cast<NVGspControl *>(ctx);
+    if (!self || !self->doorbellMap_) return 0;
+    volatile UInt32 *reg = reinterpret_cast<volatile UInt32 *>(
+        static_cast<uintptr_t>(self->doorbellMap_->getVirtualAddress()) + 0x110c04);
+    OSSynchronizeIO();
+    return *reg;
+}
+
+UInt32 NVGspControl::gspStatusHead(void *ctx) {
+    auto *self = static_cast<NVGspControl *>(ctx);
+    if (!self || !self->doorbellMap_) return 0;
+    volatile UInt32 *reg = reinterpret_cast<volatile UInt32 *>(
+        static_cast<uintptr_t>(self->doorbellMap_->getVirtualAddress()) + 0x110c80);
+    OSSynchronizeIO();
+    return *reg;
+}
+
+void NVGspControl::gspStatusTail(void *ctx, UInt32 value) {
+    auto *self = static_cast<NVGspControl *>(ctx);
+    if (!self || !self->doorbellMap_) return;
+    volatile UInt32 *reg = reinterpret_cast<volatile UInt32 *>(
+        static_cast<uintptr_t>(self->doorbellMap_->getVirtualAddress()) + 0x110c84);
+    OSSynchronizeIO();
+    *reg = value;
+    OSSynchronizeIO();
 }
 
 // 0.130.0 / 0.131.0: Resizable BAR done by the kext. macOS IOPCIFamily only
@@ -609,6 +709,33 @@ static UInt32 nvramU32(const char *key) {
         options->release();
     }
     return v;
+}
+
+// 0.179.0: opt-in AD10x tensor-core unlock. Disabled by default: the boot
+// chain runs exactly as before unless NVRAM nvgsp-unlock=1 is present.
+static bool unlockEnabledByNvram() {
+    return nvramU32("nvgsp-unlock") == 1;
+}
+
+// 0.180.1: 1 = PCIe FLR only, 2 = parent-bridge secondary bus reset only.
+// Both skip the forced GSP unload: that unload wedges SEC2/GSP in PriError
+// before the hardware reset, and the cold boot cannot reset the falcon.
+static UInt8 flrModeByNvram() {
+    IORegistryEntry *options = nvramOptions();
+    UInt8 mode = 0;
+    if (options) {
+        OSObject *o = options->getProperty("nvgsp-flr");
+        if (OSData *d = OSDynamicCast(OSData, o)) {
+            if (d->getLength() >= 1)
+                mode = static_cast<UInt8>(
+                    static_cast<const char *>(d->getBytesNoCopy())[0]);
+        } else if (OSString *str = OSDynamicCast(OSString, o)) {
+            const char *cs = str->getCStringNoCopy();
+            if (cs && cs[0]) mode = static_cast<UInt8>(cs[0]);
+        }
+        options->release();
+    }
+    return mode;
 }
 
 // value nullptr = delete; the write is flushed to flash right away (a reset
@@ -689,6 +816,31 @@ bool NVGspControl::ringWrite(UInt64 phys, const UInt32 *words, UInt32 count) {
     if (!p) return praminWriteWords(pci_, phys, words, count);
     for (UInt32 i = 0; i < count; ++i) p[i] = words[i];
     OSSynchronizeIO();
+    return true;
+}
+
+bool NVGspControl::bar1Access(UInt64 phys, UInt32 *words, UInt32 count, bool write) {
+    constexpr UInt64 kWin = 0x200000;
+    const UInt64 base = phys & ~(kWin - 1);
+    if (!bar1Direct_ || !words || !count || (phys & 3) || phys + UInt64(count) * 4 > base + kWin) return false;
+    IODeviceMemory *b1 = bar1Dev();
+    if (!b1 || base + kWin > b1->getLength()) return false;
+    IOMemoryMap *map = nullptr;
+    for (auto &w : vramWin_) if (w.map && w.base == base) { map = w.map; break; }
+    if (!map) {
+        map = b1->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache, base, kWin);
+        if (!map) return false;
+        auto &slot = vramWin_[vramWinNext_++ % 8];
+        if (slot.map) slot.map->release();
+        slot.base = base; slot.map = map;
+    }
+    volatile UInt32 *p = reinterpret_cast<volatile UInt32 *>(map->getVirtualAddress() + (phys - base));
+    if (write) {
+        for (UInt32 i = 0; i < count; ++i) p[i] = words[i];
+        OSSynchronizeIO();
+    } else {
+        for (UInt32 i = 0; i < count; ++i) words[i] = p[i];
+    }
     return true;
 }
 
@@ -920,15 +1072,49 @@ bool NVGspControl::start(IOService *provider) {
     if (!super::start(provider)) return false;
     markBoot("start");
     pci_ = OSDynamicCast(IOPCIDevice, provider);
-    if (!pci_ || pci_->configRead16(kIOPCIConfigVendorID) != 0x10de ||
-        pci_->configRead16(kIOPCIConfigDeviceID) != 0x2704)
+    if (!pci_) return false;
+    const UInt16 gpuVendor = pci_->configRead16(kIOPCIConfigVendorID);
+    const UInt16 gpuDevice = pci_->configRead16(kIOPCIConfigDeviceID);
+    if (gpuVendor != 0x10de) return false;
+    setProperty("NVGspControl-gpu-vendor", gpuVendor, 16);
+    setProperty("NVGspControl-gpu-device", gpuDevice, 16);
+    setProperty("NVGspControl-gpu-family", nvGPUFamilyName(gpuDevice));
+    setProperty("NVGspControl-gpu-marketing", nvGPUDeviceName(gpuDevice));
+    setProperty("NVGspControl-gpu-profile-supported", nvGPUProfileSupported(gpuDevice));
+    if (!nvGPUProfileSupported(gpuDevice)) {
+        IOLog("NVGspControl: NVIDIA %04x:%04x (%s) recognized but has no native "
+              "register/firmware profile in this build; refusing to program AD103 offsets\n",
+              0x10de, gpuDevice, nvGPUDeviceName(gpuDevice));
         return false;
+    }
+    // 0.178.39 diagnostic: can this function do a PCIe FLR? The soft reset
+    // path dies at SEC2 PriError after a GR hang; an FLR is the remaining
+    // hardware-level fallback. Read-only here; no reset is attempted.
+    {
+        UInt8 off = 0;
+        if (pci_->findPCICapability(kIOPCIPCIExpressCapability, &off)) {
+            const UInt32 cap = pci_->configRead32(off + 4);
+            flrCapable_ = (cap & (1U << 28)) != 0;
+            pcieCapOffset_ = off;
+            setProperty("NVGspControl-pcie-flr-capable", flrCapable_);
+            setProperty("NVGspControl-pcie-device-control",
+                        pci_->configRead16(off + 8), 32);
+            setProperty("NVGspControl-pcie-cap-offset", off, 32);
+        } else {
+            flrCapable_ = false;
+            setProperty("NVGspControl-pcie-flr-capable", false);
+        }
+    }
     rebarOkCall_ = thread_call_allocate(&NVGspControl::rebarOkCallout, this);   // 0.131.0
     rebarResize();   // 0.130.0: before anything maps BAR1
     // 0.100.5: GSP command-queue doorbell.
     doorbellMap_ = pci_->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
-    if (doorbellMap_ && doorbellMap_->getLength() > 0x110c04)
+    if (doorbellMap_ && doorbellMap_->getLength() > 0x110c84) {
         init_.setDoorbell(&NVGspControl::gspDoorbell, this);
+        init_.setQueueCallbacks(&NVGspControl::gspQueueTail, this,
+                                &NVGspControl::gspStatusHead, this,
+                                &NVGspControl::gspStatusTail, this);
+    }
     if (doorbellMap_ && doorbellMap_->getLength() >= 0x01000000) {   // 0.117.0
         gBar0Pci = pci_;
         gBar0Map = doorbellMap_;
@@ -979,18 +1165,82 @@ bool NVGspControl::start(IOService *provider) {
     // binds at 64 KiB granularity, VRAM suballocation safe.
     setProperty("NVGspControl-abi", kUserAbi, 32);
     setProperty("NVGspControl-exec-segment-flags", nvgsp::kExecSupportedFlags, 32);
+    // 0.180.0: WindowServer starts on the firmware framebuffer and calls
+    // IOKitWaitQuiet before SkyLight picks a compositor. It used to run at
+    // ~7 s, while NVAccelerator registers only after the GSP chain (~17 s),
+    // so the desktop stayed on the software compositor and every app inherited
+    // it. Hold this service busy until NVAccelerator::start releases it, with
+    // a 60 s cap so a failed bring-up still lets the login window appear.
+    if (nvramU32("nvgsp-boothold") == 1) {
+        bootHold_ = true;
+        adjustBusy(1);
+        setProperty("NVGspControl-boot-hold", "holding");
+        bootHoldCap_ = thread_call_allocate(&NVGspControl::bootHoldCapCallout, this);
+        if (bootHoldCap_) {
+            UInt64 deadline = 0;
+            clock_interval_to_deadline(60, kSecondScale, &deadline);
+            thread_call_enter_delayed(bootHoldCap_, deadline);
+        } else {
+            releaseBootHold("no cap timer");
+        }
+    } else {
+        setProperty("NVGspControl-boot-hold", "off");
+    }
+    // 0.180.141: the native615 framebuffer (contiguous sysmem, 3840x2160x4)
+    // exists before NVDisplay starts; the display path copies it to VRAM.
+    if (displayFbAlloc615())
+        IOLog("NVGspControl: native615 framebuffer ready\n");
     registerService();
     IOLog("NVGspControl: userspace firmware staging service ready\n");
     return true;
 }
 
+void NVGspControl::releaseBootHold(const char *why) {
+    if (!bootHold_) return;
+    bootHold_ = false;
+    adjustBusy(-1);
+    setProperty("NVGspControl-boot-hold", why ? why : "released");
+}
+
+void NVGspControl::bootHoldCapCallout(thread_call_param_t self,
+                                      thread_call_param_t) {
+    auto *s = static_cast<NVGspControl *>(self);
+    if (s && s->bootHold_) s->releaseBootHold("cap");
+}
+
 void NVGspControl::stop(IOService *provider) {
+    if(lock_) {lk(__LINE__);native615Stopping_=true;ulk();}
+    if(displayCopyCall615_) {   // 0.180.138: no copy may run once the buffer is gone
+        if(lock_) {lk(__LINE__);displayCopyOn615_=false;ulk();}
+        thread_call_cancel_wait(displayCopyCall615_);thread_call_free(displayCopyCall615_);displayCopyCall615_=nullptr;
+        if(displayCopyInflight615_)IOSleep(50);   // 0.180.139: let a kicked copy finish reading the buffer
+    }
+    if(displayFb615_) {displayFb615_->complete();displayFb615_->release();displayFb615_=nullptr;}   // 0.180.137
+    if(displayCursorImage615_) {IOFree(displayCursorImage615_,256*256*4);displayCursorImage615_=nullptr;}   // 0.180.143, 169: 256x256
+    // Every native MMIO/RPC operation observes stopping and has a bounded
+    // wait. Keep all state/maps alive until the bootstrap caller has exited.
+    while(native615Busy_)IOSleep(1);
+    releaseBootHold("stop");
+    if (bootHoldCap_) {
+        thread_call_cancel(bootHoldCap_);
+        thread_call_free(bootHoldCap_);
+        bootHoldCap_ = nullptr;
+    }
     if (sleepWakeNotifier_) sleepWakeNotifier_->remove();
     sleepWakeNotifier_ = nullptr;
     if (boostCall_) {
         thread_call_cancel(boostCall_);
         thread_call_free(boostCall_);
         boostCall_ = nullptr;
+    }
+    // 0.180.146: stop the display-port connect poll. The callout re-arms
+    // itself, so cancel plus a short wait for the body before freeing.
+    if (hotplugPollCall_) {
+        hotplugPollStop_ = true;
+        thread_call_cancel(hotplugPollCall_);
+        for (UInt32 ms = 0; hotplugPollActive_ && ms < 2000; ++ms) IOSleep(1);
+        thread_call_free(hotplugPollCall_);
+        hotplugPollCall_ = nullptr;
     }
     if (autoResetCall_) {
         thread_call_cancel(autoResetCall_);
@@ -1012,7 +1262,29 @@ void NVGspControl::stop(IOService *provider) {
         IOFree(dispSave_, 0x10000);
         dispSave_ = nullptr;
     }
+    // Quiesce PCI DMA before releasing the flush page or any firmware mapping.
+    // GSP may read the flush address even without a pending userspace command.
+    if (pci_) {
+        pci_->setBusMasterEnable(false);
+        if (doorbellMap_) {
+            Bar0Io io{doorbellMap_};
+            io.write(nvgsp::kSysmemFlushLo, 0);
+            UInt32 hi = 0;
+            if (io.read(nvgsp::kSysmemFlushHi, &hi))
+                io.write(nvgsp::kSysmemFlushHi, hi & 0xff000000U);
+        }
+    }
+    nativeRpcReplyTarget_=nullptr;nativeRpcReplyCapacity_=0;
+    nativeFaultData_.release();nativeFaultQueue_.release();nativeReplayData_.release();
+    for(auto &u:nativeUserDatas_)u.release();
+    for(auto &row:nativeAllocDatas_)for(auto &a:row)a.release();
+    for(UInt32 k=0;k<kClientSlots615_;++k)releaseWraps615(k);   // 0.180.117
+    if(native615_) { IOFree(native615_,sizeof(*native615_));native615_=nullptr; }
+    for(UInt32 k=0;k<kClientSlots615_;++k)client615Owners_[k]=client615BufferOwners_[k]=nullptr;   // 0.180.92/109/112
+    client615Slot_=0;
+    native615Attempted_=native615Busy_=native615Ready_=false;
     init_.setDoorbell(nullptr, nullptr);
+    init_.setQueueCallbacks(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
     if (gBar0Map == doorbellMap_) {   // 0.117.0: no new users of the cache
         gBar0Map = nullptr;
         gBar0Pci = nullptr;
@@ -1031,6 +1303,9 @@ void NVGspControl::stop(IOService *provider) {
     staged_ = executed_ = false;
     statusSequence_ = 0;
     initDone_ = false;
+    gmcInitReady_ = false;
+    gmcHsResumeDeadline_ = 0;
+    gmcConfig_ = nvgsp::GmcStaticConfig{};
     initResult_ = initPrivateResult_ = ~0U;
     postInitPhase_ = 0;
     internalClient_ = internalDevice_ = internalSubdevice_ = 0;
@@ -1057,6 +1332,7 @@ void NVGspControl::stop(IOService *provider) {
     bar1Finished_ = false;
     bar1Live_ = false;                       // 0.123.0
     grPersistent_ = false;
+    grSelfTestOk_ = false;
     subPbOff_ = subSeq_ = 0;
     scratchOffset_ = 0;
     scratchHuge_ = 0;
@@ -1065,6 +1341,9 @@ void NVGspControl::stop(IOService *provider) {
     arenaDropAllLocked(false);               // 0.111.0: stop frees the contexts
     scratchTry_ = 0;
     scratchRetry_ = false;
+    desktopSurface_ = kDesktopSurface;
+    desktopOffset_ = 0;
+    modeSurfaceHandle_ = 0;
     ceChunk_ = 0;
     ceMapped_ = ceStarted_ = cePersistent_ = false;
     ceToken_ = cePbOff_ = ceSeq_ = 0;
@@ -1091,6 +1370,19 @@ void NVGspControl::stop(IOService *provider) {
     gopSurfaceHashMid_ = 0;
     gopSurfaceHashMidOk_ = false;
     bisectPoll_ = 0;
+    // 0.180.12: release every remaining memory object and the shared-window
+    // wiring on stop. The old path dropped the table and leaked up to 32 x
+    // 2 MiB wired chunks plus the 16 MiB arena pool on every unload/reload.
+    for (UInt32 i = 0; i < kMaxMem; ++i)
+        if (mem_[i].owner) releaseGpuMemLocked(i);
+    for (UInt32 i = 0; i < kShmChunks; ++i) {
+        if (shmChunk_[i]) { shmChunk_[i]->complete(); shmChunk_[i]->release(); shmChunk_[i] = nullptr; }
+    }
+    OSSafeReleaseNULL(shmUser_);
+    OSSafeReleaseNULL(bar1Mem_);
+    OSSafeReleaseNULL(bar3Mem_);
+    arenaPoolPhys_ = 0;
+    sysmemFlush_.release();
     init_.reset();
     booter_.reset();
     gsp_.reset();
@@ -1098,6 +1390,7 @@ void NVGspControl::stop(IOService *provider) {
     for (UInt32 i = 0; i < bar1Wins_; ++i)
         if (bar1Win_[i].map) bar1Win_[i].map->release();
     bar1Wins_ = 0;
+    for (auto &w : vramWin_) { if (w.map) w.map->release(); w.map = nullptr; }   // 0.180.120
     if (bar1Lock_) { IOLockFree(bar1Lock_); bar1Lock_ = nullptr; }
     if (lock_) { IOLockFree(lock_); lock_ = nullptr; }
     super::stop(provider);
@@ -1105,6 +1398,31 @@ void NVGspControl::stop(IOService *provider) {
 
 IOReturn NVGspControl::executeBoot() {
     if (!pci_ || !staged_ || executed_) return kIOReturnNotReady;
+    // msgq v2: re-publish the command queue head (pre-queued GMCAPI init)
+    // right before the GSP starts, after any delay while the userspace loader
+    // committed the package.
+    init_.publishTxHead();
+    const bool unlockOn = unlockEnabledByNvram();
+    setProperty("NVGspControl-unlock-enabled", unlockOn);
+    if (unlockOn && unlockFatal_) {
+        // A previous V67 launch failed without a verified FLR. Do not replay
+        // the exploit on a retry; the operator must clear nvgsp-unlock and
+        // reboot/power-cycle.
+        setProperty("NVGspControl-unlock-abort", true);
+        return kIOReturnNotReady;
+    }
+    if (unlockOn && !unlockDone_) {
+        const bool unlockOk = executeUnlock();
+        unlockDone_ = unlockOk;
+        setProperty("NVGspControl-unlock-ok", unlockOk);
+        if (!unlockOk && unlockFatal_) {
+            // The V67 chain ran but did not reach a verified FLR. Continuing
+            // into FWSEC with an unknown WPR2 state is worse than failing
+            // this boot; disable NVRAM nvgsp-unlock and reboot.
+            setProperty("NVGspControl-unlock-abort", true);
+            return kIOReturnNotReady;
+        }
+    }
     markBoot("gsp-boot");
     IODeviceMemory *bar0 = pci_->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
     IOMemoryMap *map = bar0 ? bar0->map() : nullptr;
@@ -1113,6 +1431,10 @@ IOReturn NVGspControl::executeBoot() {
         return kIOReturnNoResources;
     }
     Bar0Io io{map};
+    UInt32 romShadow = 0;
+    const bool romShadowOk = enableRomShadow(io, &romShadow);
+    setProperty("NVGspControl-exec-rom-shadow", romShadow | 1U, 32);
+    setProperty("NVGspControl-exec-rom-shadow-ok", romShadowOk);
     UInt8 *rom = static_cast<UInt8 *>(IOMalloc(kPromBytes));
     if (!rom) { map->release(); return kIOReturnNoMemory; }
     bool romRead = true;
@@ -1124,8 +1446,13 @@ IOReturn NVGspControl::executeBoot() {
     nvgsp::VbiosFwsecView vbios{};
     UInt32 gspFuse = 0, boot0 = 0;
     const bool vbiosOk = romRead && nvgsp::parseVbiosFwsec(rom, kPromBytes, &vbios);
-    const bool identityOk = io.read(kBoot0, &boot0) &&
-        io.read(kGspUcode9Fuse, &gspFuse);
+    const bool boot0Ok = io.read(kBoot0, &boot0);
+    const bool fuseOk = io.read(kGspUcode9Fuse, &gspFuse);
+    const bool identityOk = boot0Ok && fuseOk;
+    setProperty("NVGspControl-exec-rom-read", romRead);
+    setProperty("NVGspControl-exec-boot0-ok", boot0Ok);
+    setProperty("NVGspControl-exec-fuse-ok", fuseOk);
+    setProperty("NVGspControl-exec-identity-ok", identityOk);
     const nvgsp::WprMeta *meta = gsp_.metadata();
     // 0.99.1: fresh WPR metadata for every boot (S3 re-boot saw the first
     // boot's verified/bootCount and the GSP RISC-V halted, mbox0 0x80000000).
@@ -1143,13 +1470,25 @@ IOReturn NVGspControl::executeBoot() {
     // Stage the final prerequisite before the first register write. If this
     // allocation fails the running GOP state remains untouched.
     nvgsp::FwsecStaging fwsec;
-    const bool fwsecStage = busMaster &&
+    const bool flushPage = (sysmemFlush_.size() || sysmemFlush_.allocate(4096, true)) &&
+        sysmemFlush_.syncToDevice();
+    const bool fwsecStage = busMaster && flushPage &&
         fwsec.stage(vbios.fwsec, gspFuse & 0xff, meta->frtsOffset,
                     nullptr, vbios.dmaImageSize);
 
     // NVIDIA normal boot: reset GSP into Falcon, execute board FWSEC/FRTS,
     // reset GSP into RISC-V, program LibOS args, then run SEC2 Booter Load.
-    const bool gspFalconReset = fwsecStage &&
+    // CPU RM must provide this before FWSEC/GSP initialization. GSP's
+    // kmemsysStatePreLoad checks the address and returns INVALID_STATE if
+    // both address fields are zero; firmware does not allocate this page.
+    uint32_t flushLo = 0, flushHi = 0;
+    const bool flushOk = fwsecStage && nvgsp::programSysmemFlush(
+        io, sysmemFlush_.busAddress(), &flushLo, &flushHi);
+    setProperty("NVGspControl-sysmem-flush-bus", sysmemFlush_.busAddress(), 64);
+    setProperty("NVGspControl-sysmem-flush-lo", flushLo, 32);
+    setProperty("NVGspControl-sysmem-flush-hi", flushHi, 32);
+    setProperty("NVGspControl-sysmem-flush-ok", flushOk);
+    const bool gspFalconReset = flushOk &&
         resetPulse(io, 0x001103c0, 0x001100f4) &&
         io.write(0x00111668, 0) &&
         nvgsp::falconPoll(io, 0x00111668, 1, 1, 200000, 10) &&
@@ -1188,10 +1527,16 @@ IOReturn NVGspControl::executeBoot() {
         booter_.layout()
     };
     nvgsp::BooterExecutionResult booterResult{};
+    uint32_t booterStage = 0;
     const bool booterOk = sec2Reset && nvgsp::executeBooterLoad(
         io, booterView, booter_.busAddress(), booter_.imageSize(),
         bootMailboxOverride_ ? bootMailboxOverride_ : gsp_.metadataBusAddress(),
-        &booterResult);
+        &booterResult, &booterStage);
+    // Preserve the actual halted/running state on failure too; a zeroed
+    // result previously hid partial DMA and the last bootloader stage.
+    io.read(nvgsp::sec2::kCpuCtl, &booterResult.cpuCtl);
+    io.read(nvgsp::sec2::kMailbox0, &booterResult.mailbox0);
+    io.read(nvgsp::sec2::kMailbox1, &booterResult.mailbox1);
     const bool osVersionOk = booterOk &&
         io.write(nvgsp::falcon::kBase + 0x80, gsp_.appVersion());
     uint32_t riscvCpuCtl = 0;
@@ -1220,10 +1565,13 @@ IOReturn NVGspControl::executeBoot() {
     setProperty("NVGspControl-exec-sec2-dmacmd", sec2DmaCommand, 32);
     setProperty("NVGspControl-exec-sec2-rm", sec2Rm, 32);
     setProperty("NVGspControl-exec-booter-ok", booterOk);
+    setProperty("NVGspControl-exec-booter-stage", booterStage, 32);
+    setProperty("NVGspControl-exec-booter-cpuctl", booterResult.cpuCtl, 32);
     setProperty("NVGspControl-exec-gsp-active", gspActive);
     setProperty("NVGspControl-exec-fwsec-dma", fwsecResult.dmaTransfers, 32);
     setProperty("NVGspControl-exec-booter-dma", booterResult.dmaTransfers, 32);
     setProperty("NVGspControl-exec-sec2-mailbox0", booterResult.mailbox0, 32);
+    setProperty("NVGspControl-exec-sec2-mailbox1", booterResult.mailbox1, 32);
     setProperty("NVGspControl-exec-riscv-cpuctl", riscvCpuCtl, 32);
     setProperty("NVGspControl-executed", executed_);
     // 0.9.4: mid-point GOP hash (end of executeBoot, before any --status
@@ -1748,7 +2096,11 @@ IOReturn NVGspControl::pingGsp(UInt64 *nsOut, UInt64 *viaIntrOut) {
         IOSleep(1);
         lk(__LINE__);
     }
+    // 0.180.12: a timeout must release the RPC slot. The old code returned
+    // Timeout while pingOutstanding_ stayed set, permanently blocking every
+    // later RPC/reset/S3 path through waitRpcSlotLocked().
     const bool done = !pingOutstanding_;
+    pingOutstanding_ = false;
     UInt64 ns = 0;
     if (done) absolutetime_to_nanoseconds(pingDoneAt_ - pingSentAt_, &ns);
     ++pings_;
@@ -1780,9 +2132,50 @@ IOReturn NVGspControl::pingGsp(UInt64 *nsOut, UInt64 *viaIntrOut) {
 // callPlatformFunction("nvgsp-vblank-register", false, fn, ref, 0, 0) where
 // fn is void (*)(void *ref, UInt32 count, UInt64 uptimeAbs), called from the
 // MSI workloop on every head-0 vblank. "nvgsp-vblank-unregister" removes it.
+// 0.180.179: admin-only runtime flags (gone on reboot): NVGspControl-cilp-request
+IOReturn NVGspControl::setProperties(OSObject *properties) {
+    auto *d = OSDynamicCast(OSDictionary, properties);
+    auto *n = d ? OSDynamicCast(OSNumber, d->getObject("NVGspControl-cilp-request")) : nullptr;
+    if (!n || !lock_) return kIOReturnUnsupported;
+    if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+        return kIOReturnNotPrivileged;
+    cilpRequest_ = n->unsigned32BitValue() != 0;
+    lk(__LINE__); setProperty("NVGspControl-cilp-request", cilpRequest_); ulk();
+    return kIOReturnSuccess;
+}
+
 IOReturn NVGspControl::callPlatformFunction(const OSSymbol *name, bool wait,
                                             void *p1, void *p2, void *p3,
                                             void *p4) {
+    // 0.180.0: NVAccelerator::start has registered its IOAccelerator; let
+    // WindowServer's IOKitWaitQuiet return so SkyLight starts with it.
+    if (name && name->isEqualTo("nvgsp-boot-hold-release")) {
+        releaseBootHold("accelerator started");
+        return kIOReturnSuccess;
+    }
+    // 0.180.13: the pitched 256x256 cursor surface is fixed; a successful
+    // cursorSetup() is the real capability gate. `nvgsp-cursor=1` remains an
+    // explicit override for diagnostic boots.
+    // 0.180.141: on the native615 display the cursor is head 0's hardware
+    // cursor brought up by the display transport (op 10 registers it).
+    // 0.180.143: also before op 10 once the native615 framebuffer exists
+    // (NVDisplay probes at start; WindowServer asks only at display setup)
+    if (name && (displayNative615_ || displayFb615_)) {
+        if (name->isEqualTo("nvgsp-cursor-probe")) return displayCursor615(0, p1, p2);
+        if (name->isEqualTo("nvgsp-cursor-image")) return displayCursor615(1, p1, p2);
+        if (name->isEqualTo("nvgsp-cursor-move")) return displayCursor615(2, p1, p2);
+        if (name->isEqualTo("nvgsp-cursor-show")) return displayCursor615(3, p1, p2);
+    }
+    if (name && (name->isEqualTo("nvgsp-cursor-image") || name->isEqualTo("nvgsp-cursor-move") ||
+                 name->isEqualTo("nvgsp-cursor-show"))) {
+        if (nvramU32("nvgsp-cursor") != 1 && !cursorReady_) {
+            setProperty("NVGspControl-cursor-enabled", false);
+            return kIOReturnNotReady;
+        }
+        setProperty("NVGspControl-cursor-enabled", true);
+    }
+    if (name && name->isEqualTo("nvgsp-cursor-probe"))
+        return cursorSetup();
     // 0.84.0: hardware cursor API for NVDisplay.
     if (name && name->isEqualTo("nvgsp-cursor-image"))
         return cursorImage(static_cast<const UInt32 *>(p1),
@@ -1795,6 +2188,25 @@ IOReturn NVGspControl::callPlatformFunction(const OSSymbol *name, bool wait,
         return cursorShow(p1 != nullptr);
     if (name && name->isEqualTo("nvgsp-dpms"))
         return dpSetPower(p1 != nullptr);
+    // 0.180.11: NVDisplay's gamma table: p1 = 3 x count 16-bit entries
+    // (R plane, G plane, B plane), p2 = count.
+    if (name && name->isEqualTo("nvgsp-gamma-set"))
+        return gammaSet(static_cast<const UInt16 *>(p1),
+                        static_cast<UInt32>(reinterpret_cast<uintptr_t>(p2)));
+    // 0.180.13: p1 = UInt32[2] {readback verified, mismatched dwords}.
+    if (name && name->isEqualTo("nvgsp-gamma-status")) {
+        if (!p1) return kIOReturnBadArgument;
+        UInt32 *out = static_cast<UInt32 *>(p1);
+        UInt32 verified = 0, mismatch = 0;
+        // 0.180.153: -gamma-verified is an OSBoolean; the OSNumber cast always
+        // failed, so NVDisplay-gamma-verified read No on a verified LUT.
+        if (OSBoolean *v = OSDynamicCast(OSBoolean, getProperty("NVGspControl-gamma-verified")))
+            verified = v->isTrue();
+        if (OSNumber *n = OSDynamicCast(OSNumber, getProperty("NVGspControl-gamma-readback-mismatch")))
+            mismatch = n->unsigned32BitValue();
+        out[0] = verified; out[1] = mismatch;
+        return kIOReturnSuccess;
+    }
     // 0.143.0 (M28): p1 = SInt32 *milli-degrees C. GPU temperature from the
     // thermal sensor at 0x020460 (nouveau gp100_temp_get): bits 16:3 are
     // degrees in 1/256 steps; bit 29 = valid, bit 30 = shadowed copy (what
@@ -1869,16 +2281,28 @@ IOReturn NVGspControl::callPlatformFunction(const OSSymbol *name, bool wait,
         if (ks->stampVa && (ks->stampVa < region || ks->stampVa + 4 > region + kStampBytes))
             return kIOReturnBadArgument;
         return submitSegments(ks->owner, ks->engine, ks->va, ks->dwords, ks->flags, ks->n,
-                              &ks->seqOut, ks->stampVa, ks->stampValue);
+                              &ks->seqOut, ks->stampVa, ks->stampValue, true);
     }
     // 0.159.0: PGRAPH status for utilization sampling (Activity Monitor):
     // *p1 = NV_PGRAPH_STATUS (bit 0 busy). A plain BAR0 read, no lock.
+    // 0.180.144: also on the native615 runtime (GR is GSP-RM's there, the
+    // status register still reads through BAR0; a privilege-blocked 0xbadf
+    // read counts as not ready). NVAccelerator samples this at 100 Hz, so
+    // about once a second it also refreshes the VRAM in use for its
+    // PerformanceStatistics (Activity Monitor, OpenGL Driver Monitor).
     if (name && name->isEqualTo("nvgsp-gr-busy")) {
         UInt32 *out = static_cast<UInt32 *>(p1);
-        if (!out || !pci_ || !grPersistent_) return kIOReturnNotReady;
+        const bool native = native615_ && native615Ready_ && !native615Stopping_;
+        if (!out || !pci_ || (!grPersistent_ && !native)) return kIOReturnNotReady;
         IOMemoryMap *m = sharedBar0Map(pci_);
-        const bool ok = m && m->getLength() >= 0x400704 && Bar0Io{m}.read(0x400700, out);
+        bool ok = m && m->getLength() >= 0x400704 && Bar0Io{m}.read(0x400700, out);
         if (m) m->release();
+        if (ok && native && (*out >> 16) == 0xbadf) return kIOReturnNotReady;
+        if (native && lock_ && !(++grBusySamples615_ % 100)) {
+            lk(__LINE__);
+            setProperty("NVGspControl-mem-vram-bytes", vramInUseLocked(), 64);
+            ulk();
+        }
         return ok ? kIOReturnSuccess : kIOReturnIOError;
     }
     // 0.167.0: "nvgsp-ring-progress" p1 = UInt32[4] out {GR submitted, GR
@@ -1902,12 +2326,31 @@ IOReturn NVGspControl::callPlatformFunction(const OSSymbol *name, bool wait,
         ulk();
         return ok ? kIOReturnSuccess : kIOReturnNotReady;
     }
+    if (name && name->isEqualTo("nvgsp-pipe-present")) {          // 0.180.170
+        if (!lock_) return kIOReturnNotReady;
+        lk(__LINE__);
+        pipePresentAt615_ = mach_absolute_time();
+        ++pipePresents615_;
+        pipeEverPresented615_ = true;
+        setProperty("NVGspControl-pipe-presents", pipePresents615_, 32);
+        ulk();
+        return kIOReturnSuccess;
+    }
     if (name && name->isEqualTo("nvgsp-flip-copy"))                // 0.154.0
         return flipCopy(static_cast<NVGspFlipCopy *>(p1));
     if (name && name->isEqualTo("nvgsp-hotplug-register")) {
         hotplugFn_ = reinterpret_cast<HotplugFn>(p1);
         hotplugRef_ = p2;
-        return armHotplug();
+        // 0.180.146: registration means "call me when the display set changes".
+        // The GSP event client cannot be allocated at the native615 phase-27
+        // runtime (0xffffffff), so the connect poll is the live path; report
+        // success when either one is working, otherwise NVDisplay retried 602
+        // times and never learned about the poll.
+        const IOReturn armed = armHotplug();
+        startHotplugPoll();
+        setProperty("NVGspControl-hotplug-register-arm", UInt32(armed), 32);
+        setProperty("NVGspControl-hotplug-register-poll", hotplugPollCall_ != nullptr);
+        return (armed == kIOReturnSuccess || hotplugPollCall_) ? kIOReturnSuccess : armed;
     }
     // 0.173.0: "nvgsp-reset-register" p1 = ResetDoneFn(void *ref), p2 = ref
     // (p1 null: unregister p2). Called after a GPU reset (or S3 re-boot) brought
@@ -1974,32 +2417,26 @@ IOReturn NVGspControl::peekBar0(UInt32 offset, UInt32 count, UInt32 *out) {
     return ret;
 }
 
-IOReturn NVGspControl::vramAccess(UInt64 offset, UInt32 *words, UInt32 count, bool write) {
+IOReturn NVGspControl::vramAccess(UInt64 offset, UInt32 *words, UInt32 count, bool write,
+                                bool nativeRuntime) {
     // 0.81.0: VRAM read/write through the PRAMIN window under lock_ (the
     // window at BAR0 0x1700 is shared with every in-kernel PRAMIN user).
     if (!lock_ || !pci_ || !words || !count || count > 1024 || (offset & 3))
         return kIOReturnBadArgument;
     lk(__LINE__);
+    if(native615Attempted_ && !nativeRuntime) {ulk();return kIOReturnBusy;}
+    if(nativeRuntime && (native615Stopping_ || sleeping_ || resetBusy_ || gmcMmuFaultPending_)) {
+        ulk();return kIOReturnOffline;
+    }
     bool ok = true;
+    // 0.180.121: not through BAR1 (0.180.120 broke bootstrap stage 3 with an
+    // I/O error: after GSP boot BAR1 is not an identity view of all of VRAM)
     if (write) {
         ok = praminWriteWords(pci_, offset, words, count);
     } else {
-        // The public DWORD ABI allows offset&7 == 4; PTE access does not.
-        // Consume that leading high DWORD, then read aligned pairs.
-        UInt32 i = 0;
-        if (offset & 4) {
-            UInt64 v = 0;
-            PraminPteResult r{};
-            ok = praminPteAccess(pci_, offset - 4, &v, false, false, &r);
-            if (ok) words[i++] = static_cast<UInt32>(v >> 32);
-        }
-        for (; ok && i < count; i += 2) {
-            UInt64 v = 0;
-            PraminPteResult r{};
-            ok = praminPteAccess(pci_, offset + i * 4, &v, false, false, &r);
-            words[i] = static_cast<UInt32>(v);
-            if (i + 1 < count) words[i + 1] = static_cast<UInt32>(v >> 32);
-        }
+        // 0.180.119: one window move per 64 KiB instead of a full PTE-access
+        // round trip (window set/check/restore) per 8 bytes
+        ok = praminReadWords(pci_, offset, words, count);
     }
     ulk();
     return ok ? kIOReturnSuccess : kIOReturnIOError;
@@ -2025,29 +2462,127 @@ IOReturn NVGspControl::pokeBar0(UInt32 offset, UInt32 value) {
 
 // Dedicated admin probe ABI: resolve the reserved channel token through RM.
 // No arbitrary MMIO offset, production channel or caller token is accepted.
-IOReturn NVGspControl::diagnosticChannelKick(UInt32 handle) {
-    if (handle != 0xc0e9006f) return kIOReturnBadArgument;
-    const UInt32 generation = resetGeneration();
-    UInt32 req[7] = {0xc0d00001, handle, 0xc36f0108, 0, 4, 0, 0};
-    UInt8 reply[112]{};
-    UInt32 bytes = sizeof(reply), result = ~0U, status = ~0U, token = 0;
-    const IOReturn rpc = userRpc(76, reinterpret_cast<const UInt8 *>(req), sizeof(req), reply, &bytes, &result);
-    if (rpc != kIOReturnSuccess) return rpc;
-    if (bytes >= 108) {
-        __builtin_memcpy(&status, reply + 92, 4);
-        __builtin_memcpy(&token, reply + 104, 4);
+IOReturn NVGspControl::diagnosticVramReserve(UInt64 requested, UInt64 *offset,
+                                            UInt64 *reserved, UInt64 *generation,
+                                            bool nativeRuntime) {
+    if(!lock_ || !offset || !reserved || !generation)return kIOReturnBadArgument;
+    lk(__LINE__);
+    if(native615Attempted_ && !nativeRuntime) {ulk();return kIOReturnBusy;}
+    if(!gmcInitReady_ || postInitPhase_!=27 || gmcMmuFaultPending_ ||
+       userRpcLatePending_ || userRpcOutstanding_ || resetBusy_ || sleeping_) {
+        ulk();return kIOReturnNotReady;
     }
-    if (result || status || !token || (token & 0xffff) != 9)
+    UInt64 bytes=0,start=0,end=0,at=0;
+    if(!nvgsp::diagnosticVramSize615(requested,diagnosticVramBytes_,diagnosticVramSlots_,&bytes)) {
+        ulk();return kIOReturnBadArgument;
+    }
+    if(!nvgsp::diagnosticVramBounds615(gmcConfig_,&start,&end)) {
+        ulk();return kIOReturnNotReady;
+    }
+    if(!vramHeap_.fit(start,end,bytes,&at) || (at&(nvgsp::kDiagnosticVramAlignment615-1)) ||
+       at<start || at>end || bytes>end-at || !vramHeap_.insert(at,bytes)) {
+        ulk();return kIOReturnNoMemory;
+    }
+    // This reservation is deliberately not a client GpuMem. Closing the short
+    // diagnostic connection must never release backing referenced by GR/PTEs.
+    // No raw address is accepted and no production channel or BAR1 is touched.
+    diagnosticVramBytes_+=bytes;++diagnosticVramSlots_;
+    *offset=at;*reserved=bytes;*generation=resetGeneration();
+    setProperty("NVGspControl-diag-vram-reserved-bytes",diagnosticVramBytes_,64);
+    setProperty("NVGspControl-diag-vram-reserved-slots",diagnosticVramSlots_,32);
+    setProperty("NVGspControl-diag-vram-last-offset",at,64);
+    setProperty("NVGspControl-diag-vram-last-bytes",bytes,64);
+    setProperty("NVGspControl-diag-vram-range-base",start,64);
+    setProperty("NVGspControl-diag-vram-range-end",end,64);
+    setProperty("NVGspControl-diag-vram-lifetime","GPU epoch; cold guest stop required");
+    ulk();return kIOReturnSuccess;
+}
+
+IOReturn NVGspControl::diagnosticChannelKick(UInt32 handle, bool nativeRuntime) {
+    if (!lock_ || !pci_) return kIOReturnBadArgument;
+    lk(__LINE__);
+    const bool ownedProbe=nativeRuntime && native615Busy_ && native615_ &&
+        native615_->isolation.attempted &&
+        (handle==native615_->isolation.channels[0].channel ||
+         handle==native615_->isolation.channels[1].channel) &&
+        (handle==0xc0d00156 || handle==0xc0d00256);
+    const bool clientGr=nativeRuntime && native615Busy_ && native615_ &&
+        ((native615_->clientGrs[client615Slot_].attempted && ((native615_->clientGrs[client615Slot_].scheduled &&
+          handle==(0xc0d00356U|client615Slot_<<16)) ||
+        (native615_->clientGrs[client615Slot_].cancelChannel && handle==0xc0d00456))) ||
+        (native615_->mmu.live && handle==0xc0d00556));
+    if(!nvgsp::diagnosticKickHandle615(handle) && !ownedProbe && !clientGr) {ulk();return kIOReturnBadArgument;}
+    if(native615Attempted_ && !nativeRuntime) {ulk();return kIOReturnBusy;}
+    const UInt32 generation = resetGeneration();
+    const bool paused = postInitPhase_ == 27 && gmcInitReady_;
+    const bool ready = !gmcMmuFaultPending_ && (paused || postInitPhase_ == 33);
+    // 0.180.130: an owned client's work-submit token was fetched when its
+    // channel was made and never changes; asking GSP again (an RPC) was ~5 ms
+    // of every Metal submission
+    UInt32 cachedToken = 0;
+    if (clientGr && handle == (0xc0d00356U | client615Slot_ << 16) && native615_->clientGrs[client615Slot_].scheduled)
+        cachedToken = native615_->clientGrs[client615Slot_].token;
+    // 0.180.162: the maintenance channel (TLB invalidates for every IOSurface
+    // wrap/unwrap, the display framebuffer copy, VRAM zeroing) asked GSP for
+    // its token on every kick: one ~5 ms RPC per wrap (wrap 11.5 ms, of it
+    // 4.6 ms "TLB") and per display frame. Same cache, keyed by the channel's
+    // instance and the reset generation.
+    const bool mmuKick = clientGr && handle == 0xc0d00556 && native615_->mmu.live;
+    if (!cachedToken && mmuKick && mmuKickToken615_ && mmuKickGeneration615_ == generation &&
+        mmuKickInstance615_ == native615_->mmu.instance)
+        cachedToken = mmuKickToken615_;
+    const UInt64 mmuInstance = mmuKick ? native615_->mmu.instance : 0;
+    ulk();
+    if (!ready) return kIOReturnNotReady;
+    if (cachedToken) {
+        lk(__LINE__);
+        IOReturn ret = kIOReturnOffline;
+        if (!resetBusy_ && !sleeping_ && !gmcMmuFaultPending_ && generation == resetGeneration() &&
+            paused && postInitPhase_ == 27 && gmcInitReady_) {
+            IOMemoryMap *map = sharedBar0Map(pci_);
+            ret = kIOReturnNoMemory;
+            if (map && map->getLength() >= 0x00BB0094) {
+                Bar0Io bar0{map};
+                ret = bar0.write(0x00BB0090, cachedToken) ? kIOReturnSuccess : kIOReturnIOError;
+            }
+            if (map) map->release();
+        }
+        ulk();
+        return ret;
+    }
+    constexpr UInt32 client = nvgsp::kLifecycleClient615, command = 0xc36f0108;
+    UInt8 req[sizeof(nvgsp::ControlHeader615)+4]{};
+    if (!nvgsp::buildControl615(req,sizeof(req),client,handle,command,4)) return kIOReturnBadArgument;
+    UInt8 reply[100]{};
+    UInt32 bytes = sizeof(reply), result = ~0U;
+    const IOReturn rpc = paused ? userRpcImpl(76,req,sizeof(req),reply,&bytes,&result,true,nativeRuntime)
+                               : userRpc(76,req,sizeof(req),reply,&bytes,&result);
+    if (rpc != kIOReturnSuccess) return rpc;
+    nvgsp::ControlReply615 decoded{};
+    if (result || bytes!=sizeof(reply) ||
+        !nvgsp::decodeControlReply615(reply,bytes,client,handle,command,4,decoded) ||
+        !decoded.successful())
         return kIOReturnNotReady;
+    // Work-submit tokens are opaque. Never reinterpret them as physical ChIDs.
+    const UInt32 token = nvgsp::control615U32(decoded.params);
     lk(__LINE__);
     IOReturn ret = kIOReturnOffline;
-    if (!resetBusy_ && generation == resetGeneration()) {
+    if (!resetBusy_ && !sleeping_ && !gmcMmuFaultPending_ && generation == resetGeneration() &&
+        (postInitPhase_ == 33 || (paused && postInitPhase_ == 27 && gmcInitReady_))) {
         IOMemoryMap *map = sharedBar0Map(pci_);
         ret = kIOReturnNoMemory;
         if (map && map->getLength() >= 0x00BB0094) {
             Bar0Io bar0{map};
+            // TU102+ baremetal: FULL_PHYS_OFFSET(B80000) + VF(30000) +
+            // NVC361_NOTIFY_CHANNEL_PENDING(90). Primary kern_gpu_tu102.c.
             ret = bar0.write(0x00BB0090, token) ? kIOReturnSuccess : kIOReturnIOError;
-            if (ret == kIOReturnSuccess) setProperty("NVGspControl-probe-channel-token", token, 32);
+            if (ret == kIOReturnSuccess) {
+                setProperty("NVGspControl-probe-channel-token", token, 32);
+                setProperty("NVGspControl-probe-channel-handle", handle, 32);
+                if (mmuInstance && token) {   // 0.180.162
+                    mmuKickToken615_ = token; mmuKickGeneration615_ = generation; mmuKickInstance615_ = mmuInstance;
+                }
+            }
         }
         if (map) map->release();
     }
@@ -2108,10 +2643,17 @@ void NVGspControl::markBoot(const char *tag) {
     setProperty("NVGspControl-boot-timeline", bootTl_);
 }
 
-bool NVGspControl::waitRpcSlotLocked(UInt32 ms) {
+bool NVGspControl::waitRpcSlotLocked(UInt32 ms, bool diagnostic) {
     for (UInt32 t = 0;; ++t) {
-        if (postInitPhase_ != 33 || sleeping_) return false;
-        if (!userRpcActive_ && !userRpcOutstanding_ && !pingOutstanding_) return true;
+        const bool diagnosticReady = diagnostic && gmcInitReady_ && postInitPhase_ == 27;
+        if ((postInitPhase_ != 33 && !diagnosticReady) || sleeping_) return false;
+        if (userRpcLatePending_ && userRpcLateGeneration_!=gpuResets_) {
+            userRpcLatePending_=false;
+            setProperty("NVGspControl-user-rpc-late-cancelled-by-reset",true);
+            setProperty("NVGspControl-user-rpc-late-pending",false);
+        }
+        if (userRpcLatePending_) pollStatusLocked();
+        if (!userRpcActive_ && !userRpcOutstanding_ && !pingOutstanding_ && !userRpcLatePending_) return true;
         if (t >= ms) return false;
         ulk();
         IOSleep(1);
@@ -2121,11 +2663,53 @@ bool NVGspControl::waitRpcSlotLocked(UInt32 ms) {
 
 IOReturn NVGspControl::userRpc(UInt32 function, const UInt8 *params, UInt32 bytes,
                                UInt8 *reply, UInt32 *replyBytes, UInt32 *rpcResult) {
-    if (!lock_ || !params || bytes > 3900 || !reply || !replyBytes) return kIOReturnBadArgument;
+    return userRpcImpl(function, params, bytes, reply, replyBytes, rpcResult, false);
+}
+
+IOReturn NVGspControl::diagnosticRpc(UInt32 function, const UInt8 *params, UInt32 bytes,
+                                   UInt8 *reply, UInt32 *replyBytes, UInt32 *rpcResult) {
+    return userRpcImpl(function, params, bytes, reply, replyBytes, rpcResult, true);
+}
+
+IOReturn NVGspControl::userRpcImpl(UInt32 function, const UInt8 *params, UInt32 bytes,
+                                 UInt8 *reply, UInt32 *replyBytes, UInt32 *rpcResult,
+                                 bool diagnostic, bool nativeRuntime) {
+    if (!replyBytes) return kIOReturnBadArgument;
+    const UInt32 capacity = *replyBytes;
+    *replyBytes = 0;
+    if (rpcResult) *rpcResult = ~0U;
+    if (!lock_ || !params || !reply || !capacity) return kIOReturnBadArgument;
+    const bool nativeFaultLarge=nativeRuntime && native615_ &&
+        params==native615_->faultRequest && reply==native615_->faultReply &&
+        capacity==sizeof(native615_->faultReply) &&
+        nvgsp::nativeShadowFaultRequest615(function,params,bytes);
+    if(bytes>3900 && !nativeFaultLarge)return kIOReturnBadArgument;
     lk(__LINE__);
-    if (!waitRpcSlotLocked(6000)) {
+    if(native615Attempted_ && !nativeRuntime) {ulk();return kIOReturnBusy;}
+    if (!waitRpcSlotLocked(6000, diagnostic)) {
         ulk();
         return kIOReturnBusy;
+    }
+    if((native615Attempted_ && !nativeRuntime) || (nativeRuntime && native615Stopping_)) {
+        ulk();return kIOReturnBusy;
+    }
+    if (postInitPhase_ == 27) {
+        auto *classes = OSDynamicCast(OSData, getProperty("NVGspControl-class-list"));
+        if (!diagnostic || !gmcInitReady_ || !classes ||
+            !(nativeFaultLarge || nvgsp::diagnosticRequest615(function, params, bytes,
+                classes->getBytesNoCopy(), classes->getLength()) ||
+              // 0.180.136: displayTransport615 op 5 on the internal subdevice
+              (function==76 && displayInternalCmd615_ && bytes>=40 && internalClient_ &&
+               nvgsp::control615U32(params)==internalClient_ &&
+               nvgsp::control615U32(params+4)==internalSubdevice_ &&
+               nvgsp::control615U32(params+8)==displayInternalCmd615_))) {
+            ulk();
+            return kIOReturnBadArgument;
+        }
+        setProperty("NVGspControl-diagnostic-rpc-stage", postInitPhase_, 32);
+        if (gmcMmuFaultPending_ && function==103) {
+            ulk();return kIOReturnNotReady;
+        }
     }
     // The interrupt/poll thread clears outstanding when the reply arrives.
     // Keep ownership until this caller copies it: another sleeping caller
@@ -2134,33 +2718,51 @@ IOReturn NVGspControl::userRpc(UInt32 function, const UInt8 *params, UInt32 byte
     userRpcFunction_ = function;
     userRpcOutstanding_ = true;
     userRpcReplyBytes_ = 0;
+    userRpcResult_ = ~0U;
+    nativeRpcReplyTarget_=nativeFaultLarge ? reply : nullptr;
+    nativeRpcReplyCapacity_=nativeFaultLarge ? capacity : 0;
+    const UInt32 generation = gpuResets_;
     userRpcSeq_ = 0x80000000U | (++userRpcSeqCounter_ & 0x7fffffffU);   // 0.178.9
     if (!init_.enqueueRpc(function, params, bytes, userRpcSeq_)) {
         userRpcOutstanding_ = false;
         userRpcActive_ = false;
+        nativeRpcReplyTarget_=nullptr;nativeRpcReplyCapacity_=0;
         ulk();
         return kIOReturnIOError;
     }
     // Drive the status queue ourselves (no dependency on the daemon poll).
-    for (UInt32 ms = 0; userRpcOutstanding_ && ms < 5000; ++ms) {
+    UInt64 deadline = 0;
+    clock_interval_to_deadline(5, kSecondScale, &deadline);
+    for (; userRpcOutstanding_ && generation == gpuResets_ && mach_absolute_time() < deadline &&
+           !(nativeRuntime && native615Stopping_);) {
         pollStatusLocked();
         if (!userRpcOutstanding_) break;
         ulk();
         IOSleep(1);
         lk(__LINE__);
     }
-    const bool done = !userRpcOutstanding_;
+    const bool done = nvgsp::rpcReplyCompleted615(userRpcOutstanding_, userRpcReplyBytes_,
+                                                generation, gpuResets_);
+    if (!done && userRpcOutstanding_ && generation==gpuResets_) {
+        userRpcLatePending_=true;
+        userRpcLateFunction_=function;userRpcLateSeq_=userRpcSeq_;userRpcLateGeneration_=generation;
+        removeProperty("NVGspControl-user-rpc-late-reply");
+        setProperty("NVGspControl-user-rpc-late-pending",true);
+        setProperty("NVGspControl-user-rpc-late-function",function,32);
+        setProperty("NVGspControl-user-rpc-late-sequence",userRpcSeq_,32);
+    }
     userRpcOutstanding_ = false;
-    const UInt32 n = done ? (userRpcReplyBytes_ < *replyBytes ? userRpcReplyBytes_ : *replyBytes) : 0;
-    if (n) __builtin_memcpy(reply, userRpcReply_, n);
+    const UInt32 n = done ? (userRpcReplyBytes_ < capacity ? userRpcReplyBytes_ : capacity) : 0;
+    if (n && !nativeFaultLarge) __builtin_memcpy(reply, userRpcReply_, n);
     *replyBytes = n;
     if (rpcResult) *rpcResult = done ? userRpcResult_ : ~0U;
     userRpcActive_ = false;
+    nativeRpcReplyTarget_=nullptr;nativeRpcReplyCapacity_=0;
     ++userRpcs_;
     setProperty("NVGspControl-user-rpc-count", userRpcs_, 32);
     setProperty("NVGspControl-user-rpc-last-function", function, 32);
     ulk();
-    return done ? kIOReturnSuccess : kIOReturnTimeout;
+    return generation != gpuResets_ ? kIOReturnOffline : done ? kIOReturnSuccess : kIOReturnTimeout;
 }
 
 // 0.83.0: kernel-managed core channel pushbuffer (4 KiB at
@@ -2235,16 +2837,21 @@ IOReturn NVGspControl::coreUnstick() {
 UInt32 NVGspControl::coreException() {
     UInt32 stat = 0;
     IOMemoryMap *map = sharedBar0Map(pci_);
-    if (map && map->getLength() >= 0x611858) {
+    if (map && map->getLength() >= 0x611030) {
         Bar0Io bar0{map};
-        UInt32 pending = 0;
-        // FE_EXCEPT retains an ACKed snapshot, including VALID/type NONE.
-        // Only the live core interrupt source establishes a pending fault.
-        if (bar0.read(0x611854, &pending) && (pending & 1U) &&
-            bar0.read(0x611020, &stat) && (stat & 0x10000000U)) {
+        // 0.180.6: bit 28 (0x10000000) is a normal display update status;
+        // a plain core UPDATE sets it without any fault (observed 7 Nov).
+        // The exception bit is 31 (0x80000000; a real fault reads
+        // 0x80000090 with data/code). Checking bit 28 made every cursor
+        // image/show look failed and forced the software cursor.
+        if (bar0.read(0x611020, &stat) && (stat & 0x80000000U)) {
             UInt32 data = 0, code = 0;
             bar0.read(0x611024, &data);
             bar0.read(0x611028, &code);
+            // 0.180.11: decode as nouveau's gv100_disp_exception does:
+            // bits 0-11 = failing method >> 2, bits 12-14 = error type.
+            setProperty("NVGspControl-core-exception-mthd", (stat & 0xfffU) << 2, 32);
+            setProperty("NVGspControl-core-exception-type", (stat & 0x7000U) >> 12, 32);
             bar0.write(0x611020, 0x90000000U);   // ack, as nouveau does
             const UInt32 rec[3] = {stat, data, code};
             OSData *d = OSData::withBytes(rec, sizeof(rec));
@@ -2257,47 +2864,12 @@ UInt32 NVGspControl::coreException() {
     return stat;
 }
 
-IOReturn NVGspControl::waitCursorArmed(UInt32 usage, const UInt32 state[7]) {
-    if (!pci_ || !state) return kIOReturnBadArgument;
-    IOMemoryMap *map = sharedBar0Map(pci_);
-    if (!map || map->getLength() < 0x68a0a4) {
-        if (map) map->release();
-        return kIOReturnNoMemory;
-    }
-    Bar0Io bar0{map};
-    IOReturn result = kIOReturnTimeout;
-    for (UInt32 ms = 0; ms < 200; ++ms) {
-        UInt32 pending = 0, cs = 0, put = 0, get = 0, assyUsage = 0, armedUsage = 0;
-        UInt32 assy[7] = {}, armed[7] = {};
-        bool ok = bar0.read(0x611854, &pending) && bar0.read(0x610630, &cs) &&
-            bar0.read(0x680000, &put) && bar0.read(0x680004, &get) &&
-            bar0.read(0x682030, &assyUsage) && bar0.read(0x68a030, &armedUsage);
-        for (UInt32 i = 0; ok && i < 7; ++i)
-            ok = bar0.read(0x682088 + i*4, &assy[i]) && bar0.read(0x68a088 + i*4, &armed[i]);
-        if (!ok) { result = kIOReturnIOError; break; }
-        if (pending & 1U) { coreException(); result = kIOReturnIOError; break; }
-        if (((cs >> 16) & 0x1f) == 0x0b && put == get &&
-            assyUsage == usage && armedUsage == usage &&
-            !__builtin_memcmp(assy, state, sizeof(assy)) &&
-            !__builtin_memcmp(armed, state, sizeof(armed))) {
-            result = kIOReturnSuccess;
-            break;
-        }
-        IOSleep(1);
-    }
-    map->release();
-    setProperty("NVGspControl-cursor-arm-result", static_cast<UInt32>(result), 32);
-    return result;
-}
-
 // 0.84.0: hardware cursor (head 0), nvkms EvoSetCursorImageC3 + MoveCursorC3
 // with nouveau r535_curs_init ordering. 64x64 A8R8G8B8, two 16 KiB buffers
 // at the tail of the scratch VRAM (scratch + 0xFF00000); the VRAM ctxdma the
 // window uses (RAMIN+0x2000) gets a core-channel (chid 0) RAMHT entry.
 static constexpr UInt32 kCursorCtxdma = 0xc0d0d002;
-// Dual legacy/client hash slots must not alias the cursor's 56/60 slots.
-// The old OLUT handle D006 used 52/56; D00A uses 48/52 instead.
-static constexpr UInt32 kOlutCtxdma = 0xc0d0d00a;
+static constexpr UInt32 kOlutCtxdma = 0xc0d0d006;
 static constexpr UInt32 kIlutCtxdma = 0xc0d0d007;
 // 0.101.0: see the call site. Returns the number of PD0 tables installed.
 UInt32 NVGspControl::installVramWindow() {
@@ -2343,7 +2915,10 @@ UInt32 NVGspControl::installVramWindow() {
 // 0.102.0: see the call site. PTE aperture SYSTEM_COHERENT (2) + VOL -> |0xD.
 UInt32 NVGspControl::installSharedWindow() {
     constexpr UInt64 kShmVa = 0x3000000000ULL;
-    constexpr UInt64 kTableOff = 0xF820000ULL;   // after the 32 VRAM-window tables
+    // 64 PD0 tables for the global VRAM window are reserved at 0xF800000;
+    // the shared window table must start after all of them, not after 32.
+    constexpr UInt64 kTableOff = 0xF840000ULL;
+    if (scratchTry_ < kTableOff + 4096) return 0;
     const UInt32 first = static_cast<UInt32>(kShmVa >> 29) & 0x1ff;
     const UInt64 table = scratchOffset_ + kTableOff;
     PraminPteResult r{};
@@ -2592,7 +3167,7 @@ NVGspControl::ArenaCtx *NVGspControl::arenaForLocked(const void *owner, bool cre
     if (!c) return nullptr;
     bzero(c, sizeof(*c));                                // ArenaMap needs zeroed state
     c->owner = owner;
-    c->pid = proc_selfpid();                             // 0.158.0
+    c->pid = 0;                                         // 0.178.28: auxiliary-KC kexts cannot bind proc_selfpid; pid is diagnostic only
     ArenaBackend b{this, c};
     c->map.sparse = arenaSparseByNvram();
     setProperty("NVGspControl-arena-sparse", c->map.sparse);
@@ -2601,6 +3176,44 @@ NVGspControl::ArenaCtx *NVGspControl::arenaForLocked(const void *owner, bool cre
     arenaCtx_[slot] = c;
     setProperty("NVGspControl-arena-clients", slot + 1, 32);
     return c;
+}
+
+// 0.180.12: true only when every 4 KiB page of [va, va+bytes) is mapped in
+// `owner`'s own arena by an ordinary memory object. This rejects submissions
+// that point at the global VRAM window, kernel VAs, raw admin binds, or
+// another client's pages. Caller holds lock_.
+bool NVGspControl::arenaOwnsRangeLocked(const void *owner, UInt64 va, UInt64 bytes) {
+    if (!owner || !bytes || va < nvgsp::kArenaBase || va >= nvgsp::kArenaEnd ||
+        bytes > nvgsp::kArenaEnd - va || va > UINT64_MAX - bytes)
+        return false;
+    ArenaCtx *c = arenaForLocked(owner, false);
+    if (!c || !c->ready) return false;
+    const UInt64 first = va & ~0xfffULL;
+    const UInt64 last = (va + bytes - 1) & ~0xfffULL;
+    for (UInt64 a = first;; a += 0x1000) {
+        UInt32 how = 0;
+        const UInt16 tag = c->map.ownerAt(a, &how);
+        if (!tag || tag == nvgsp::kArenaRawOwner || tag > kMaxMem) return false;
+        const GpuMem &m = mem_[tag - 1];
+        if (!m.owner || m.owner != owner) return false;
+        if (a == last) break;
+    }
+    return true;
+}
+
+UInt64 NVGspControl::clientObjectBytesLocked(const void *owner, UInt32 domain) const {
+    UInt64 total = 0;
+    for (UInt32 i = 0; i < kMaxMem; ++i)
+        if (mem_[i].owner == owner && mem_[i].domain == domain)
+            total += mem_[i].bytes;
+    return total;
+}
+
+UInt32 NVGspControl::clientObjectCountLocked(const void *owner) const {
+    UInt32 count = 0;
+    for (UInt32 i = 0; i < kMaxMem; ++i)
+        if (mem_[i].owner == owner) ++count;
+    return count;
 }
 
 // Point PD1[320..383] at `c`'s tables (nullptr: no arena). Caller holds lock_.
@@ -2698,14 +3311,29 @@ void NVGspControl::noteGpuEventLocked(const char *what) {
 // walking. A VA mapped only by another client's arena means work ran under
 // the wrong tables; mapped by nobody means it outlived its memory. Caller
 // holds lock_.
+// Bounded append for the fault/state diagnostics: `n += snprintf(...)` can
+// make n larger than the buffer (snprintf returns the would-be length), after
+// which `sizeof(s) - n` wraps and the next write runs off the stack.
+static void nvAppendf(char *s, size_t cap, int &n, const char *fmt, ...) {
+    if (n < 0) n = 0;
+    if ((size_t)n >= cap) { n = static_cast<int>(cap) - 1; return; }
+    va_list ap;
+    va_start(ap, fmt);
+    const int w = vsnprintf(s + n, cap - static_cast<size_t>(n), fmt, ap);
+    va_end(ap);
+    if (w < 0) return;
+    n += w;
+    if ((size_t)n >= cap) n = static_cast<int>(cap) - 1;
+}
+
 void NVGspControl::explainFaultLocked(UInt64 va) {
     char s[480];
     int n = 0;
     int activeSlot = -1;
     for (UInt32 i = 0; i < kMaxArenaCtx; ++i)
         if (arenaCtx_[i] && arenaCtx_[i] == arenaActive_) activeSlot = static_cast<int>(i);
-    n += snprintf(s + n, sizeof(s) - n, "va 0x%llx active %d pid %d:", va, activeSlot,
-                  activeSlot >= 0 ? arenaCtx_[activeSlot]->pid : 0);
+    nvAppendf(s, sizeof s, n, "va 0x%llx active %d pid %d:", va, activeSlot,
+              activeSlot >= 0 ? arenaCtx_[activeSlot]->pid : 0);
     bool any = false;
     for (UInt32 i = 0; i < kMaxArenaCtx && n < static_cast<int>(sizeof(s)) - 48; ++i) {
         ArenaCtx *c = arenaCtx_[i];
@@ -2715,11 +3343,11 @@ void NVGspControl::explainFaultLocked(UInt64 va) {
         if (!tag) continue;
         const UInt64 bytes = tag <= kMaxMem ? mem_[tag - 1].bytes : 0;
         const UInt32 dom = tag <= kMaxMem ? mem_[tag - 1].domain : 0;
-        n += snprintf(s + n, sizeof(s) - n, " [slot %u pid %d obj %u dom %u 0x%llx %s]", i, c->pid, tag,
-                      dom, bytes, how == 3 ? "4K" : how == 2 ? "64K" : "2M");
+        nvAppendf(s, sizeof s, n, " [slot %u pid %d obj %u dom %u 0x%llx %s]", i, c->pid, tag,
+                  dom, bytes, how == 3 ? "4K" : how == 2 ? "64K" : "2M");
         any = true;
     }
-    if (!any) n += snprintf(s + n, sizeof(s) - n, " mapped by no client");
+    if (!any) nvAppendf(s, sizeof s, n, " mapped by no client");
     // 0.164.0: every arena as it stands (after a reset a client can hold a
     // context that is not ready, or one without its staging page)
     for (UInt32 i = 0; i < kMaxArenaCtx && n > 0 && n < static_cast<int>(sizeof(s)) - 40; ++i) {
@@ -2856,7 +3484,8 @@ IOReturn NVGspControl::memInfo(UInt64 *heapBytesOut, UInt64 *vramUsedOut, UInt64
     UInt64 vram = 0, sys = 0;
     for (UInt32 i = 0; i < kMaxMem; ++i) {
         if (!mem_[i].owner) continue;
-        if (mem_[i].domain == 0) vram += mem_[i].bytes; else sys += mem_[i].bytes;
+        if (mem_[i].domain == 0 || mem_[i].domain == 2) vram += mem_[i].bytes;
+        else sys += mem_[i].bytes;
     }
     ulk();
     *heapBytesOut = fbFreeLimit_ && end > kHeapBase ? end - kHeapBase : 0;
@@ -2870,6 +3499,11 @@ IOReturn NVGspControl::memAlloc(const void *owner, UInt64 bytes, UInt32 domain,
                                 UInt32 *handleOut, UInt64 *physOut) {
     if (!lock_ || !owner || !bytes || domain > 2 || !handleOut || !physOut)
         return kIOReturnBadArgument;
+    // 0.180.12: reject the arithmetic-wrap inputs, not just improbable sizes.
+    if (bytes > kMaxAllocBytes ||
+        bytes > UINT64_MAX - 0x1fffffULL ||
+        (domain == 1 && bytes > kMaxSysAllocBytes))
+        return kIOReturnBadArgument;
     // 0.147.0: system memory chunks (physically contiguous 2 MiB each, then
     // zeroed) are allocated before taking lock_: done inside it, one
     // allocation held the lock for up to 46 ms and delayed vblank and fence
@@ -2877,8 +3511,11 @@ IOReturn NVGspControl::memAlloc(const void *owner, UInt64 bytes, UInt32 domain,
     if (!kce_.ready) kceEnsure();                    // 0.149.0
     IOBufferMemoryDescriptor **pre = nullptr;
     if (domain == 1) {
-        const UInt64 aligned = (bytes + 0x1fffff) & ~0x1fffffULL;
-        const UInt32 n = static_cast<UInt32>(aligned >> 21);
+        const UInt64 aligned = (bytes + 0x1fffffULL) & ~0x1fffffULL;
+        const UInt64 n64 = aligned >> 21;
+        if (!n64 || n64 > UINT32_MAX || n64 > (kMaxSysAllocBytes >> 21))
+            return kIOReturnBadArgument;
+        const UInt32 n = static_cast<UInt32>(n64);
         pre = static_cast<IOBufferMemoryDescriptor **>(IOMalloc(n * sizeof(void *)));
         if (!pre) return kIOReturnNoMemory;
         bzero(pre, n * sizeof(void *));
@@ -2898,6 +3535,24 @@ IOReturn NVGspControl::memAlloc(const void *owner, UInt64 bytes, UInt32 domain,
     }
     lk(__LINE__);
     waitThawLocked();                                // 0.127.0
+    // 0.180.12: per-client quotas. These are deliberately generous for one
+    // compositor/app but stop a single process from exhausting the global
+    // 65k-handle table, all wired sysmem, or all VRAM.
+    const UInt64 alignedBytes = (bytes + 0x1fffffULL) & ~0x1fffffULL;
+    const UInt64 clientVram = clientObjectBytesLocked(owner, 0) +
+                              clientObjectBytesLocked(owner, 2);
+    if (clientObjectCountLocked(owner) >= kMaxObjectsPerClient ||
+        (domain == 1 && clientObjectBytesLocked(owner, 1) > kMaxWiredBytesPerClient - alignedBytes) ||
+        ((domain == 0 || domain == 2) &&
+         clientVram > kMaxVramBytesPerClient - alignedBytes)) {
+        if (pre) {
+            const UInt32 n = static_cast<UInt32>(alignedBytes >> 21);
+            for (UInt32 k = 0; k < n; ++k) if (pre[k]) { pre[k]->complete(); pre[k]->release(); }
+            IOFree(pre, n * sizeof(void *));
+        }
+        ulk();
+        return kIOReturnNoResources;
+    }
     IOReturn ret = memAllocLocked(owner, bytes, domain, handleOut, physOut, pre);
     // 0.149.0: heap full -> move idle client objects to system memory until
     // this one fits (or nothing is left to move)
@@ -2933,10 +3588,29 @@ IOReturn NVGspControl::memAlloc(const void *owner, UInt64 bytes, UInt32 domain,
             UInt64 ns = 0;
             zeroed = n && kceRing(&ring) && submitRing(ring, words, n, &ns) == kIOReturnSuccess;
         }
-        if (!zeroed) ++vramZeroMisses_;
+        // 0.180.12: no BAR1 mapping (ReBAR off) must not expose the previous
+        // owner's VRAM. PRAMIN is slower but does not touch a client ring.
+        // Cap it to 16 MiB because the window helper intentionally rejects
+        // larger single calls; larger objects must use ReBAR or explicit CE
+        // zeroing. The old "silently leave it unzeroed" path is now a failure
+        // unless the operator opts out for diagnostics.
+        if (!zeroed && objBytes <= (16ULL << 20) && pci_) {
+            zeroed = praminZeroRange(pci_, phys, objBytes);
+        }
+        if (!zeroed) {
+            ++vramZeroMisses_;
+            setProperty("NVGspControl-vram-zero-misses", vramZeroMisses_, 32);
+            if (nvramU32("nvgsp-allow-unzeroed-vram") != 1) {
+                // Release the just-created object rather than hand a client
+                // memory that may still contain another process's data.
+                const UInt32 h = *handleOut;
+                ulk();
+                memFree(owner, h);
+                return kIOReturnNoMemory;
+            }
+        }
         ++vramZeroed_;
         setProperty("NVGspControl-vram-zeroed", vramZeroed_, 32);
-        setProperty("NVGspControl-vram-zero-misses", vramZeroMisses_, 32);
     }
     ulk();
     return ret;
@@ -2950,7 +3624,8 @@ bool NVGspControl::zeroVram(UInt64 phys, UInt64 bytes) {
     // (Xid 32, invalid pushbuffer); S3 never saw that because no client runs.
     // Write-combined, ~9 GB/s, with lock_ not held.
     IODeviceMemory *bar1 = bar1Dev();
-    if (!bar1 || !bytes || phys + bytes > bar1->getLength()) return false;
+    if (!bar1 || !bytes || phys > UINT64_MAX - bytes ||
+        phys + bytes > bar1->getLength()) return false;
     IOMemoryMap *map = bar1->createMappingInTask(kernel_task, 0,
                                                  kIOMapAnywhere | kIOMapWriteCombineCache,
                                                  phys, bytes);
@@ -2966,13 +3641,18 @@ IOReturn NVGspControl::memAllocLocked(const void *owner, UInt64 bytes, UInt32 do
                                       UInt32 *handleOut, UInt64 *physOut,
                                       IOBufferMemoryDescriptor **pre) {
     constexpr UInt64 kHeapBase = 0x40000000ULL;   // 1 GiB (below: kext carve-outs)
-    bytes = (bytes + 0x1fffff) & ~0x1fffffULL;
+    if (!bytes || bytes > kMaxAllocBytes || bytes > UINT64_MAX - 0x1fffffULL)
+        return kIOReturnBadArgument;
+    bytes = (bytes + 0x1fffffULL) & ~0x1fffffULL;
+    const UInt64 chunks64 = bytes >> 21;
+    if (!chunks64 || chunks64 > UINT32_MAX) return kIOReturnBadArgument;
+    const UInt32 chunksN = static_cast<UInt32>(chunks64);
     // `pre` (SYS chunks the caller allocated unlocked) is always consumed
     auto dropPre = [&]() {
         if (!pre) return;
-        for (UInt32 k = 0; k < (bytes >> 21); ++k)
+        for (UInt32 k = 0; k < chunksN; ++k)
             if (pre[k]) { pre[k]->complete(); pre[k]->release(); }
-        IOFree(pre, (bytes >> 21) * sizeof(void *));
+        IOFree(pre, chunksN * sizeof(void *));
         pre = nullptr;
     };
     UInt32 h = 0;
@@ -3012,7 +3692,7 @@ IOReturn NVGspControl::memAllocLocked(const void *owner, UInt64 bytes, UInt32 do
         }
         if (placed) ret = kIOReturnSuccess;
     } else {
-        const UInt32 n = static_cast<UInt32>(bytes >> 21);
+        const UInt32 n = chunksN;
         m.chunk = pre ? pre : static_cast<IOBufferMemoryDescriptor **>(IOMalloc(n * sizeof(void *)));
         const bool had = pre != nullptr;
         pre = nullptr;   // owned by m now
@@ -3066,7 +3746,10 @@ static void releaseGpuMem(NVGspControl::GpuMem &m) {
     if (m.user && m.domain == 3) m.user->complete();   // 0.134.0: unwire user pages
     if (m.user) m.user->release();
     for (UInt32 k = 0; k < m.chunks; ++k) { m.chunk[k]->complete(); m.chunk[k]->release(); }
-    if (m.chunk) IOFree(m.chunk, (m.bytes >> 21) * sizeof(void *));
+    // 0.180.12: the descriptor array was allocated for m.chunks entries, not
+    // for m.bytes>>21 (which used to be the same only before the 32-bit
+    // truncation bug). Never free with a size derived from the object length.
+    if (m.chunk) IOFree(m.chunk, m.chunks * sizeof(void *));
     bzero(&m, sizeof(m));
 }
 
@@ -3099,15 +3782,60 @@ void NVGspControl::thawLocked() {
 // kernel copy channel, instead of a CPU memcpy of the whole frame. GR work
 // queued so far (the composite that drew the surface) finishes first.
 IOReturn NVGspControl::flipCopy(NVGspFlipCopy *f) {
+    // 0.180.10: publish the exact reason a copy-engine flip was refused; the
+    // CPU fallback is ~220 ms for a 4K frame, so knowing stage 2 vs 3 vs 7 is
+    // what tells us whether the aperture address or the CE ring is wrong.
+    UInt32 flipTries = 0, flipOks = 0, flipFails = 0;
+    if (OSNumber *n = OSDynamicCast(OSNumber, getProperty("NVGspControl-flipcopy-tries"))) flipTries = n->unsigned32BitValue();
+    if (OSNumber *n = OSDynamicCast(OSNumber, getProperty("NVGspControl-flipcopy-ok"))) flipOks = n->unsigned32BitValue();
+    if (OSNumber *n = OSDynamicCast(OSNumber, getProperty("NVGspControl-flipcopy-fail"))) flipFails = n->unsigned32BitValue();
+    ++flipTries;
+    setProperty("NVGspControl-flipcopy-tries", flipTries, 32);
     if (!f || f->version != 1 || !f->src || !f->rows || !f->widthBytes || f->widthBytes > f->srcRowBytes ||
-        f->widthBytes > f->dstRowBytes)
+        f->widthBytes > f->dstRowBytes) {
+        ++flipFails;
+        setProperty("NVGspControl-flipcopy-fail", flipFails, 32);
+        setProperty("NVGspControl-flipcopy-stage", static_cast<UInt32>(1), 32);
         return kIOReturnBadArgument;
+    }
+    setProperty("NVGspControl-flipcopy-srcrow", f->srcRowBytes, 32);
+    setProperty("NVGspControl-flipcopy-dstrow", f->dstRowBytes, 32);
+    setProperty("NVGspControl-flipcopy-dstbus", f->dstBus, 64);
+    setProperty("NVGspControl-flipcopy-rows", f->rows, 32);
+    setProperty("NVGspControl-flipcopy-width", f->widthBytes, 32);
     IODeviceMemory *b1 = bar1Dev();
-    if (!b1 || !lock_) return kIOReturnNotReady;
+    if (!b1 || !lock_) {
+        ++flipFails; setProperty("NVGspControl-flipcopy-fail", flipFails, 32);
+        setProperty("NVGspControl-flipcopy-stage", static_cast<UInt32>(2), 32);
+        return kIOReturnNotReady;
+    }
     const UInt64 base = b1->getPhysicalAddress();
     const UInt64 span = UInt64(f->rows - 1) * f->dstRowBytes + f->widthBytes;
-    if (f->dstBus < base || f->dstBus + span > base + b1->getLength()) return kIOReturnBadArgument;
-    const UInt64 dstVram = f->dstBus - base;
+    setProperty("NVGspControl-flipcopy-bar1base", base, 64);
+    setProperty("NVGspControl-flipcopy-bar1bytes", b1->getLength(), 64);
+    setProperty("NVGspControl-flipcopy-span", span, 64);
+    // 0.180.170: the native615 display pipeline scans out from a VRAM surface
+    // (`displayCopyDst615_`, the same one displayFbCopy615 writes), which is a
+    // LOCAL_FB address, not a BAR1 (bus) address. Accept it as the flip
+    // destination instead of failing the BAR1 window check: the display pipe
+    // then puts WindowServer's surface straight into the scan-out buffer
+    // (copy engine, ~8 ms for 4K) rather than through the CPU copy (3.3 s for
+    // 4K into the framebuffer aperture, measured 20:51).
+    const UInt64 scanout = displayCopyDst615_;
+    const UInt64 scanoutBytes = UInt64(displayCopyPitch615_) * displayCopyLines615_;
+    UInt64 dstVram = 0;
+    if (scanout && scanoutBytes && f->dstBus >= scanout && f->dstBus + span <= scanout + scanoutBytes) {
+        dstVram = f->dstBus;
+        setProperty("NVGspControl-flipcopy-mode", static_cast<UInt32>(1), 32);
+    } else if (f->dstBus >= base && f->dstBus + span <= base + b1->getLength()) {
+        dstVram = f->dstBus - base;
+        setProperty("NVGspControl-flipcopy-mode", static_cast<UInt32>(2), 32);
+    } else {
+        ++flipFails; setProperty("NVGspControl-flipcopy-fail", flipFails, 32);
+        setProperty("NVGspControl-flipcopy-stage", static_cast<UInt32>(3), 32);
+        return kIOReturnBadArgument;
+    }
+    setProperty("NVGspControl-flipcopy-vram", dstVram, 64);
     constexpr UInt32 kMax = (nvgsp::kVideoPbBytes / 4 - 64) / nvgsp::kCeCopyWords;
     auto *batch = static_cast<nvgsp::EvictCopy *>(IOMalloc(kMax * sizeof(nvgsp::EvictCopy)));
     if (!batch) return kIOReturnNoMemory;
@@ -3140,6 +3868,11 @@ IOReturn NVGspControl::flipCopy(NVGspFlipCopy *f) {
     ulk();
     IOFree(batch, kMax * sizeof(nvgsp::EvictCopy));
     f->copiesOut = lines;
+    setProperty("NVGspControl-flipcopy-lines", lines, 32);
+    if (ok) { ++flipOks; setProperty("NVGspControl-flipcopy-ok", flipOks, 32);
+              setProperty("NVGspControl-flipcopy-stage", static_cast<UInt32>(0), 32); }
+    else { ++flipFails; setProperty("NVGspControl-flipcopy-fail", flipFails, 32);
+           setProperty("NVGspControl-flipcopy-stage", static_cast<UInt32>(7), 32); }
     return ok ? kIOReturnSuccess : kIOReturnIOError;
 }
 
@@ -3353,6 +4086,8 @@ bool NVGspControl::evictObjectLocked(UInt32 index) {
     nvgsp::ArenaRemapEntry *journal = nullptr;
     UInt32 entries = 0;
     nvgsp::ArenaRemapResult res = nvgsp::ArenaRemapResult::Success;
+    bool remapApplied = false;
+    bool tlbFailed = false;
     if (ok && ctx && ctx->ready) {
         ArenaBackend b{this, ctx};
         const nvgsp::ResidencyTranslation tr{{m.phys, m.bytes, nullptr, 0}, {0, m.bytes, phys, n}};
@@ -3363,23 +4098,32 @@ bool NVGspControl::evictObjectLocked(UInt32 index) {
             UInt32 again = 0;
             ok = journal && ctx->map.planOwnerRemap(b, tag, tr, 0xC, journal, entries, &again) &&
                  again == entries;
-            if (ok) res = nvgsp::applyArenaRemap(b, journal, entries);
+            if (ok) {
+                res = nvgsp::applyArenaRemap(b, journal, entries);
+                remapApplied = res != nvgsp::ArenaRemapResult::RollbackFailed;
+            }
             if (ok && res != nvgsp::ArenaRemapResult::Success) ok = false;
             // even a rolled-back attempt may have been seen by the MMU
-            if (tlbInvalidate() != kIOReturnSuccess) ok = false;
+            if (tlbInvalidate() != kIOReturnSuccess) { tlbFailed = true; ok = false; }
         }
     }
     if (journal) IOFree(journal, entries * sizeof(*journal));
     if (batch) IOFree(batch, nvgsp::kEvictBatchCopies * sizeof(nvgsp::EvictCopy));
     if (phys) IOFree(phys, n * sizeof(uint64_t));
     if (!ok) {
-        if (res == nvgsp::ArenaRemapResult::RollbackFailed) {
-            // PTEs may point at either copy: keep both alive, leak the chunks
-            IOLog("NVGspControl: evict of object %u could not roll back, sysmem kept\n", index + 1);
+        // If the remap was applied (or may have partially applied), PTEs can
+        // point at the sysmem chunks. Keep them alive even when the TLB flush
+        // failed; the object itself stays in VRAM, so both translations are
+        // valid. This intentionally leaks the sysmem copy until reset/teardown
+        // instead of freeing memory the GPU may still walk.
+        const bool ptesMayPointAtCopy = remapApplied || res == nvgsp::ArenaRemapResult::RollbackFailed;
+        if (ptesMayPointAtCopy) {
+            IOLog("NVGspControl: evict of object %u kept both copies (tlb=%d, res=%d)\n",
+                  index + 1, tlbFailed ? 1 : 0, static_cast<int>(res));
         } else {
             for (UInt32 k = 0; k < have && chunk; ++k) { chunk[k]->complete(); chunk[k]->release(); }
+            if (chunk) IOFree(chunk, n * sizeof(void *));
         }
-        if (chunk) IOFree(chunk, n * sizeof(void *));
         return false;
     }
     vramHeap_.remove(m.phys);
@@ -3410,8 +4154,17 @@ void NVGspControl::clientLive(const void *owner, task_t task, bool live) {
     if (!lock_ || !owner) return;
     lk(__LINE__);
     for (UInt32 i = 0; i < 256; ++i) {
-        if (live && !liveClients_[i].owner) { liveClients_[i] = LiveClient{owner, task}; break; }
-        if (!live && liveClients_[i].owner == owner) { liveClients_[i] = LiveClient{}; break; }
+        if (live && liveClients_[i].owner == owner) break;
+        if (live && !liveClients_[i].owner) {
+            if (task) task_reference(task);
+            liveClients_[i] = LiveClient{owner, task};
+            break;
+        }
+        if (!live && liveClients_[i].owner == owner) {
+            if (liveClients_[i].task) task_deallocate(liveClients_[i].task);
+            liveClients_[i] = LiveClient{};
+            break;
+        }
     }
     ulk();
 }
@@ -3448,24 +4201,21 @@ IOReturn NVGspControl::memFree(const void *owner, UInt32 handle) {
     waitThawLocked();                                // 0.127.0
     GpuMem &m = mem_[handle - 1];
     const bool mine = m.owner && m.owner == owner;
-    bool unbound = true;
-    GpuMem dead{};
-    if (mine) {
-        // 0.110.0: never scan out memory that is about to be released.
-        if (presentOwner_ == owner && presentHandle_ == handle) presentStopLocked(owner);
-        // 0.109.0: no GPU PTE may outlive the pages it points at.
-        unbound = unbindObjectLocked(handle);
-        // 0.147.0: the pages are unmapped and the TLB flushed; hand them back
-        // to the kernel after dropping lock_ (freeing contiguous chunks and
-        // descriptors under it was the other half of the long holds).
-        if (m.domain == 0) vramHeap_.remove(m.phys);
-        dead = m;
-        bzero(&m, sizeof(m));
+    if (!mine) { ulk(); return kIOReturnNotPermitted; }
+    // 0.180.12: free only after every GPU reference is gone. The old code
+    // zeroed the slot even when present-stop or PTE-unbind failed, leaving a
+    // live scan-out/translation pointing at freed pages.
+    if (presentOwner_ == owner && presentHandle_ == handle) {
+        const IOReturn stop = presentStopLocked(owner);
+        if (stop != kIOReturnSuccess) { ulk(); return stop; }
     }
+    if (!unbindObjectLocked(handle)) { ulk(); return kIOReturnIOError; }
+    if (m.domain == 0) vramHeap_.remove(m.phys);
+    GpuMem dead = m;
+    bzero(&m, sizeof(m));
     ulk();
-    if (dead.owner) releaseGpuMem(dead);
-    if (!mine) return kIOReturnNotPermitted;
-    return unbound ? kIOReturnSuccess : kIOReturnIOError;
+    releaseGpuMem(dead);
+    return kIOReturnSuccess;
 }
 
 // 0.134.0: host memory straight into the GPU VA (Metal/Vulkan zero-copy).
@@ -3474,7 +4224,10 @@ IOReturn NVGspControl::memFree(const void *owner, UInt32 handle) {
 IOReturn NVGspControl::userMemBind(const void *owner, task_t task, UInt64 uaddr, UInt64 bytes,
                                    UInt64 va, UInt32 flags, UInt32 *handleOut) {
     if (!lock_ || !owner || !task || !handleOut || !bytes || ((uaddr | bytes | va) & 0xfff) ||
-        bytes > (1ULL << 30))
+        bytes > (1ULL << 30) || uaddr > UINT64_MAX - bytes ||
+        // x86_64 user space ends below the kernel half. Never let a caller
+        // hand us a kernel VA and rely on withAddressRange to reject it.
+        uaddr >= 0x0000800000000000ULL)
         return kIOReturnBadArgument;
     IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(uaddr, bytes, kIODirectionInOut, task);
     if (!md) return kIOReturnNoMemory;
@@ -3494,6 +4247,13 @@ IOReturn NVGspControl::userMemBind(const void *owner, task_t task, UInt64 uaddr,
     }
     lk(__LINE__);
     waitThawLocked();
+    if (clientObjectCountLocked(owner) >= kMaxObjectsPerClient ||
+        clientObjectBytesLocked(owner, 3) > kMaxWiredBytesPerClient - bytes) {
+        ulk();
+        IOFree(phys, n * sizeof(UInt64));
+        md->complete(); md->release();
+        return kIOReturnNoResources;
+    }
     UInt32 h = 0;
     while (h < kMaxMem && mem_[h].owner) ++h;
     ArenaCtx *c = h < kMaxMem ? arenaForLocked(owner, true) : nullptr;
@@ -3576,13 +4336,44 @@ void NVGspControl::memFreeAll(const void *owner) {
     waitSubmittedUnlocked(3000000);                  // 0.155.0: before taking lock_; 0.166.0: 3 s without progress
     lk(__LINE__);
     waitThawLocked();                                // 0.127.0
-    presentStopLocked(owner);                        // 0.110.0
+    const IOReturn presentStop = presentStopLocked(owner);   // 0.110.0
+    bool safeToDropArena = true;
     for (UInt32 i = 0; i < kMaxMem; ++i)
         if (mem_[i].owner == owner) {
-            unbindObjectLocked(i + 1);               // 0.109.0 (+ TLB flush)
-            releaseGpuMemLocked(i);
+            // A failed flip-back means the display still scans this object.
+            // Leave it (and its arena) alive rather than freeing live VRAM.
+            if (presentStop != kIOReturnSuccess && presentOwner_ == owner &&
+                presentHandle_ == i + 1) {
+                safeToDropArena = false;
+                mem_[i].owner = &kLeakedObjectOwner;
+                setProperty("NVGspControl-close-present-stop-failed", i + 1, 32);
+                continue;
+            }
+            // Do not free pages while a PTE may still point at them. A failed
+            // unbind is rare; leaking the object until reset is safer than a
+            // GPU access to reused memory.
+            if (unbindObjectLocked(i + 1)) releaseGpuMemLocked(i);
+            else {
+                safeToDropArena = false;
+                mem_[i].owner = &kLeakedObjectOwner;
+                setProperty("NVGspControl-close-unbind-failed", i + 1, 32);
+                // Keep the PTE tables alive for the GPU, but detach them from
+                // the owner pointer: the user client object is about to be
+                // freed and a new client may reuse the same address.
+                if (ArenaCtx *c = arenaForLocked(owner, false)) {
+                    c->owner = nullptr;
+                    c->ready = false;
+                }
+            }
         }
-    arenaReleaseLocked(owner);                       // 0.111.0
+    if (!safeToDropArena) {
+        if (ArenaCtx *c = arenaForLocked(owner, false)) {
+            c->owner = nullptr;
+            c->ready = false;
+        }
+        if (presentOwner_ == owner) presentOwner_ = &kLeakedObjectOwner;
+    }
+    if (safeToDropArena) arenaReleaseLocked(owner);  // 0.111.0
     // 0.145.0: its state stays on the channel; a new client at the same
     // address must still see "someone else"
     if (lastGrOwner_ == owner) lastGrOwner_ = reinterpret_cast<const void *>(1);
@@ -3616,9 +4407,12 @@ IOReturn NVGspControl::vaBindObject(const void *owner, UInt32 handle, UInt64 va,
             const UInt64 at = memOffset + o, in = at & 0x1fffff;
             const UInt64 len = (0x200000 - in) < (range - o) ? (0x200000 - in) : (range - o);
             IOByteCount segLen = 0;
-            const UInt64 phys = m.chunk[at >> 21]->getPhysicalSegment(0, &segLen,
-                                                                       kIOMemoryMapperNone);
-            ok = phys && c->map.bind(b, va + o, len, phys + in,
+            const UInt64 chunkIndex = at >> 21;
+            if (!m.chunk || chunkIndex >= m.chunks || in > UINT64_MAX - len) { ok = false; break; }
+            const UInt64 phys = m.chunk[chunkIndex]->getPhysicalSegment(0, &segLen,
+                                                                        kIOMemoryMapperNone);
+            ok = phys && segLen >= in + len && phys <= UINT64_MAX - in;
+            if (ok) ok = c->map.bind(b, va + o, len, phys + in,
                                      arenaPteFlags((flags & 0xff) | 0x100), tag);
             o += len;
         }
@@ -3630,7 +4424,7 @@ IOReturn NVGspControl::vaBindObject(const void *owner, UInt32 handle, UInt64 va,
         int slot = -1;
         for (UInt32 i = 0; i < kMaxArenaCtx; ++i) if (arenaCtx_[i] == c) slot = static_cast<int>(i);
         IOLog("NVGspControl: staging bind owner %p slot %d pid %d gen %u ok %d\n", owner, slot,
-              proc_selfpid(), resetGeneration(), ok ? 1 : 0);
+              c->pid, resetGeneration(), ok ? 1 : 0);
     }
     ulk();
     if (!ok) return kIOReturnBadArgument;
@@ -3655,6 +4449,10 @@ IOMemoryDescriptor *NVGspControl::memUserDescriptor(const void *owner, UInt32 ha
 // Asynchronous; returns the fence sequence. engine 0 = GR, 1 = CE.
 // 0.135.0: at most one boost request per second while clients submit; the
 // 3 s duration lets GSP drop back to P8 shortly after the last submission.
+// 0.180.11: log the RPC result and try BOOST_SET_3X if BOOST_TO_MAX does not
+// move the clock (the GSP perf table can cap GR max at 885 MHz; see STATUS.md
+// FP32 clock-cap item). nvram `nvgsp-boost=0` disables auto-boost,
+// `nvgsp-boost-pin=1` pins BOOST_TO_MAX indefinitely (duration 0xffffffff).
 void NVGspControl::noteGpuBusy() {
     if (!boostCall_) return;
     UInt64 now = 0, ns = 0;
@@ -3665,32 +4463,116 @@ void NVGspControl::noteGpuBusy() {
     thread_call_enter(boostCall_);
 }
 
+// 0.180.164: the native615 runtime refuses legacy userRpc (Busy), so the
+// boost never reached GSP there (NVGspControl-boost-last-error e00002d5) and
+// the GPU ran at idle clocks; copy-engine sysmem<->VRAM measured 3.1 GB/s on
+// a Gen4 x16 link. Same controls through the native control ABI.
+bool NVGspControl::nativeControl615(UInt32 object, UInt32 command, void *params, UInt32 bytes) {
+    if (!lock_ || !params || bytes > 64) return false;
+    lk(__LINE__);
+    // 0.180.165: never before the runtime's warm-up dispatches finished. 164
+    // boosted when autowarm's tools opened their user clients; the boost held
+    // native615Busy_ while the admin warm-up compute checked it (no wait on that
+    // path), the compute got NotReady, provenNakBytes stayed 0 and every Metal
+    // client create answered NotReady for the whole boot.
+    const bool ready = native615_ && native615Ready_ && !native615Busy_ && gmcInitReady_ && postInitPhase_ == 27 &&
+        !gmcMmuFaultPending_ && !userRpcLatePending_ && !userRpcActive_ && !userRpcOutstanding_ &&
+        !resetBusy_ && !sleeping_ && native615_->sequence >= 3 && native615_->provenNakBytes;
+    if (ready) native615Busy_ = true;
+    ulk();
+    if (!ready) return false;
+    constexpr UInt32 C = nvgsp::kLifecycleClient615;
+    auto *s = native615_;
+    UInt8 req[40 + 64]{};
+    bool ok = false;
+    if (nvgsp::buildControl615(req, 40 + bytes, C, object, command, bytes)) {
+        __builtin_memcpy(req + 40, params, bytes);
+        UInt32 replyBytes = sizeof(s->reply), result = ~0U;
+        IOReturn r = userRpcImpl(76, req, 40 + bytes, s->reply, &replyBytes, &result, true, true);
+        nvgsp::ControlReply615 reply{};
+        if (!r && replyBytes == 96 + bytes &&
+            nvgsp::decodeControlReply615(s->reply, replyBytes, C, object, command, bytes, reply)) {
+            const UInt32 status = result ? result : reply.header.status;
+            setProperty("NVGspControl-native-control-last", command, 32);
+            setProperty("NVGspControl-native-control-status", status, 32);
+            if (!status) { __builtin_memcpy(params, reply.params, bytes); ok = true; }
+        }
+    }
+    lk(__LINE__);
+    native615Busy_ = false;
+    ulk();
+    return ok;
+}
+
 void NVGspControl::boostCallout(thread_call_param_t p, thread_call_param_t) {
     NVGspControl *self = static_cast<NVGspControl *>(p);
+    if (self->native615_ && self->postInitPhase_ == 27) {   // 0.180.164
+        UInt8 boost[8]{};
+        boost[0] = self->boostPinned_ ? 3u : 2u;
+        const UInt32 seconds = self->boostPinned_ ? 0xffffffffu : 3u;
+        __builtin_memcpy(boost + 4, &seconds, 4);
+        if (!self->nativeControl615(nvgsp::kLifecycleSubdevice615, self->boostPinned_ ? 0x20800a9bu : 0x20800a9au,
+                                    boost, sizeof(boost))) {
+            self->lastBoostAbs_ = 0;   // busy or refused: try again on the next submission
+            self->setProperty("NVGspControl-boost-native-failed", true);
+            return;
+        }
+        self->boostSent_++;
+        self->setProperty("NVGspControl-activity-boosts", self->boostSent_, 32);
+        self->setProperty("NVGspControl-boost-mode", self->boostPinned_ ? 3u : 2u, 32);
+        UInt32 pstate = 0;
+        if (self->nativeControl615(nvgsp::kLifecycleSubdevice615, 0x20802068u, &pstate, sizeof(pstate)))
+            self->setProperty("NVGspControl-boost-pstate", pstate, 32);
+        return;
+    }
     constexpr UInt32 kClientHandle = 0xc0d00001, kSubdevice = 0xc0d02080;
-    constexpr UInt32 kCmd = 0x20800a9a, kBytes = 8;      // INTERNAL_PERF_BOOST_SET_2X
-    UInt8 control[24 + 8]{};
+    constexpr UInt32 kCmdSet2x = 0x20800a9a, kCmdSet3x = 0x20800a9b; // INTERNAL_PERF_BOOST_SET_2X / _3X
+    constexpr UInt32 kBytes = 8;
+    UInt8 control[24 + kBytes]{};
     __builtin_memcpy(control, &kClientHandle, 4);
     __builtin_memcpy(control + 4, &kSubdevice, 4);
-    __builtin_memcpy(control + 8, &kCmd, 4);
+    // BOOST_SET_3X when pinned (indefinite), BOOST_TO_MAX otherwise (3 s).
+    __builtin_memcpy(control + 8, self->boostPinned_ ? &kCmdSet3x : &kCmdSet2x, 4);
     __builtin_memcpy(control + 16, &kBytes, 4);
-    control[24] = 2;                                   // BOOST_TO_MAX
-    const UInt32 seconds = 3;
+    // BOOST_TO_MAX = 2, BOOST_SET_3X = 3
+    control[24] = self->boostPinned_ ? 3u : 2u;
+    UInt32 seconds = self->boostPinned_ ? 0xffffffffu : 3u;
     __builtin_memcpy(control + 28, &seconds, 4);
     UInt8 reply[64];
     UInt32 replyBytes = sizeof(reply), result = 0;
-    if (self->userRpc(76, control, sizeof(control), reply, &replyBytes, &result) == kIOReturnSuccess) {
+    IOReturn r = self->userRpc(76, control, sizeof(control), reply, &replyBytes, &result);
+    if (r == kIOReturnSuccess) {
         self->boostSent_++;
         self->setProperty("NVGspControl-activity-boosts", self->boostSent_, 32);
+        self->setProperty("NVGspControl-boost-last-result", result, 32);
+        self->setProperty("NVGspControl-boost-mode", self->boostPinned_ ? 3u : 2u, 32);
+        // Read back current P-state after boost to confirm the clock moved.
+        constexpr UInt32 kCmdPstate = 0x20802068, kPBytes = 4; // PERF_GET_CURRENT_PSTATE
+        UInt8 pctl[24 + kPBytes]{};
+        __builtin_memcpy(pctl, &kClientHandle, 4);
+        __builtin_memcpy(pctl + 4, &kSubdevice, 4);
+        __builtin_memcpy(pctl + 8, &kCmdPstate, 4);
+        __builtin_memcpy(pctl + 16, &kPBytes, 4);
+        UInt8 preply[256];
+        UInt32 preplyBytes = sizeof(preply), presult = ~0U;
+        if (self->userRpc(76, pctl, sizeof(pctl), preply, &preplyBytes, &presult) == kIOReturnSuccess &&
+            preplyBytes >= 4) {
+            UInt32 pstate = 0;
+            __builtin_memcpy(&pstate, preply, 4);
+            self->setProperty("NVGspControl-boost-pstate", pstate, 32);
+        }
     }
-    else
+    else {
         self->lastBoostAbs_ = 0;                       // busy: try again on the next submit
+        self->setProperty("NVGspControl-boost-last-error", static_cast<UInt32>(r), 32);
+    }
 }
 
 IOReturn NVGspControl::submitSegments(const void *owner, UInt32 engine, const UInt64 *segVa,
                                       const UInt32 *segDwords, const UInt32 *segFlags, UInt32 n,
-                                      UInt32 *seqOut, UInt64 stampVa, UInt32 stampValue) {
-    if (nvramBoostPinned_ == 0) noteGpuBusy();
+                                      UInt32 *seqOut, UInt64 stampVa, UInt32 stampValue,
+                                      bool trusted) {
+    if (nvramBoostPinned_ == 0 && boostPinned_ == 0) noteGpuBusy();
     if (!lock_ || !pci_ || !segVa || !segDwords || !segFlags || !n || n > nvgsp::kExecMaxSegments || !seqOut)
         return kIOReturnBadArgument;
     for (UInt32 i = 0; i < n; ++i)
@@ -3704,18 +4586,55 @@ IOReturn NVGspControl::submitSegments(const void *owner, UInt32 engine, const UI
     // CHRAM ENABLE (write 0x2, ga100_chan_start) before the doorbell.
     // 0.129.0: the internal doorbell made NVDEC0/NVENC0/OFA0 execute live
     // (0.128.0, flag 0x200), so video rings always get it now.
-    const bool noWfi = engine & 0x100;
-    const bool internalDoorbell = (engine & 0xff) >= 2 || (engine & 0x200);
-    const bool chramEnable = engine & 0x400;
+    bool noWfi = engine & 0x100;
+    bool internalDoorbell = (engine & 0xff) >= 2 || (engine & 0x200);
+    bool chramEnable = engine & 0x400;
     engine &= 0xff;
+    // 0.180.12: experimental tail-doorbell/CHRAM/no-WFI bits are diagnostics.
+    // A normal client must not be able to wedge a video engine or skip the
+    // fence release. Video engines still need their runlist doorbell.
+    auto *uc = OSDynamicCast(IOAccelNVGspUserClient,
+                             static_cast<OSObject *>(const_cast<void *>(owner)));
+    if (!uc || !uc->isAdmin()) {
+        noWfi = false;
+        chramEnable = false;
+        internalDoorbell = engine >= 2;
+    }
     lk(__LINE__);
-    if (stampVa) {  // 0.174.0: native submissions bypass externalMethod's generation gate
+    // 0.180.12: the external selector-21 path must only point at pages owned
+    // by this client's arena. Native NVAccelerator submissions are marked
+    // trusted by the kernel caller's nvgsp-submit-stamp path and may use the
+    // family's task VAs. The old test was `stampVa == 0`, which silently
+    // trusted (or rejected) submissions based on an optional stamp.
+    if (!trusted) {
+        for (UInt32 i = 0; i < n; ++i) {
+            const UInt64 bytes = UInt64(segDwords[i]) * 4;
+            if (!arenaOwnsRangeLocked(owner, segVa[i], bytes)) {
+                setProperty("NVGspControl-seg-stage", 8, 32);
+                setProperty("NVGspControl-seg-reject-va", segVa[i], 64);
+                ulk();
+                return kIOReturnBadArgument;
+            }
+        }
+    }
+    if (stampVa || trusted) {  // native submissions bypass externalMethod's generation gate
+        // 0.180.4: never submit native work into a hung ring or a reset/sleep
+        // window. A degraded GPU used to accept the submit and fault with
+        // Internal Error 0xa; callers now get a clean NotReady and retry
+        // after recovery. Trusted callers get the same gate: a kernel stamp
+        // is not a licence to submit during a reset.
+        if (grStall_.hung || ceStall_.hung || resetBusy_ || sleeping_) {
+            setProperty("NVGspControl-seg-stage", 7, 32);
+            ulk();
+            return kIOReturnNotReady;
+        }
         auto *uc = OSDynamicCast(IOAccelNVGspUserClient,
                                 static_cast<OSObject *>(const_cast<void *>(owner)));
         const IOReturn status = uc ? uc->generationStatus() : kIOReturnBadArgument;
         if (status != kIOReturnSuccess) { ulk(); return status; }
     }
-    if (!waitChannelMutationLocked()) { ulk(); return kIOReturnNotReady; }
+    UInt32 segStage = 0;
+    if (!waitChannelMutationLocked()) { setProperty("NVGspControl-seg-stage", 1, 32); ulk(); return kIOReturnNotReady; }
     Ring ring{};
     bool have = false;
     ClientChannel *own = engine == 0 ? clientChannelLocked(owner) : nullptr;   // 0.178.0
@@ -3733,15 +4652,20 @@ IOReturn NVGspControl::submitSegments(const void *owner, UInt32 engine, const UI
         : engine == 1 ? ceOutstanding_ : video_[have ? engine - 2 : 0].outstanding;
     IOReturn ret = !have ? kIOReturnNotReady
                          : own ? clientArenaLocked(own) : arenaSwitchLocked(owner);   // 0.111.0
-    if (own && ret == kIOReturnSuccess && !clientRingLocked(own, &ring)) ret = kIOReturnNotReady;
+    segStage = !have ? 2 : (ret == kIOReturnSuccess ? 3 : 4);
+    if (own && ret == kIOReturnSuccess && !clientRingLocked(own, &ring)) { ret = kIOReturnNotReady; segStage = 5; }
     if (stampVa) {
         // arenaSwitchLocked may wait for thaw with lock_ dropped. A reset
         // during that wait invalidates both the client and the ring snapshot.
         auto *uc = OSDynamicCast(IOAccelNVGspUserClient,
                                 static_cast<OSObject *>(const_cast<void *>(owner)));
         const IOReturn status = uc ? uc->generationStatus() : kIOReturnBadArgument;
-        if (status != kIOReturnSuccess) ret = status;
+        if (status != kIOReturnSuccess) { ret = status; segStage = 6; }
     }
+    setProperty("NVGspControl-seg-engine", engine, 32);
+    setProperty("NVGspControl-seg-stage", segStage, 32);
+    setProperty("NVGspControl-seg-last-result", static_cast<UInt32>(ret), 32);
+    if (ret == kIOReturnSuccess) setProperty("NVGspControl-seg-submits", ++segSubmits_, 32);
     if (ret == kIOReturnSuccess && engine == 0 && !own) noteGrOwnerLocked(owner);
     if (ret == kIOReturnSuccess && own) {
         ++cchanSubmits_;
@@ -3842,15 +4766,30 @@ IOReturn NVGspControl::submitSegments(const void *owner, UInt32 engine, const UI
     return ret;
 }
 
-// 0.140.0 (D3): identity output LUT at scratch + 0xFF10000 (after the two
-// cursor buffers), own ctxdma at RAMIN+0x20C0, RAMHT at both hash slots.
+// 0.140.0 (D3): identity output LUT at scratch + 0xFF80000 (after the two
+// 256 KiB cursor buffers, which occupy 0xFF00000..0xFF80000), own ctxdma at
+// RAMIN+0x20C0, RAMHT at both hash slots.
 IOReturn NVGspControl::olutSetup() {
-    if (!dispInstOffset_ || !scratchOffset_) return kIOReturnNotReady;
-    const UInt64 surf = scratchOffset_ + nvgsp::kOlutScratchDelta;
-    constexpr UInt32 kWords = nvgsp::kIdentityLutWords;
+    if (!dispInstOffset_ || !scratchOffset_ || scratchTry_ < 0xFF90000)
+        return kIOReturnNotReady;
+    const UInt64 surf = scratchOffset_ + 0xFF80000;
+    constexpr UInt32 kWords = (4 + 1025) * 2;
     UInt32 *lut = static_cast<UInt32 *>(IOMalloc(kWords * 4));
     if (!lut) return kIOReturnNoMemory;
-    nvgsp::buildIdentityDisplayLut(lut, kWords, false);
+    bzero(lut, kWords * 4);
+    // 0.180.174: the Ada/c67d head takes UNORM16 LUT entries, not FP16.
+    // Nouveau writes the same head class with drm_color_lut_extract(...,16)
+    // raw (headc57d.c), and NVIDIA documents UNORM16 as [0,1] -> [0,0xFFFF].
+    // Our FP16 encoding put white at 0x3BFC = 15356/65535 = 23 %: every frame
+    // reached the panel dim and flat (the desktop looked washed out while the
+    // scan-out memory held correct pixels), and a 255,0,0 test fill showed up
+    // faded red. Entries also start after the 32-byte (4 x 8-byte) VSS header,
+    // not after 16 bytes.
+    for (UInt32 i = 0; i < 1025; ++i) {
+        const UInt32 v = i >= 1024 ? 0xffffU : (i * 0xffffU + 512U) / 1024U;   // UNORM16
+        lut[(8 + i * 2)] = v | (v << 16);      // R | G << 16
+        lut[(8 + i * 2) + 1] = v;              // B
+    }
     IOReturn r = kIOReturnSuccess;
     for (UInt32 o = 0; o < kWords && r == kIOReturnSuccess; o += 1024) {
         const UInt32 n = kWords - o < 1024 ? kWords - o : 1024;
@@ -3871,22 +4810,126 @@ IOReturn NVGspControl::olutSetup() {
     return ok ? kIOReturnSuccess : kIOReturnIOError;
 }
 
-// Window input identity is FP16, while the head output identity is fixed-point.
-// Use a separate surface so programming one cannot overwrite the other.
-IOReturn NVGspControl::ilutSetup() {
-    if (!dispInstOffset_ || !scratchOffset_) return kIOReturnNotReady;
-    const UInt64 surf = scratchOffset_ + nvgsp::kIlutScratchDelta;
-    constexpr UInt32 kWords = nvgsp::kIdentityLutWords;
+// 0.180.11: program the head's output LUT from NVDisplay's gamma table. The
+// OLUT surface is the one olutSetup() fills with the identity ramp: 4 VSS
+// header words + 1025 FP16 entries, two dwords per entry (R | G << 16, B).
+// Each entry is quantized to the LUT's 10 bits and encoded exactly like the
+// identity ramp, so a 1024-entry table maps 1:1. Re-uploading the surface is
+// all a runtime gamma change needs; the ctxdma and the head's OLUT enable
+// were programmed at mode-set. This proves the table reached the hardware
+// LUT, not that the panel was measured: the visual gamma check is separate.
+IOReturn NVGspControl::gammaSet(const UInt16 *rgb, UInt32 count) {
+    // 0.180.151: the boot display bring-up (disp_all.py) puts the head's
+    // output LUT at 0x3de000000: 34 MiB reserved at 0x3dc000000, LUT +2 MiB,
+    // OLUT ctxdma 0xc0d0d006 and the head's OLUT enable programmed there.
+    // The legacy GR-scratch address below is only valid on the retired path;
+    // using it here made every WindowServer gamma set return BadArgument
+    // (set_device_transfer e00002c7, no colour profile).
+    const bool nativeLut = displayCommon615_ && displayNative615_;
+    // 0.180.152: 0x3de000000 (disp_all.py LUT); 151 had 0x3DE00000, a
+    // different VRAM page. It never landed only because vramAccess refused
+    // the non-native call (Busy, NVDisplay-gamma-result e00002d5).
+    // 0.180.180: + 0x2100. disp_all.py lays the LUT surface out as nvkms does:
+    // the window ILUT (FP16) at 0 and the head OLUT (UNORM16) at 0x2100. The
+    // UNORM16 table written at 0 became the ILUT: every value >= 0x8000 is a
+    // negative FP16, so the panel looked like a negative (2026-11-18).
+    const UInt64 surf = nativeLut ? 0x3DE000000ULL + 0x2100 : (scratchOffset_ + 0xFF80000);
+    if (!rgb || count < 2 || count > 4096 ||
+        (!nativeLut && (!scratchOffset_ || scratchTry_ < 0xFF90000)))
+        return kIOReturnBadArgument;
+    constexpr UInt32 kWords = (4 + 1025) * 2;
     UInt32 *lut = static_cast<UInt32 *>(IOMalloc(kWords * 4));
     if (!lut) return kIOReturnNoMemory;
-    nvgsp::buildIdentityDisplayLut(lut, kWords, true);
-    IOReturn r = kIOReturnSuccess;
-    for (UInt32 o = 0; o < kWords && r == kIOReturnSuccess; o += 1024) {
-        const UInt32 n = kWords - o < 1024 ? kWords - o : 1024;
-        r = vramAccess(surf + o * 4, lut + o, n, true);
+    bzero(lut, kWords * 4);
+    for (UInt32 i = 0; i < 1025; ++i) {
+        const UInt32 j = i >= 1024 ? 1023 : (i * (count - 1) + 511) / 1023;
+        const UInt16 src[3] = {rgb[j], rgb[count + j], rgb[count * 2 + j]};
+        // 0.180.174: UNORM16 entries (see olutSetup), 8 bytes each after the
+        // 32-byte header. WindowServer's table is already 16-bit.
+        lut[8 + i * 2] = src[0] | (UInt32(src[1]) << 16);
+        lut[(8 + i * 2) + 1] = src[2];
     }
+    // 0.180.11: serialize concurrent gamma sets (WindowServer ramp + colour
+    // sync) so a torn table is never uploaded. Dedicated lock: vramAccess
+    // already takes lock_ internally. The lazy init can race once by design
+    // (two first callers may each allocate; the loser is leaked, never used).
+    static IOLock *gammaLock;
+    static bool gammaLockTried;
+    if (!gammaLockTried) { gammaLockTried = true; gammaLock = IOLockAlloc(); }
+    if (gammaLock) IOLockLock(gammaLock);
+    // 0.180.153: read the LUT first and skip the upload when VRAM already
+    // holds this table (WindowServer re-sends the same ramp on every display
+    // reconfiguration). Comparing against VRAM rather than a cached copy stays
+    // correct when disp_all.py rewrites the identity LUT behind our back.
+    auto readLut = [&](UInt32 *dst) -> bool {
+        IOReturn rr = kIOReturnSuccess;
+        for (UInt32 o = 0; o < kWords && rr == kIOReturnSuccess; o += 1024) {
+            const UInt32 n = kWords - o < 1024 ? kWords - o : 1024;
+            rr = vramAccess(surf + o * 4, dst + o, n, false, nativeLut);
+        }
+        return rr == kIOReturnSuccess;
+    };
+    auto diff = [&](const UInt32 *back) -> UInt32 {
+        UInt32 d = 0;
+        for (UInt32 i = 0; i < kWords; ++i)
+            if (back[i] != lut[i]) ++d;
+        return d;
+    };
+    UInt32 *back = static_cast<UInt32 *>(IOMalloc(kWords * 4));
+    bool unchanged = false;
+    if (back) {
+        bzero(back, kWords * 4);
+        unchanged = readLut(back) && diff(back) == 0;
+    }
+    IOReturn r = kIOReturnSuccess;
+    for (UInt32 o = 0; !unchanged && o < kWords && r == kIOReturnSuccess; o += 1024) {
+        const UInt32 n = kWords - o < 1024 ? kWords - o : 1024;
+        r = vramAccess(surf + o * 4, lut + o, n, true, nativeLut);
+    }
+    // 0.180.13: measure the programmed LUT, not just trust the write. This
+    // catches a backed/unbacked BAR1 window or a cursor/LUT scratch overlap
+    // before the desktop silently runs on stale gamma.
+    bool verified = unchanged;
+    UInt32 mismatch = 0;
+    if (!unchanged && r == kIOReturnSuccess && back) {
+        bzero(back, kWords * 4);
+        if (readLut(back)) {
+            mismatch = diff(back);
+            verified = mismatch == 0;
+        }
+    }
+    if (back) IOFree(back, kWords * 4);
+    if (unchanged) {
+        UInt32 skips = 0;
+        if (OSNumber *n = OSDynamicCast(OSNumber, getProperty("NVGspControl-gamma-skips")))
+            skips = n->unsigned32BitValue();
+        setProperty("NVGspControl-gamma-skips", skips + 1, 32);
+    }
+    if (r == kIOReturnSuccess) {
+        setProperty("NVGspControl-gamma-verified", verified);
+        setProperty("NVGspControl-gamma-readback-mismatch", mismatch, 32);
+    }
+    if (gammaLock) IOLockUnlock(gammaLock);
     IOFree(lut, kWords * 4);
-    if (r != kIOReturnSuccess) return r;
+    if (r == kIOReturnSuccess) {
+        UInt32 sets = 0;
+        if (OSNumber *n = OSDynamicCast(OSNumber, getProperty("NVGspControl-gamma-sets")))
+            sets = n->unsigned32BitValue();
+        setProperty("NVGspControl-gamma-sets", sets + 1, 32);
+        setProperty("NVGspControl-gamma-surface", surf, 64);
+        // 0.180.153: the native615 head's OLUT is enabled by disp_all.py
+        setProperty("NVGspControl-gamma-olut-active", nativeLut || mode_.olut);
+    }
+    return r;
+}
+
+// 0.142.0: the identity LUT from olutSetup() for window 0 (chid 1): own
+// ctxdma object at RAMIN+0x20E0, RAMHT entries for chid 1 at the nouveau
+// slot (window ISO lives there) and at the hClient-hashed one.
+IOReturn NVGspControl::ilutSetup() {
+    if (!dispInstOffset_ || !scratchOffset_ || scratchTry_ < 0xFF90000)
+        return kIOReturnNotReady;
+    const UInt64 surf = scratchOffset_ + 0xFF80000;
     constexpr UInt32 kChid = 1;
     UInt32 h = kIlutCtxdma, hash = 0;
     while (h) { hash ^= h & 0x3ff; h >>= 10; }
@@ -3904,7 +4947,8 @@ IOReturn NVGspControl::ilutSetup() {
 
 IOReturn NVGspControl::cursorSetup() {
     if (cursorReady_) return kIOReturnSuccess;
-    if (!dispInstOffset_ || !scratchOffset_ || !corePut_ || !internalClient_)
+    if (!dispInstOffset_ || !scratchOffset_ || scratchTry_ < 0xFF90000 ||
+        !corePut_ || !internalClient_)
         return kIOReturnNotReady;
     UInt8 reply[256];
     UInt32 replyBytes = sizeof(reply), result = ~0U;
@@ -3933,20 +4977,72 @@ IOReturn NVGspControl::cursorSetup() {
     if (r == kIOReturnSuccess && replyBytes >= 100) __builtin_memcpy(&st, reply + 96, 4);
     setProperty("NVGspControl-cursor-alloc-status", st, 32);
     if (st != 0 && st != 0x56) return kIOReturnIOError;  // 0x56: already ours
-    // 0.138.0: own tight ctxdma (RAMIN+0x20A0) over the two 16 KiB cursor
-    // buffers, like NVIDIA's per-surface ctxdmas, instead of the window's
-    // [0, 16 GiB) one; RAMHT entry at both the nouveau slot and NVIDIA's
-    // (disp_inst_mem_0300.c also hashes hClient[7:0] << 2).
-    cursorBase_ = scratchOffset_ + 0xFF00000;
+    // 0.138.0: own tight ctxdma (RAMIN+0x20A0) over the two cursor buffers,
+    // like NVIDIA's per-surface ctxdmas, instead of the window's
+    // [0, 16 GiB) one.
+    // 0.180.9: the live head's HEAD_USAGE_BOUNDS is 0x1014 (W256_H256), so
+    // program a 256x256 cursor: two 256 KiB buffers (512 KiB ctxdma). The
+    // previous 16 KiB tight object could not back a W256 fetch, and writing
+    // HEAD_USAGE_BOUNDS on a live head tore the head down (7 Nov: all head
+    // pixel clocks went to 0 and the core UPDATE never retired). Never touch
+    // usage bounds here; match what the GSP already armed.
+    cursorBase_ = scratchOffset_ + 0xFF00000;   // 256 KiB aligned
+    // 0.180.11: publish the head's armed usage bounds (read-only). The 7 Nov
+    // experiments showed that writing this register on a live head tears the
+    // head down (all head pixel clocks 0, the core UPDATE never retires), so
+    // it is never written; the value is recorded for the cursor log instead.
+    if (IOMemoryMap *m = sharedBar0Map(pci_)) {
+        if (m->getLength() >= 0x68A034) {
+            Bar0Io ub{m};
+            UInt32 u = 0;
+            if (ub.read(0x68A030, &u)) setProperty("NVGspControl-cursor-usage-armed", u, 32);
+        }
+        m->release();
+    }
     UInt32 h = kCursorCtxdma, hash = 0;
     while (h) { hash ^= h & 0x3ff; h >>= 10; }
-    const UInt32 ent[2] = {kCursorCtxdma, (0xc0d00001 & 0x3fff) | (0x20A0U << 9)};
     const UInt32 dma[4] = {0x5, static_cast<UInt32>(cursorBase_ >> 8), 0,
-                           static_cast<UInt32>((cursorBase_ + 0x7fff) >> 8)};
+                           static_cast<UInt32>((cursorBase_ + 0x7FFFF) >> 8)};
     lk(__LINE__);
-    const bool ok = praminWriteWords(pci_, dispInstOffset_ + 0x20A0, dma, 4) &&
-        praminWriteWords(pci_, dispInstOffset_ + hash * 8, ent, 2) &&
-        praminWriteWords(pci_, dispInstOffset_ + (hash ^ ((0xc0d00001 & 0xff) << 2)) * 8, ent, 2);
+    bool ok = praminWriteWords(pci_, dispInstOffset_ + 0x20A0, dma, 4);
+    // 0.180.11: register the handle for every channel context the display
+    // core may use (RAMHT is per-chid) at the PLAIN hash10 slot only. The
+    // core channel does not hash the hClient term: the notifier ctxdma at
+    // RAMIN+0x2040 has always worked with a plain hash10 slot, and nouveau's
+    // nvkm_ramht_hash has no client term (the ^ ((hClient & 0xff) << 2) form
+    // belongs to NVIDIA's RM insertion). Inspect each slot first and never
+    // overwrite a foreign entry: a hand-built write can silently clobber a
+    // GSP-RM object that hashes to the same slot.
+    UInt32 ramhtForeign = 0;
+    for (UInt32 chid = 0; ok && chid < 4; ++chid) {
+        const UInt32 slot = hash ^ (chid << 6);
+        UInt32 cur[2] = {0, 0};
+        ok = praminReadWords(pci_, dispInstOffset_ + slot * 8, cur, 2);
+        char prop[40];
+        snprintf(prop, sizeof prop, "NVGspControl-cursor-ramht%u", chid);
+        setProperty(prop, cur[0], 32);
+        if (ok && cur[0] != 0 && cur[0] != kCursorCtxdma) {
+            ++ramhtForeign;
+            continue;
+        }
+        const UInt32 ent[2] = {kCursorCtxdma,
+            (chid << 25) | (0xc0d00001 & 0x3fff) | (0x20A0U << 9)};
+        ok = praminWriteWords(pci_, dispInstOffset_ + slot * 8, ent, 2);
+    }
+    setProperty("NVGspControl-cursor-ramht-foreign", ramhtForeign, 32);
+    // Zero both 256 KiB surfaces once so the 64x64 image sits in a fully
+    // transparent 256x256 cursor (the hardware reads the whole surface).
+    if (ok) {
+        UInt32 *z = static_cast<UInt32 *>(IOMalloc(0x4000));
+        if (!z) {
+            ok = false;   // 0.180.11: never expose stale VRAM as a cursor
+        } else {
+            bzero(z, 0x4000);
+            for (UInt32 o = 0; ok && o < 0x80000; o += 0x1000)
+                ok = vramAccess(cursorBase_ + o, z, 0x1000 / 4, true);
+            IOFree(z, 0x4000);
+        }
+    }
     ulk();
     if (!ok) return kIOReturnIOError;
     setProperty("NVGspControl-cursor-unstick", static_cast<UInt32>(coreUnstick()), 32);
@@ -3959,85 +5055,98 @@ IOReturn NVGspControl::cursorSetup() {
 IOReturn NVGspControl::cursorImage(const UInt32 *argb64x64, UInt32 hotX, UInt32 hotY) {
     IOReturn r = cursorSetup();
     if (r != kIOReturnSuccess) return r;
+    if (!argb64x64) return kIOReturnBadArgument;
     const UInt32 next = cursorBuf_ ^ 1;
-    const UInt64 surf = cursorBase_ + next * 0x4000;
-    r = vramAccess(surf, const_cast<UInt32 *>(argb64x64), 1024, true);
-    for (UInt32 i = 1; r == kIOReturnSuccess && i < 4; ++i)
-        r = vramAccess(surf + i * 4096, const_cast<UInt32 *>(argb64x64 + i * 1024), 1024, true);
+    const UInt64 surf = cursorBase_ + next * 0x40000;   // 256 KiB cursor surface
+    setProperty("NVGspControl-cursor-surface", static_cast<UInt64>(surf), 64);
+    // 0.180.13: the hardware surface is 256x256 with a 1024-byte pitch. The
+    // old code wrote 16 KiB packed as 64-pixel rows, so the hardware read
+    // four image rows per cursor row and the image was garbled. Build one
+    // 64 KiB staging block with the real pitch, then upload it in 4 KiB
+    // pieces (the rest of the 256x256 surface is already transparent).
+    UInt32 *packed = static_cast<UInt32 *>(IOMalloc(0x10000));
+    if (!packed) return kIOReturnNoMemory;
+    bzero(packed, 0x10000);
+    for (UInt32 y = 0; y < 64; ++y)
+        __builtin_memcpy(packed + y * 256, argb64x64 + y * 64, 64 * 4);
+    for (UInt32 o = 0; r == kIOReturnSuccess && o < 0x10000; o += 0x1000)
+        r = vramAccess(surf + o, packed + o / 4, 0x1000 / 4, true);
+    IOFree(packed, 0x10000);
     if (r != kIOReturnSuccess) return r;
+    // 0.180.9: the head's armed usage bounds is 0x1014 (W256_H256). Request
+    // the matching W256 control (size bits 9:8 = 3) and a 256 KiB surface;
+    // requesting W64 against a W256-only head, or rewriting usage bounds on
+    // a live head, is what faulted the core channel before.
     const UInt32 control = 0x80000000U | ((hotY & 0xff) << 20) | ((hotX & 0xff) << 12) |
-        (1U << 8) | 0xCF;   // ENABLE | hotspot | W64_H64 | A8R8G8B8
-    // Reserve at least64px while preserving any larger initialized capacity.
-    // Enabled cursor also requires the normal composition/ILUT/OLUT path;
-    // bounds alone did not resolve the bypass-path UPDATE rejection.
-    UInt32 usage = 0x1110;
-    {
-        IOMemoryMap *m = sharedBar0Map(pci_);
-        const bool ok = m && m->getLength() >= 0x68A034 && Bar0Io{m}.read(0x68A030, &usage);
-        if (m) m->release();
-        if (!ok || (usage & 7U) > 4U) return kIOReturnIOError;
-    }
-    const UInt32 capacity = (usage & 7U) < 2U ? 2U : usage & 7U;
-    usage = (usage & ~7U) | capacity;
-    const UInt32 relative = static_cast<UInt32>((surf - cursorBase_) >> 8);
-    UInt32 expected[] = {kCursorCtxdma,kCursorCtxdma,relative,relative,0,
-        cursorVisible_ ? control : (control & 0x7fffffffU),0x75ff};
+        (3U << 8) | 0xCF;   // ENABLE | hotspot | W256_H256 | A8R8G8B8
+    const UInt32 cursorDma = kCursorCtxdma;
+    const UInt32 cursorOff = static_cast<UInt32>((surf - cursorBase_) >> 8);
     const UInt32 words[] = {
-        (1U << 18) | 0x2030, usage,
         (1U << 18) | 0x2098, 0,                          // PRESENT_CONTROL_CURSOR mono
-        (2U << 18) | 0x2088, kCursorCtxdma, kCursorCtxdma, // both cursor DMA slots
-        // The cursor DMA object starts at cursorBase_; OFFSET is relative
-        // to that object, not an absolute VRAM address (NVIDIA SetCursorSurfaceAddress).
-        (2U << 18) | 0x2090, static_cast<UInt32>((surf - cursorBase_) >> 8),
-        static_cast<UInt32>((surf - cursorBase_) >> 8),   // both cursor offsets
+        (2U << 18) | 0x2088, cursorDma, cursorDma,        // both cursor DMA slots
+        (2U << 18) | 0x2090, cursorOff, cursorOff,        // both cursor offsets
         (1U << 18) | 0x209C, cursorVisible_ ? control : (control & 0x7fffffffU),
-        (1U << 18) | 0x20A0, 0x75FF,                     // non-premultiplied alpha
-        (2U << 18) | 0x218, 0, 0,                        // no interlocks
+        (1U << 18) | 0x20A0, 0x75FF,                     // non-premultiplied alpha (nvkms NON_PREMULT_ALPHA: K1=255, K1*SRC, NEG_K1*SRC)
+        (1U << 18) | 0x218, 0,                           // no interlocks
         (1U << 18) | 0x200, 1,                           // UPDATE, RELEASE_ELV
     };
+    cursorControl_ = control;
+    setProperty("NVGspControl-cursor-control", control, 32);
+    setProperty("NVGspControl-cursor-offset", cursorOff, 32);
+    // 0.180.11: clear any stale display-core interlock before every cursor
+    // submit. CONTROL_CURSOR faults the core PB (GET stuck at 68) when a
+    // previous UPDATE left SET_WINDOW_INTERLOCK_FLAGS armed; coreUnstick
+    // releases it so the cursor enable can retire.
+    coreUnstick();
     r = submitCore(words, sizeof(words) / 4);
-    if (r == kIOReturnSuccess) r = waitCursorArmed(usage, expected);
+    setProperty("NVGspControl-cursor-submit-result", static_cast<UInt32>(r), 32);
+    if (r == kIOReturnSuccess) cursorBuf_ = next;
+    // 0.138.0: a rejected UPDATE leaves an FE exception pending; ack it and
+    // report failure so NVDisplay falls back to the software cursor.
     if (r == kIOReturnSuccess) {
-        cursorControl_ = control;
-        cursorBuf_ = next;
-    } else {
-        // Restore a disabled image at the same capacity; never shrink live
-        // cursor resources on this failure path. Report cleanup separately.
-        expected[5] = control & 0x7fffffffU;
-        const UInt32 off[] = {(1U << 18) | 0x209C, expected[5],
-                              (2U << 18) | 0x218, 0, 0, (1U << 18) | 0x200, 1};
-        IOReturn cleanup = submitCore(off, sizeof(off) / 4);
-        if (cleanup == kIOReturnSuccess) cleanup = waitCursorArmed(usage, expected);
-        setProperty("NVGspControl-cursor-failure-disable-result", static_cast<UInt32>(cleanup), 32);
-        cursorVisible_ = false;
-        cursorControl_ = 0; // another image must ARM before show is usable
+        IODelay(2000);
+        const bool exc = coreException();
+        setProperty("NVGspControl-cursor-exception", exc);
+        if (exc) {
+            // The rejected enable stays in ASSY and every later core UPDATE
+            // re-validates it (27 Sep: plain UPDATEs kept faulting), so put
+            // the cursor back to disabled before giving up.
+            const UInt32 off[] = {(1U << 18) | 0x209C, control & 0x7fffffffU,
+                                  (1U << 18) | 0x218, 0, (1U << 18) | 0x200, 1};
+            coreUnstick();
+            submitCore(off, sizeof(off) / 4);
+            IODelay(2000);
+            coreException();
+            cursorVisible_ = false;
+            r = kIOReturnIOError;
+        }
     }
     return r;
 }
 
 IOReturn NVGspControl::cursorShow(bool visible) {
-    if (!cursorReady_ || !cursorControl_) return kIOReturnNotReady;
-    UInt32 usage = 0, expected[7] = {};
-    if (peekBar0(0x68a030, 1, &usage) != kIOReturnSuccess ||
-        peekBar0(0x68a088, 7, expected) != kIOReturnSuccess) return kIOReturnIOError;
-    expected[5] = visible ? cursorControl_ : (cursorControl_ & 0x7fffffffU);
+    if (!cursorReady_) return kIOReturnNotReady;
+    cursorVisible_ = visible;
     const UInt32 words[] = {
         (1U << 18) | 0x209C, visible ? cursorControl_ : (cursorControl_ & 0x7fffffffU),
-        (2U << 18) | 0x218, 0, 0,
+        (1U << 18) | 0x218, 0,
         (1U << 18) | 0x200, 1,
     };
+    // 0.180.11: clear any stale display-core interlock before every cursor
+    // submit, same as cursorImage (CONTROL_CURSOR faults the core PB).
+    coreUnstick();
     IOReturn r = submitCore(words, sizeof(words) / 4);
-    if (r == kIOReturnSuccess) r = waitCursorArmed(usage, expected);
-    if (r == kIOReturnSuccess) cursorVisible_ = visible;
-    else {
-        expected[5] = cursorControl_ & 0x7fffffffU;
-        const UInt32 off[] = {(1U << 18) | 0x209C, expected[5],
-                              (2U << 18) | 0x218, 0, 0, (1U << 18) | 0x200, 1};
-        IOReturn cleanup = submitCore(off, sizeof(off) / 4);
-        if (cleanup == kIOReturnSuccess) cleanup = waitCursorArmed(usage, expected);
-        setProperty("NVGspControl-cursor-failure-disable-result", static_cast<UInt32>(cleanup), 32);
-        cursorVisible_ = false;
-        cursorControl_ = 0; // require another verified image after a failed transition
+    if (r == kIOReturnSuccess) {
+        IODelay(2000);
+        if (coreException()) {
+            const UInt32 off[] = {(1U << 18) | 0x209C, cursorControl_ & 0x7fffffffU,
+                                  (1U << 18) | 0x218, 0, (1U << 18) | 0x200, 1};
+            submitCore(off, sizeof(off) / 4);
+            IODelay(2000);
+            coreException();
+            cursorVisible_ = false;
+            r = kIOReturnIOError;
+        }
     }
     return r;
 }
@@ -4056,58 +5165,65 @@ IOReturn NVGspControl::cursorTest(UInt32 op) {
     cursorVisible_ = true;
     r = cursorImage(img, 0, 0);
     IOFree(img, 64 * 64 * 4);
-    if (r == kIOReturnSuccess) r = cursorMove(64, 64);
+    if (r == kIOReturnSuccess) r = cursorMove(64, 64);   // report a failed move, not just the image upload
     setProperty("NVGspControl-cursor-test", static_cast<UInt32>(r), 32);
     return r;
 }
 
 IOReturn NVGspControl::cursorMove(SInt32 x, SInt32 y) {
-    // Cursor PIO (user area 0x6D8000 + head*0x1000): hot-spot point out, then
-    // UPDATE (nvkms MoveCursorC3). Each store needs its own free-space check.
+    // Cursor PIO (user area 0x6D8000 + head*0x1000, class C57A): wait for Free
+    // before EACH push (nvkms MoveCursorC5, 0.1 s bound), hot-spot point out,
+    // then UPDATE with FLIP_LOCK_PIN_NONE. Free (0x008) must be non-zero.
     if (!cursorReady_ || !pci_) return kIOReturnNotReady;
     IOMemoryMap *map = sharedBar0Map(pci_);
     if (!map || map->getLength() < 0x6D9000) { if (map) map->release(); return kIOReturnNoMemory; }
     Bar0Io bar0{map};
-    const auto waitFree = [&bar0]() -> IOReturn {
-        for (UInt32 i = 0; i < 100; ++i) {
-            UInt32 space = 0;
-            if (!bar0.read(0x6D8008, &space)) return kIOReturnIOError;
-            if (space & 0x3fU) return kIOReturnSuccess;
-            IOSleep(1);
+    const auto waitFree = [&bar0]() {
+        UInt32 fr = 0;
+        for (UInt32 i = 0; i < 10000; ++i) {          // nvkms: 0.1 s
+            if (bar0.read(0x6D8008, &fr)) return fr != 0;
+            IODelay(10);
         }
-        return kIOReturnTimeout;
+        return false;
     };
-    IOReturn result = waitFree();
-    if (result == kIOReturnSuccess &&
-        !bar0.write(0x6D8208, (static_cast<UInt32>(y & 0xffff) << 16) |
-                              static_cast<UInt32>(x & 0xffff))) result = kIOReturnIOError;
-    if (result == kIOReturnSuccess) result = waitFree();
-    if (result == kIOReturnSuccess && !bar0.write(0x6D8200, 0)) result = kIOReturnIOError;
+    bool ok = waitFree();
+    if (ok)
+        ok = bar0.write(0x6D8208, (static_cast<UInt32>(y & 0xffff) << 16) |
+                                  static_cast<UInt32>(x & 0xffff));
+    if (ok) ok = waitFree();
+    if (ok) ok = bar0.write(0x6D8200, 0);
     map->release();
-    return result;
+    setProperty("NVGspControl-cursor-move", (static_cast<UInt32>(y & 0xffff) << 16) |
+                                            static_cast<UInt32>(x & 0xffff), 32);
+    return ok ? kIOReturnSuccess : kIOReturnTimeout;
 }
 
 // 0.87.0: GSP LibOS log buffer read-out (LOGINIT 0, LOGINTR 1, LOGRM 2,
 // LOGMNOC 3, LOGKRNL 4; 64 KiB each) for host-side decoding.
 IOReturn NVGspControl::readGspLog(UInt32 index, UInt32 offset, UInt8 *out, UInt32 bytes) {
     // 0.99.2: index 8 = shared queue memory (516 KiB: PTEs, cmd, status).
+    // 0.180.12: do the range check in 64 bits. `offset + bytes` used to wrap in
+    // UInt32 and let a caller read up to 4 GiB past the 64 KiB snapshot.
+    if (!out || !bytes || bytes > 4096) return kIOReturnBadArgument;
     if (index == 8) {
-        if (!lock_ || !out || !bytes || bytes > 4096 || offset + bytes > nvgsp::kGspSharedBytes)
-            return kIOReturnBadArgument;
+        const UInt64 end = UInt64(offset) + bytes;
+        if (!lock_ || end > nvgsp::kGspSharedBytes) return kIOReturnBadArgument;
         lk(__LINE__);
         const bool okq = init_.snapshotQueue(offset, out, bytes);
         ulk();
         return okq ? kIOReturnSuccess : kIOReturnNotReady;
     }
-    if (!lock_ || index >= 5 || !out || !bytes || bytes > 4096 || offset + bytes > 0x10000)
-        return kIOReturnBadArgument;
-    UInt8 *copy = static_cast<UInt8 *>(IOMalloc(0x10000));
+    const UInt64 end = UInt64(offset) + bytes;
+    if (!lock_ || index >= nvgsp::kGspLogCount ||
+        end > nvgsp::kGspLogs[index].bytes) return kIOReturnBadArgument;
+    const UInt32 logBytes = nvgsp::kGspLogs[index].bytes;
+    UInt8 *copy = static_cast<UInt8 *>(IOMalloc(logBytes));
     if (!copy) return kIOReturnNoMemory;
     lk(__LINE__);
-    const bool ok = init_.snapshotLog(index, copy, 0x10000);
+    const bool ok = init_.snapshotLog(index, copy, logBytes);
     ulk();
     if (ok) __builtin_memcpy(out, copy + offset, bytes);
-    IOFree(copy, 0x10000);
+    IOFree(copy, logBytes);
     return ok ? kIOReturnSuccess : kIOReturnNotReady;
 }
 
@@ -4207,6 +5323,49 @@ constexpr UInt32 kHeadAddrs[] = {
 };
 }  // namespace
 
+// 0.180.171: the head's output colour-space conversion (OCSC0, method 0x2240)
+// was enabled with only three of its twelve matrix coefficients programmed;
+// the rest came from the live armed head state, so an arbitrary colour matrix
+// sat in the pixel path - the desktop looked washed out on the monitor while
+// the scan-out memory still held the right colours. The OS already delivers
+// sRGB pixels, so the head must pass them through: OCSC0 stays disabled unless
+// someone programmes the whole matrix (NVRAM nvgsp-olut-csc=1 restores the old
+// behaviour for comparison).
+static bool olutCscWanted() {
+    static int latched = -1;
+    if (latched < 0) {
+        latched = 0;
+        if (IORegistryEntry *o = IORegistryEntry::fromPath("/options", gIODTPlane)) {
+            if (OSData *d = OSDynamicCast(OSData, o->getProperty("nvgsp-olut-csc")))
+                latched = !(d->getLength() >= 1 && static_cast<const char *>(d->getBytesNoCopy())[0] == '0');
+            o->release();
+        }
+    }
+    return latched == 1;
+}
+
+// 0.180.173: the head's output LUT is bypassed by default. A working NVIDIA
+// macOS framebuffer (nullmoth/nvidia-macos-driver, nvrm-fb.cpp) ignores
+// setGammaTable and runs its pipeline as "CSC IDENT ILUT OFF OLUT OFF", i.e.
+// the scan-out values reach the panel untouched - and its colours are correct.
+// Ours loaded a 1025-entry 16-bit-float "identity" ramp and the desktop looked
+// washed out on the monitor, so the ramp is not neutral in this pipeline
+// (domain/format, not the coefficient values: the readback matched). Until the
+// ramp format is proven on hardware, pass through; NVRAM nvgsp-olut=1 brings
+// the LUT back for comparison.
+static bool olutWanted() {
+    static int latched = -1;
+    if (latched < 0) {
+        latched = 1;                       // 0.180.174: on (UNORM16 ramp now)
+        if (IORegistryEntry *o = IORegistryEntry::fromPath("/options", gIODTPlane)) {
+            if (OSData *d = OSDynamicCast(OSData, o->getProperty("nvgsp-olut")))
+                latched = !(d->getLength() >= 1 && static_cast<const char *>(d->getBytesNoCopy())[0] == '0');
+            o->release();
+        }
+    }
+    return latched == 1;
+}
+
 // 0.93.0: full driver-driven modeset cycle on head 0 in nouveau order
 // (SET_MANUAL_DP, detach, DP release, ASSIGN_SOR, sink D0, train,
 // CONFIG_STREAM, attach), byte-identical to the passing modeset3.py run.
@@ -4269,14 +5428,28 @@ IOReturn NVGspControl::setMode(const UInt32 t[10], UInt32 *statusOut) {
     const UInt32 pclkKHz = t[0], hA = t[1], hB = t[2], hSO = t[3], hSW = t[4];
     const UInt32 vA = t[5], vB = t[6], vSO = t[7], vSW = t[8], flags = t[9];
     const UInt64 pclk = UInt64(pclkKHz) * 1000;
-    constexpr UInt64 kLane = 540000000ULL;   // HBR2 8b/10b, bytes/s per lane
-    if (!pclk || hA <= 60 || hA > kDesktopSurface.width || vA > kDesktopSurface.height ||
-        !vA || !hSW || !vSW || hSO + hSW >= hB || vSO + vSW >= vB ||
-        pclk * 30 >= 8 * kLane * 4 || pclk >= 0x80000000ULL ||
-        pclk * 15 < 1400000000ULL)   // VPLL: P <= 15 and VCO >= 1.4 GHz
+    const UInt64 kLane = dpLaneBytes();   // link rate from DPCD, HBR2 fallback
+    const UInt64 kLink = kLane * dpLaneCount();
+    auto vpllPossible = [](UInt64 p) {
+        for (UInt32 div = 1; div <= 15; ++div) {
+            const UInt64 vco = p * div;
+            if (vco >= 1400000000ULL && vco <= 1700000000ULL) return true;
+        }
+        return false;
+    };
+    // Raster fields are packed into 16-bit hardware registers. Do the sums in
+    // 64 bits so malformed blanking/sync values cannot wrap and program a
+    // different mode than the one that was validated.
+    const UInt64 hT64 = UInt64(hA) + hB, vT64 = UInt64(vA) + vB;
+    if (!pclk || hA <= 60 || hA > kMaxScanoutWidth || vA > kMaxScanoutHeight ||
+        !vA || !hSW || !vSW || hB > 0x8000 || vB > 0x8000 ||
+        UInt64(hSO) + hSW >= hB || UInt64(vSO) + vSW >= vB ||
+        hT64 > 0xffff || vT64 > 0xffff ||
+        pclk * 30 >= 8 * kLink || pclk >= 0x80000000ULL ||
+        !vpllPossible(pclk))
         return kIOReturnBadArgument;
     HeadMode m{};
-    const UInt32 hT = hA + hB, vT = vA + vB;
+    const UInt32 hT = static_cast<UInt32>(hT64), vT = static_cast<UInt32>(vT64);
     const UInt32 hBE = hB - hSO - 1, vBE = vB - vSO - 1;   // sync + back porch - 1
     m.pclkHz = static_cast<UInt32>(pclk);
     m.hActive = hA;
@@ -4294,10 +5467,10 @@ IOReturn NVGspControl::setMode(const UInt32 t[10], UInt32 *statusOut) {
     const UInt32 steer = (hA % 4) ? (4 - hA % 4) * 30 : 0;
     const UInt32 blankBits = 3 * 8 * 4 * 2 + 3 * 8 * 4 + steer;
     const UInt32 minHBlank =
-        static_cast<UInt32>(UInt64(blankBits) * 100000 / 32 * pclk / kLane / 100000) + 12;
+        static_cast<UInt32>(UInt64(blankBits) * 100000 / 32 * pclk / kLink / 100000) + 12;
     if (minHBlank > hB) return kIOReturnBadArgument;
-    const SInt64 hs = SInt64((UInt64(hB - minHBlank) * kLane) / pclk) - 7;
-    const SInt64 vs = SInt64((UInt64(hA - 40) * kLane) / pclk) - 13;
+    const SInt64 hs = SInt64((UInt64(hB - minHBlank) * kLink) / pclk) - 7;
+    const SInt64 vs = SInt64((UInt64(hA - 40) * kLink) / pclk) - 13;
     m.hBlankSym = hs < 0 ? 0 : static_cast<UInt32>(hs);
     m.vBlankSym = vs < 0 ? 0 : static_cast<UInt32>(vs);
     m.valid = true;
@@ -4316,18 +5489,59 @@ IOReturn NVGspControl::setMode(const UInt32 t[10], UInt32 *statusOut) {
     }
     const HeadMode prev = mode_;
     const WindowSurface prevSurf = desktopSurface_;
+    const UInt64 prevOffset = desktopOffset_;
+    const UInt32 prevHandle = modeSurfaceHandle_;
+    UInt32 newHandle = 0;
+    UInt64 newOffset = 0;
+    UInt32 newPitch = kDesktopSurface.pitch;
+    const bool bigSurface = hA > kDesktopSurface.width || vA > kDesktopSurface.height;
+    if (bigSurface) {
+        // 0.180.13: the firmware surface is 4K. Allocate a private zeroed
+        // scan-out object for 8K-class modes instead of pointing the window
+        // at VRAM past the GOP surface. A failed allocation leaves the old
+        // mode and surface untouched.
+        newPitch = static_cast<UInt32>((UInt64(hA) * 4 + 63ULL) & ~63ULL);
+        const UInt64 bytes = UInt64(newPitch) * vA;
+        if (!newPitch || bytes > (256ULL << 20) || bytes > kMaxAllocBytes)
+            return kIOReturnNoResources;
+        UInt64 phys = 0;
+        const IOReturn a = memAlloc(this, bytes, 0, &newHandle, &phys);
+        if (a != kIOReturnSuccess) return a;
+        newOffset = phys;
+        // This object is the current scan-out surface: never an eviction
+        // candidate, and never freed by a client-close path.
+        lk(__LINE__);
+        if (newHandle && newHandle <= kMaxMem) mem_[newHandle - 1].client = false;
+        ulk();
+    }
     mode_ = m;
-    desktopSurface_ = WindowSurface{kDesktopSurface.pitch, hA, vA, kDesktopSurface.format};
+    desktopSurface_ = WindowSurface{newPitch, hA, vA, kDesktopSurface.format};
+    desktopOffset_ = newOffset;
+    setProperty("NVGspControl-mode-surface", desktopOffset_, 64);
+    setProperty("NVGspControl-mode-surface-handle", newHandle, 32);
     setProperty("NVGspControl-mode-raster", m.rasterSize, 32);
     setProperty("NVGspControl-mode-pclk", m.pclkHz, 32);
     setProperty("NVGspControl-mode-hblank-sym", m.hBlankSym, 32);
     setProperty("NVGspControl-mode-vblank-sym", m.vBlankSym, 32);
     UInt32 code = ~0U;
     const IOReturn r = modesetHead0(&code);
-    if (r != kIOReturnSuccess && prev.valid != m.valid) {
+    const bool restore = (r != kIOReturnSuccess && prev.valid != m.valid);
+    if (restore) {
         // first switch failed: keep the firmware mode for later modesets
         mode_ = prev;
         desktopSurface_ = prevSurf;
+        desktopOffset_ = prevOffset;
+        modeSurfaceHandle_ = prevHandle;
+        if (newHandle) memFree(this, newHandle);
+    } else {
+        // The new mode (or the attempted valid-to-valid switch) owns the
+        // surface from now on. Retire the old private scan-out object only
+        // after the window no longer points at it; a failed valid-to-valid
+        // update keeps both so a partially latched window cannot scan freed
+        // VRAM.
+        if (r == kIOReturnSuccess && prevHandle && prevHandle != newHandle)
+            memFree(this, prevHandle);
+        modeSurfaceHandle_ = newHandle ? newHandle : (r == kIOReturnSuccess ? 0 : prevHandle);
     }
     *statusOut = code;
     setProperty("NVGspControl-mode-result", code, 32);
@@ -4429,21 +5643,18 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
             case 0x2070: vals[i] = mode_.blankStart; break;
             case 0x2218: vals[i] = mode_.minFrameIdle; break;
             // 0.140.0: OLUT the nvkms way (EvoSetOutputLutC5): DIRECT10 +
-            // interpolate, 4 VSS header + 1025 fixed-point entries, norm 1.0,
+            // interpolate, 4 VSS header + 1025 FP16 entries, norm 1.0,
             // OCSC0 identity enabled after the LUT.
             // 0.165.0: interpolation off, as Linux's head 0 (0x40508)
-            case 0x2280: if (mode_.olut) vals[i] = 0x40508; break;
-            case 0x2284: if (mode_.olut) vals[i] = 0xffffffff; break;
-            case 0x2288: if (mode_.olut) vals[i] = kOlutCtxdma; break;
-            case 0x228c: if (mode_.olut) vals[i] = 0; break;
-            case 0x2240: if (mode_.olut) vals[i] = 1; break;
-            // nvCscCoefConvertS514 encodes 1.0 as 0x10000 (S5.14
-            // shifted by two register bits). Replace the entire 3x4
-            // matrix: snapshot coefficients may include gamut/offset terms.
-            case 0x2244: case 0x2258: case 0x226c: if (mode_.olut) vals[i] = 0x10000; break;
-            case 0x2248: case 0x224c: case 0x2250: case 0x2254:
-            case 0x225c: case 0x2260: case 0x2264: case 0x2268:
-            case 0x2270: if (mode_.olut) vals[i] = 0; break;
+            case 0x2280: vals[i] = (mode_.olut && olutWanted()) ? 0x40509U : 0U; break;
+            case 0x2284: if (mode_.olut && olutWanted()) vals[i] = 0xffffffff; break;
+            case 0x2288: if (mode_.olut && olutWanted()) vals[i] = kOlutCtxdma; break;
+            case 0x228c: if (mode_.olut && olutWanted()) vals[i] = 0; break;
+            // 0.180.171: pass-through unless the whole matrix is programmed
+            // (0.180.172: write 0 explicitly - the live armed value from the
+            // previous boot was 1, and the table only overrides fields it sets)
+            case 0x2240: vals[i] = (mode_.olut && olutCscWanted()) ? 1U : 0U; break;
+            case 0x2244: case 0x2258: case 0x226c: if (mode_.olut && olutCscWanted()) vals[i] = 0x10000; break;
             case 0x2030:   // HEAD_USAGE_BOUNDS.CURSOR
                 if (mode_.cursor64) vals[i] = (vals[i] & ~7U) | 2;
                 // 0.165.0: OLUT_ALLOWED (bit 4, clc67d.h). The OLUT test in
@@ -4524,7 +5735,7 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
         UInt32 st = ~0U;
         for (UInt32 t = 0; t < 3; ++t) {
             UInt8 p[28] = {};
-            const UInt32 d = 0x200, c = 0x2083, dt = 0x1404;
+            const UInt32 d = 0x200, c = 0x2083, dt = dpTrainingData();
             __builtin_memcpy(p + 4, &d, 4);
             __builtin_memcpy(p + 8, &c, 4);
             __builtin_memcpy(p + 12, &dt, 4);
@@ -4542,21 +5753,29 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
     // 8. SST stream config (dpLink 1, override 1, hblank 134, vblank 3835,
     // enhanced framing 1, TU 64, watermark 20 — nouveau watermark values).
     {
-        UInt8 p[84] = {};
-        // 0.137.0: hblank/vblank symbols follow the mode (dp_watermark.cpp
-        // SST, HBR2); TU 64 / watermark 20 hold for every mode up to 4K60.
+        // NV0073_CTRL_CMD_DP_CONFIG_STREAM_PARAMS (ctrl0073dp.h; NvBool is
+        // NvU8): bEnableOverride 0x10, bMST 0x11, singleHeadMultistreamMode
+        // 0x14, hBlankSym 0x18, vBlankSym 0x1C, colorFormat 0x20, SST at 0x44,
+        // sizeof 0x54 - the layout disp_all.py uses. 0.180.176 shifted these
+        // by 4 and set colorFormat 1, which is YCbCr444 (DP_COLORFORMAT RGB =
+        // 0) at the bEnableTwoHeadOneOr byte. The washed-out panel was the
+        // OLUT table format (disp_all.py, 2026-11-17), not this.
+        UInt8 p[0x54] = {};
         const UInt32 one = 1, tu = 64, wm = 20;
         const UInt32 hb = mode_.valid ? mode_.hBlankSym : 134;
         const UInt32 vb = mode_.valid ? mode_.vBlankSym : 3835;
-        __builtin_memcpy(p + 12, &one, 4);  // dpLink
-        p[16] = 1;                          // bEnableOverride (NvBool)
-        __builtin_memcpy(p + 24, &hb, 4);
-        __builtin_memcpy(p + 28, &vb, 4);
-        p[68] = 1;                          // SST.bEnhancedFraming
-        __builtin_memcpy(p + 72, &tu, 4);
-        __builtin_memcpy(p + 76, &wm, 4);
+        const UInt32 rgb = 0;                 // colorFormat: dpColorFormat_RGB
+        __builtin_memcpy(p + 0x0C, &one, 4);  // dpLink
+        p[0x10] = 1;                          // bEnableOverride
+        __builtin_memcpy(p + 0x18, &hb, 4);   // hBlankSym
+        __builtin_memcpy(p + 0x1C, &vb, 4);   // vBlankSym
+        __builtin_memcpy(p + 0x20, &rgb, 4);  // colorFormat
+        p[0x44] = 1;                          // SST.bEnhancedFraming
+        __builtin_memcpy(p + 0x48, &tu, 4);   // SST.tuSize
+        __builtin_memcpy(p + 0x4C, &wm, 4);   // SST.waterMark
         const UInt32 st = displayCtrl(0x731362, p, sizeof(p));
         setProperty("NVGspControl-modeset-stream", st, 32);
+        setProperty("NVGspControl-modeset-stream-colorformat", rgb, 32);
         if (st) { code = 0x08000000 | st; goto done; }
     }
     // 0.137.2 (D4): GSP-RM here does not retune the head's VPLL during the
@@ -4630,7 +5849,7 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
             presentOwner_ = nullptr;
             presentHandle_ = 0;
             presentSurface_ = WindowSurface{};
-            const IOReturn fr = flipWindowLocked(0, true, desktopSurface_, true);
+            const IOReturn fr = flipWindowLocked(desktopOffset_, true, desktopSurface_, true);
             ulk();
             setProperty("NVGspControl-modeset-window", static_cast<UInt32>(fr), 32);
         }
@@ -4755,6 +5974,13 @@ static bool srEnabledByNvram() {
 
 void NVGspControl::quiesceForSleep() {
     if (!lock_ || !pci_) return;
+    lk(__LINE__);
+    if(native615Attempted_) {
+        native615Ready_=false;native615Stopping_=true;
+        setProperty("NVGspControl-native615-ready",false);
+        setProperty("NVGspControl-native615-sleep-invalidated",true);
+    }
+    ulk();
     const bool sr = srEnabledByNvram();
     // 0.127.0: clients wait from here until wake; with SR, save the kext-heap
     // VRAM (FBSR does not cover it) while the CE channel still runs.
@@ -4905,15 +6131,28 @@ void NVGspControl::resumeDriveCallout(thread_call_param_t param, thread_call_par
     bool restaged = false;
     if (self->lock_ && self->systemInfoValid_) {
         self->lk(__LINE__);
-        self->init_.reset();
-        restaged = self->init_.stage(self->systemInfo_);
+        restaged = self->init_.restage(self->systemInfo_);
         self->ulk();
     }
     self->setProperty("NVGspControl-resume-restaged", restaged);
     const bool queuesOk = restaged ||
         (self->queueSnap_ && self->init_.restoreQueues(self->queueSnap_));
     self->setProperty("NVGspControl-resume-queues", queuesOk);
-    if (queuesOk && self->executeBoot() == kIOReturnSuccess) {
+    bool bootOk = false;
+    if (queuesOk) {
+        bootOk = self->executeBoot() == kIOReturnSuccess;
+        // 0.180.3: after a hardware reset the first executeBoot can hit a
+        // transient GSP falcon reset/PriError; the second attempt cleared it
+        // in the verified two-reset recovery. Retry once internally so one
+        // reset is enough, and force the reset-retry path if it still fails.
+        if (!bootOk && !self->resumeAbort_) {
+            IOSleep(1000);
+            bootOk = self->executeBoot() == kIOReturnSuccess;
+            self->setProperty("NVGspControl-resume-boot-retry", true);
+        }
+        if (!bootOk) self->grPersistent_ = false;
+    }
+    if (bootOk) {
         for (; polls < 900 && !self->resumeAbort_; ++polls) {
             self->pollStatus();
             UInt32 phase = 0;
@@ -5026,6 +6265,9 @@ void NVGspControl::resetForResume() {
     executed_ = false;
     statusSequence_ = 0;
     initDone_ = false;
+    gmcInitReady_ = false;
+    gmcHsResumeDeadline_ = 0;
+    gmcConfig_ = nvgsp::GmcStaticConfig{};
     initResult_ = initPrivateResult_ = ~0U;
     postInitPhase_ = 0;
     internalClient_ = internalDevice_ = internalSubdevice_ = 0;
@@ -5056,6 +6298,7 @@ void NVGspControl::resetForResume() {
     bar1Finished_ = false;
     bar1Live_ = false;                       // 0.123.0
     grPersistent_ = false;
+    grSelfTestOk_ = false;
     subPbOff_ = subSeq_ = 0;
     scratchOffset_ = 0;
     scratchHuge_ = 0;
@@ -5064,7 +6307,10 @@ void NVGspControl::resetForResume() {
     arenaDropAllLocked(true);                // 0.111.0: tables die with the VAS
     scratchTry_ = 0;
     scratchRetry_ = false;
-    fbFreeBase_ = fbFreeLimit_ = 0;
+    // 0.178.35: keep the GSP static fb-free window across a reset; clearing
+    // it made the reset chain skip the ctx carve, leaving grRing() with
+    // ctxBackingOffset_ 0 and every GR submit at NotReady (seg-stage 2).
+    // fbFreeBase_ = fbFreeLimit_ = 0;
     ceChunk_ = 0;
     ceMapped_ = ceStarted_ = cePersistent_ = false;
     ceToken_ = cePbOff_ = ceSeq_ = 0;
@@ -5256,10 +6502,203 @@ void NVGspControl::deliverHotplug() {
     if (fn) fn(ref, plug, unplug);
 }
 
+// 0.180.146: display-port connect polling. The GSP HOTPLUG event client
+// (armHotplug: NV01_EVENT 0x7e + EVENT_SET_NOTIFICATION) is not available at
+// the native615 phase-27 runtime (the alloc always answered 0xffffffff), so no
+// plug/unplug ever reached NVDisplay and a replug left the panel dark. The
+// display common object's SYSTEM_GET_CONNECT_STATE (0x730108) does work at
+// phase 27, so sample it every 300 ms and on a change run the same path as
+// deliverHotplug: EDID re-read, retrain when the DP lanes are down, then the
+// registered callback (NVDisplay drops its cached EDID, raises the IOFB
+// connect interrupt and WindowServer re-probes). Every sample is outside
+// lock_; displayProbe615 does its own native615Busy_ admission, so a poll
+// during GPU work simply reports NotReady and the next one catches up.
+void NVGspControl::startHotplugPoll() {
+    if (!lock_ || hotplugPollStop_) return;
+    if (hotplugPollCall_) return;
+    hotplugPollCall_ = thread_call_allocate(&NVGspControl::hotplugPollCallout, this);
+    setProperty("NVGspControl-hotplug-poll-active", hotplugPollCall_ != nullptr);
+    if (!hotplugPollCall_) return;
+    uint64_t deadline = 0;
+    clock_interval_to_deadline(300, kMillisecondScale, &deadline);
+    thread_call_enter_delayed(hotplugPollCall_, deadline);
+}
+
+void NVGspControl::hotplugPollCallout(thread_call_param_t param, thread_call_param_t) {
+    NVGspControl *self = static_cast<NVGspControl *>(param);
+    if (!self || self->hotplugPollStop_) return;
+    self->hotplugPollActive_ = true;
+    self->pollDisplayHotplug();
+    self->hotplugPollActive_ = false;
+    if (self->hotplugPollStop_ || !self->hotplugPollCall_) return;
+    uint64_t deadline = 0;
+    clock_interval_to_deadline(300, kMillisecondScale, &deadline);
+    thread_call_enter_delayed(self->hotplugPollCall_, deadline);
+}
+
+void NVGspControl::pollDisplayHotplug() {
+    if (!lock_) return;
+    // 0.180.149: presence is the DPCD link-status read over AUX (0x202), not
+    // RM's cached connect state: GET_CONNECT_STATE stayed 0x200 through a
+    // physical unplug, while the AUX transaction fails (and the monitor
+    // re-locks to the still-running stream by itself). 0x77/0x77 means the
+    // link is trained; a missing reply means the sink is gone. No link or
+    // head writes here — WindowServer drives the retrain through setMode.
+    UInt8 lanes[2] = {};
+    IOReturn ar = dpAuxRead(0x202, lanes, sizeof(lanes));
+    // 0.180.152: only a failed AUX transaction is evidence of absence. While
+    // a native615 client (WindowServer's Metal work, the replug retrain, the
+    // copy setup) holds the runtime, dpAuxRead answers NotReady/Busy without
+    // touching the sink; 0.180.151 counted those as "absent", so two busy
+    // samples raised a false unplug, the replug retrain kept the runtime busy
+    // again and WindowServer reconfigured in a loop (276 mode sets / 2 min).
+    // A failed transaction is retried once after 20 ms (AUX defer/retrain).
+    // 0.180.154: only NoDevice (RM replied, AUX failed) counts. 153 also
+    // counted the transport's IOError: a Metal test burst filled the GSP
+    // command queue, enqueueRpc refused three polls in a row and a connected
+    // BenQ was "unplugged" and retrained (rm-status 0 on that error).
+    if (ar == kIOReturnNoDevice) {
+        IOSleep(20);
+        ar = dpAuxRead(0x202, lanes, sizeof(lanes));
+    }
+    if (ar != kIOReturnSuccess && ar != kIOReturnNoDevice) {
+        ++hotplugPollSkips_;
+        setProperty("NVGspControl-hotplug-poll-skips", hotplugPollSkips_, 32);
+        setProperty("NVGspControl-hotplug-poll-skip-last", static_cast<UInt32>(ar), 32);
+        return;
+    }
+    const bool aux = ar == kIOReturnSuccess;
+    if (!aux) {
+        setProperty("NVGspControl-hotplug-poll-err", static_cast<UInt32>(ar), 32);
+        setProperty("NVGspControl-hotplug-poll-rm-status", auxLastRmStatus_, 32);
+    }
+    const bool link = aux && lanes[0] == 0x77 && lanes[1] == 0x77;
+    ++hotplugPollCount_;
+    setProperty("NVGspControl-hotplug-poll-aux", aux);
+    setProperty("NVGspControl-hotplug-poll-lanes", (UInt32(lanes[1]) << 8) | lanes[0], 32);
+    setProperty("NVGspControl-hotplug-poll-lanes-ok", link);
+    setProperty("NVGspControl-hotplug-poll-count", hotplugPollCount_, 32);
+    // 0.180.152: -mask is the debounced connect state (the replug daemon acts
+    // on its edges); it used to be the raw sample, so one failed read made
+    // the daemon retrain a connected link. The raw sample is -sample.
+    setProperty("NVGspControl-hotplug-poll-sample", aux ? 0x200 : 0, 32);
+    if (!hotplugPollSeen_) {
+        hotplugPollSeen_ = true;
+        hotplugPollMask_ = aux ? 0x200 : 0;
+        setProperty("NVGspControl-hotplug-poll-baseline", hotplugPollMask_, 32);
+        setProperty("NVGspControl-hotplug-poll-mask", hotplugPollMask_, 32);
+        return;
+    }
+    if (!aux) {
+        // 0.180.152: three failed samples in a row (~900 ms, each already
+        // retried once) before calling it unplugged; was two.
+        if (hotplugPollMask_ && ++hotplugPollZero_ >= 3) {
+            hotplugPollMask_ = 0;
+            hotplugPollZero_ = 0;
+            hotplugPollRetry_ = 0;
+            setProperty("NVGspControl-hotplug-poll-mask", UInt32(0), 32);
+            hotplugPollEdidOk_ = false;
+            hotplugPollEdidPending_ = false;
+            removeProperty("NVGspControl-edid");
+            setProperty("NVGspControl-edid-reread", false);
+            setProperty("NVGspControl-hotplug-poll-last", UInt64(0x200), 64);
+            setProperty("NVGspControl-hotplug-poll-unplug", 0x200, 32);
+            setProperty("NVGspControl-hotplug-poll-plug", UInt32(0), 32);
+            setProperty("NVGspControl-hotplug-poll-edid", hotplugPollEdidOk_);
+            HotplugFn fn = hotplugFn_;
+            void *ref = hotplugRef_;
+            if (fn) fn(ref, 0, 0x200);
+        }
+        return;
+    }
+    hotplugPollZero_ = 0;
+    if (!hotplugPollMask_) {
+        // Sink is back. Re-read the EDID over RM's control and tell the
+        // display pipe; WindowServer re-probes and setMode retrains the link.
+        hotplugPollMask_ = 0x200;
+        hotplugPollRetry_ = 0;
+        setProperty("NVGspControl-hotplug-poll-mask", 0x200, 32);
+        setProperty("NVGspControl-hotplug-poll-last", UInt64(0x200) << 32, 64);
+        setProperty("NVGspControl-hotplug-poll-plug", 0x200, 32);
+        setProperty("NVGspControl-hotplug-poll-unplug", UInt32(0), 32);
+        UInt64 edidOut[3] = {0, 0, 0};
+        hotplugPollEdidOk_ = displayEdid615(0x200, edidOut) == kIOReturnSuccess;
+        hotplugPollEdidPending_ = !hotplugPollEdidOk_;
+        setProperty("NVGspControl-hotplug-poll-edid", hotplugPollEdidOk_);
+        HotplugFn fn = hotplugFn_;
+        void *ref = hotplugRef_;
+        if (fn) fn(ref, 0x200, 0);
+        return;
+    }
+    // Known-present: retry a failed EDID read about once a second, then notify
+    // once more so the display picks up the fresh timings.
+    if (hotplugPollEdidPending_ && (++hotplugPollRetry_ % 3) == 0) {
+        UInt64 edidOut[3] = {0, 0, 0};
+        hotplugPollEdidOk_ = displayEdid615(0x200, edidOut) == kIOReturnSuccess;
+        setProperty("NVGspControl-hotplug-poll-edid", hotplugPollEdidOk_);
+        setProperty("NVGspControl-hotplug-poll-edid-retries", hotplugPollRetry_, 32);
+        if (hotplugPollEdidOk_) {
+            hotplugPollEdidPending_ = false;
+            HotplugFn fn = hotplugFn_;
+            void *ref = hotplugRef_;
+            if (fn) fn(ref, 0x200, 0);
+        }
+    }
+}
+
 // 0.94.0: native DPCD read (single AUX transaction, cmd 0x9 — the dpcd.py
 // read path). Reply: status@92, bytes-done@140, reply-code@144, data@124.
 IOReturn NVGspControl::dpAuxRead(UInt32 addr, UInt8 *out, UInt32 bytes) {
     if (!out || !bytes || bytes > 16) return kIOReturnBadArgument;
+    // 0.180.150: at the native615 phase-27 runtime the legacy userRpc path is
+    // refused (Busy), so the connect poll's AUX read must use the native
+    // control ABI: 40-byte header + 48-byte AUX params, reply params at 96.
+    // The data is at params+20 (d615's ctrl reply agrees) and the RM status is
+    // the control header status.
+    if (native615_ && postInitPhase_ == 27) {
+        if (!lock_) return kIOReturnNotReady;
+        lk(__LINE__);
+        const bool ready = native615Ready_ && !native615Busy_ && gmcInitReady_ && displayCommon615_ &&
+            !gmcMmuFaultPending_ && !userRpcLatePending_ && !resetBusy_ && !sleeping_;
+        if (ready) native615Busy_ = true;
+        ulk();
+        if (!ready) return kIOReturnNotReady;
+        constexpr UInt32 C = nvgsp::kLifecycleClient615, D = 0xc0d00073, CMD = 0x731341, PARAMS = 48;
+        auto *s = native615_;
+        UInt8 req[40 + PARAMS]{};
+        IOReturn r = kIOReturnBadArgument;
+        if (nvgsp::buildControl615(req, sizeof(req), C, D, CMD, PARAMS)) {
+            UInt32 displayId = 0x200, cmd = 0x9, size = bytes - 1;
+            __builtin_memcpy(req + 40 + 4, &displayId, 4);
+            __builtin_memcpy(req + 40 + 12, &cmd, 4);
+            __builtin_memcpy(req + 40 + 16, &addr, 4);
+            __builtin_memcpy(req + 40 + 36, &size, 4);
+            UInt32 replyBytes = sizeof(s->reply), result = ~0U;
+            r = userRpcImpl(76, req, sizeof(req), s->reply, &replyBytes, &result, true, true);
+            nvgsp::ControlReply615 reply{};
+            if (!r && (replyBytes != 96 + PARAMS ||
+                       !nvgsp::decodeControlReply615(s->reply, replyBytes, C, D, CMD, PARAMS, reply)))
+                r = kIOReturnBadMessageID;
+            if (!r) {
+                const UInt32 status = result ? result : reply.header.status;
+                auxLastRmStatus_ = status;
+                // 0.180.154: RM answered and the AUX transaction failed: the
+                // only evidence of a missing sink. NoDevice keeps it apart from
+                // the transport's IOError (enqueueRpc refused: command queue
+                // full under a Metal submit burst) and Timeout.
+                if (status) r = kIOReturnNoDevice;
+                else {
+                    __builtin_memcpy(out, reply.params + 20, bytes);
+                    r = kIOReturnSuccess;
+                }
+            }
+        }
+        lk(__LINE__);
+        native615Busy_ = false;
+        setProperty("NVGspControl-native615-busy", false);
+        ulk();
+        return r;
+    }
     UInt8 ctrl[24 + 48]{};
     const UInt32 hdr[6] = {0xc0d00001, 0xc0d00073, 0x731341, 0, 48, 0};
     __builtin_memcpy(ctrl, hdr, sizeof(hdr));
@@ -5285,10 +6724,31 @@ IOReturn NVGspControl::dpAuxRead(UInt32 addr, UInt8 *out, UInt32 bytes) {
         }
         IOSleep(5);
     }
-    return kIOReturnIOError;
+    return kIOReturnNoDevice;   // 0.180.154: see the native path
 }
 
-// 0.89.0: runtime EDID re-read over DP AUX (same transaction list as chain
+UInt64 NVGspControl::dpLaneBytes() const {
+    // DPCD 0x001: 0x06 RBR, 0x0a RBR2, 0x14 HBR2, 0x1e HBR3. If DPCD was
+    // never read, preserve the old HBR2 assumption.
+    const UInt8 rate = dpcd_[1];
+    if (rate >= 0x1e) return 810000000ULL;   // HBR3, 8.1 Gbps * 8/10 / lane
+    if (rate >= 0x14) return 540000000ULL;   // HBR2
+    if (rate >= 0x0a) return 270000000ULL;   // RBR2
+    if (rate >= 0x06) return 162000000ULL;   // RBR
+    return 540000000ULL;
+}
+
+UInt32 NVGspControl::dpLaneCount() const {
+    const UInt32 lanes = dpcd_[2] & 0x0fu;
+    return lanes >= 1 && lanes <= 4 ? lanes : 4;   // no DPCD: old 4-lane path
+}
+
+UInt32 NVGspControl::dpTrainingData() const {
+    const UInt8 rate = dpcd_[1];
+    const UInt32 lr = rate >= 0x1e ? 0x1e : rate >= 0x14 ? 0x14 :
+                      rate >= 0x0a ? 0x0a : rate >= 0x06 ? 0x06 : 0x14;
+    return (lr << 8) | dpLaneCount();
+}
 // phase 224: I2C-over-AUX @0x50, offset write + 16 x 16 B reads).
 IOReturn NVGspControl::dpReadEdid() {
     UInt8 edid[256]{};
@@ -5448,19 +6908,28 @@ IOReturn NVGspControl::presentObject(const void *owner, UInt32 handle, UInt64 of
                                      UInt32 pitch, UInt32 width, UInt32 height,
                                      UInt32 format) {
     if (!lock_ || !pci_ || !owner || !handle || handle > kMaxMem) return kIOReturnBadArgument;
-    if (!nvgsp::windowSurfaceValid(pitch, width, height, format, desktopSurface_.width,
-                                   desktopSurface_.height))
+    if (!nvgsp::windowSurfaceValid(pitch, width, height, format, kMaxScanoutWidth,
+                                   kMaxScanoutHeight))
         return kIOReturnBadArgument;
     lk(__LINE__);
     GpuMem &m = mem_[handle - 1];
     IOReturn ret = kIOReturnBadArgument;
-    if (m.owner == owner) m.presented = true;   // 0.149.0: scanout stays in VRAM
-    if (m.owner == owner && m.domain == 0 && !(offset & 0xff) && offset < m.bytes &&
-        UInt64(pitch) * (height - 1) + UInt64(width) * 4 <= m.bytes - offset) {
+    // The display engine walks `pitch` bytes for every row, not just the
+    // visible `width*4`. Validate the full scan-out span, otherwise a surface
+    // with pitch > width*4 can read past the object on the last row.
+    const UInt64 pitch64 = pitch;
+    const bool spanFits = height && width && pitch64 &&
+        pitch64 <= UINT64_MAX / height &&
+        pitch64 * height <= m.bytes && offset <= m.bytes - pitch64 * height &&
+        UInt64(width) * 4 <= pitch64;
+    if (m.owner == owner && m.domain == 0 && !(offset & 0xff) && spanFits) {
         const WindowSurface surf{pitch, width, height, format};
         const bool full = presentOwner_ != owner || !(surf == presentSurface_);
         ret = flipWindowLocked(m.phys + offset, full, surf);
         if (ret == kIOReturnSuccess) {
+            if (presentHandle_ && presentHandle_ != handle && presentHandle_ <= kMaxMem)
+                mem_[presentHandle_ - 1].presented = false;
+            m.presented = true;   // 0.149.0: scanout stays in VRAM
             presentOwner_ = owner;
             presentHandle_ = handle;
             presentSurface_ = surf;
@@ -5477,10 +6946,26 @@ IOReturn NVGspControl::presentObject(const void *owner, UInt32 handle, UInt64 of
 // VRAM 0) if `owner` (nullptr = anyone) is presenting. Caller holds lock_.
 IOReturn NVGspControl::presentStopLocked(const void *owner) {
     if (!presentOwner_ || (owner && presentOwner_ != owner)) return kIOReturnSuccess;
+    const void *savedOwner = presentOwner_;
+    const UInt32 savedHandle = presentHandle_;
+    const WindowSurface savedSurface = presentSurface_;
+    if (presentHandle_ && presentHandle_ <= kMaxMem)
+        mem_[presentHandle_ - 1].presented = false;
     presentOwner_ = nullptr;
     presentHandle_ = 0;
     presentSurface_ = WindowSurface{};
-    return flipWindowLocked(0, true, desktopSurface_);
+    const IOReturn ret = flipWindowLocked(desktopOffset_, true, desktopSurface_);
+    if (ret != kIOReturnSuccess) {
+        // The display engine can still be scanning the client's surface. Keep
+        // the record so memory cannot be freed underneath the scan-out, and
+        // let a later stop attempt retry the flip.
+        presentOwner_ = savedOwner;
+        presentHandle_ = savedHandle;
+        presentSurface_ = savedSurface;
+        if (savedHandle && savedHandle <= kMaxMem)
+            mem_[savedHandle - 1].presented = true;
+    }
+    return ret;
 }
 
 IOReturn NVGspControl::presentStop(const void *owner) {
@@ -5779,7 +7264,7 @@ IOReturn NVGspControl::submitRing(const Ring &ring, const UInt32 *words,
 
 IOReturn NVGspControl::submitGr(const void *owner, const UInt32 *words, UInt32 count,
                                 UInt64 *nsOut) {
-    if (nvramBoostPinned_ == 0) noteGpuBusy();          // 0.135.0
+    if (nvramBoostPinned_ == 0 && boostPinned_ == 0) noteGpuBusy();          // 0.135.0
     if (!lock_ || !pci_ || !words || !count || !nsOut)
         return kIOReturnBadArgument;
     lk(__LINE__);
@@ -5848,7 +7333,7 @@ bool NVGspControl::grLastOwnerIsOther(const void *owner) {
 
 IOReturn NVGspControl::submitGrAsync(const void *owner, const UInt32 *words, UInt32 count,
                                      UInt32 *seqOut) {
-    if (nvramBoostPinned_ == 0) noteGpuBusy();          // 0.135.0
+    if (nvramBoostPinned_ == 0 && boostPinned_ == 0) noteGpuBusy();          // 0.135.0
     if (!lock_ || !pci_ || !words || !count || !seqOut) return kIOReturnBadArgument;
     lk(__LINE__);
     Ring ring{};
@@ -6342,6 +7827,12 @@ void NVGspControl::videoDropLocked() {
 // 0.160.0: memory per client, refreshed from the status poll (every 2 s):
 // "pid N: objs O, vram V MiB, sys S MiB, user U MiB" plus totals, so a
 // process that keeps allocating (or VRAM filling up) shows at a glance.
+UInt64 NVGspControl::vramInUseLocked() const {
+    UInt64 n = 0;
+    for (UInt32 i = 0; i < vramHeap_.count(); ++i) n += vramHeap_.r[i].bytes;
+    return n;
+}
+
 void NVGspControl::publishMemByClientLocked() {
     struct Row { const void *owner; int pid; UInt32 objs; UInt64 vram, sys, user; };
     Row rows[24] = {};
@@ -6373,13 +7864,21 @@ void NVGspControl::publishMemByClientLocked() {
                       rows[r].objs, rows[r].vram >> 20, rows[r].sys >> 20, rows[r].user >> 20);
     setProperty("NVGspControl-mem-by-client", s);
     setProperty("NVGspControl-mem-slots-used", used, 32);
-    setProperty("NVGspControl-mem-vram-bytes", tv, 64);
+    // 0.180.144: every live VRAM range (kext objects, native615 clients, the
+    // display reservation) is in vramHeap_; count that when it is more
+    const UInt64 heap = vramInUseLocked();
+    setProperty("NVGspControl-mem-vram-bytes", heap > tv ? heap : tv, 64);
     setProperty("NVGspControl-mem-sys-bytes", ts + tu, 64);   // 0.162.1: NVAccelerator's PerformanceStatistics
 }
 
 IOReturn NVGspControl::pollStatusLocked() {
     publishMemByClientLocked();
     if (!executed_) return kIOReturnNotReady;
+    // msgq v2: the command queue head is a register, not shared-memory state.
+    // Re-publish the current monotonic pointer after the GSP has started; this
+    // is idempotent and recovers the pre-queued init request if a Falcon
+    // reset cleared the register during the boot chain.
+    init_.publishTxHead();
     // 0.81.0: the 0.9.6 per-poll bisect64 properties (4 new keys per
     // poll, unbounded) are gone.
     nvgsp::MsgqTxHeader header{};
@@ -6649,7 +8148,7 @@ IOReturn NVGspControl::pollStatusLocked() {
     bool ownedTreeFreeResponse = false;
     UInt8 *deviceInfo = nullptr;
     UInt32 deviceInfoBytes = 0, deviceInfoStatus = ~0U;
-    UInt8 classList[404]{};
+    UInt8 classList[nvgsp::kClassList615Bytes]{};
     UInt32 classListStatus = ~0U;
     UInt32 deviceIds = 0, attachedIds[32]{};
     // Draining NOCAT journal records is safe: NVIDIA's host handler only copies
@@ -6660,6 +8159,17 @@ IOReturn NVGspControl::pollStatusLocked() {
         if (!init_.snapshotStatus(&header, &readPtr, first, sizeof(first))) {
             badReason = 1; break;
         }
+        const auto resetState = nvgsp::initQueueResetState(gmcHsResumeDeadline_,
+            mach_absolute_time(), readPtr, header.writePtr);
+        if (resetState == nvgsp::InitQueueResetState::AwaitProducer) {
+            setProperty("NVGspControl-gmc-resume-pending", true);
+            break; // known HS head reset; no packet or cursor is consumed
+        }
+        if (resetState == nvgsp::InitQueueResetState::TimedOut) {
+            setProperty("NVGspControl-gmc-resume-timeout", true);
+            badReason = 45;
+            break;
+        }
         UInt32 available = header.writePtr + header.msgCount - readPtr;
         if (available >= header.msgCount) available -= header.msgCount;
         if (!available) {
@@ -6668,7 +8178,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             // with lock_ held (0.80.0: every daemon poll took 4.3 s and
             // stalled vblank/flip/submit behind it). Waiters (userRpc,
             // ping) loop on pollStatusLocked themselves.
-            if (postInitPhase_ == 33) break;
+            if (postInitPhase_ == 33 || userRpcOutstanding_ || userRpcLatePending_) break;
             // 0.90.0: during the chain, stop after 150 ms without a new
             // message (replies normally land within a few ms); the daemon's
             // next 1 s poll picks up slow ones. Was a fixed 4 s busy-wait
@@ -6707,37 +8217,188 @@ IOReturn NVGspControl::pollStatusLocked() {
         nvgsp::RpcMessageHeader rpc{};
         if (!entry) { badReason = 2; break; }
         __builtin_memcpy(&q, entry, sizeof(q));
-        __builtin_memcpy(&rpc, entry + sizeof(q), sizeof(rpc));
-        if (!q.elementCount || q.elementCount > 16 || q.elementCount > available) {
+        const UInt32 elementCount = (q.mctpPayloadSize + 4095U) / 4096U;
+        if (q.mctpMagic == nvgsp::kMctpMagicSeen) {
+            // Stale element left by a previous GSP session; consume it.
+            if (!elementCount || elementCount > 16 || elementCount > available) {
+                badReason = 3; break;
+            }
+            readPtr = (readPtr + elementCount) % header.msgCount;
+            consumed += elementCount;
+            if (!init_.publishStatusReadPtr(readPtr)) { badReason = 7; break; }
+            continue;
+        }
+        if (q.mctpMagic != nvgsp::kMctpMagic ||
+            !elementCount || elementCount > 16 || elementCount > available ||
+            q.mctpPayloadSize < sizeof(q) ||
+            q.mctpPayloadSize > 16 * 4096U ||
+            q.nvdmPayloadSize < sizeof(rpc) ||
+            q.nvdmPayloadSize > q.mctpPayloadSize - sizeof(q)) {
             badReason = 3; break;
         }
+        if (q.nvdmHeader == nvgsp::kGmcNvdmHeader) {
+            // Keep GMCAPI separate from legacy VRPC. A successful INIT
+            // response is recorded verbatim; it does not synthesize the old
+            // INIT_DONE event or silently advance the legacy phase machine.
+            const UInt32 assembledBytes = q.mctpPayloadSize;
+            auto *assembled = static_cast<UInt8 *>(IOMalloc(assembledBytes));
+            bool copied = assembled != nullptr;
+            if (assembled) {
+                for (UInt32 offset = 0; offset < assembledBytes; ++offset) {
+                    const UInt32 slot = (readPtr + offset / 4096) % header.msgCount;
+                    const UInt8 *part = init_.statusEntry(slot);
+                    if (!part) { copied = false; break; }
+                    assembled[offset] = part[offset % 4096];
+                }
+            }
+            nvgsp::GmcHeader gmc{};
+            const bool responseOk = copied && nvgsp::parseGmcInitResponse(
+                assembled, assembledBytes, &gmc);
+            nvgsp::GmcHsParams hs{};
+            const bool hsRequest = copied && nvgsp::parseGmcHs(
+                assembled, assembledBytes, &hs);
+            nvgsp::GmcHeader mmuNotice{};
+            const bool faultNotice = copied && nvgsp::parseGmcMmuNotice615(
+                assembled,assembledBytes,&mmuNotice);
+            bool hsOk = false;
+            if (copied && assembledBytes >= sizeof(q) + sizeof(gmc)) {
+                nvgsp::GmcHeader raw{};
+                __builtin_memcpy(&raw, assembled + sizeof(q), sizeof(raw));
+                setProperty("NVGspControl-gmc-last-command", raw.command, 32);
+                setProperty("NVGspControl-gmc-last-sequence", raw.sequence, 64);
+                setProperty("NVGspControl-gmc-last-packet", assembled, assembledBytes);
+            }
+            if (responseOk) {
+                gmcHsResumeDeadline_ = 0;
+                setProperty("NVGspControl-gmc-resume-pending", false);
+                setProperty("NVGspControl-gmc-init-response", true);
+                setProperty("NVGspControl-gmc-init-status", gmc.statusOrMaxResponse, 32);
+                setProperty("NVGspControl-gmc-init-bytes", gmc.size, 32);
+                setProperty("NVGspControl-gmc-init-payload",
+                    assembled + sizeof(q) + sizeof(gmc), gmc.size);
+                nvgsp::GmcStaticConfig config{};
+                const auto *wpr = gsp_.metadata();
+                const bool configOk = gmc.statusOrMaxResponse == 0 && wpr &&
+                    nvgsp::parseGmcStaticConfig(assembled + sizeof(q) + sizeof(gmc),
+                                               gmc.size, &config) &&
+                    config.fbBytes <= wpr->fbSize;
+                setProperty("NVGspControl-gmc-config-valid", configOk);
+                if (configOk && !gmcInitReady_) {
+                    // A newly completed signed firmware initialization starts
+                    // a fresh fault/late-reply epoch; no old call becomes success.
+                    if (gmcMmuFaultPending_)
+                        setProperty("NVGspControl-gmc-mmu-fault-cleared-by-boot",true);
+                    gmcMmuFaultPending_=false;
+                    setProperty("NVGspControl-gmc-mmu-fault-pending",false);
+                    if (userRpcLatePending_)
+                        setProperty("NVGspControl-user-rpc-late-cancelled-by-reset",true);
+                    userRpcLatePending_=false;
+                    setProperty("NVGspControl-user-rpc-late-pending",false);
+                    gmcConfig_ = config;
+                    internalClient_ = config.internalClient;
+                    internalDevice_ = config.internalDevice;
+                    internalSubdevice_ = config.internalSubdevice;
+                    fbFreeBase_ = fbFreeLimit_ = 0;
+                    for (UInt32 i=0;i<config.regionCount;++i) {
+                        const auto &r = config.regions[i];
+                        if (!r.reserved && !r.tag && !(r.flags & 4) &&
+                            r.limit-r.base > fbFreeLimit_-fbFreeBase_) {
+                            fbFreeBase_=r.base; fbFreeLimit_=r.limit;
+                        }
+                    }
+                    setProperty("NVGspControl-static-gpu-name", config.gpuName);
+                    setProperty("NVGspControl-static-fb-bytes", config.fbBytes, 64);
+                    setProperty("NVGspControl-fb-length", config.fbBytes, 64);
+                    setProperty("NVGspControl-fb-regions", config.regionCount, 32);
+                    setProperty("NVGspControl-fb-free-base", fbFreeBase_, 64);
+                    setProperty("NVGspControl-fb-free-limit", fbFreeLimit_, 64);
+                    setProperty("NVGspControl-gmc-bar1-pde", config.bar1Pde, 64);
+                    setProperty("NVGspControl-gmc-bar2-pde", config.bar2Pde, 64);
+                    setProperty("NVGspControl-gmc-vmmu-segment", config.vmmuSegmentBytes, 64);
+                    setProperty("NVGspControl-internal-client", internalClient_, 32);
+                    setProperty("NVGspControl-internal-device", internalDevice_, 32);
+                    setProperty("NVGspControl-internal-subdevice", internalSubdevice_, 32);
+                    // Real GMC success replaces the retired GUEST_INFO /
+                    // GET_STATIC_INFO exchange. Keep legacy INIT_DONE false.
+                    gmcInitReady_ = true;
+                    postInitPhase_ = 4;
+                    markBoot("gmc-init-ready");
+                }
+                setProperty("NVGspControl-gmc-init-ready", gmcInitReady_);
+                auto &summary = records[recordCount++];
+                summary.ringIndex = readPtr; summary.elementCount = elementCount;
+                summary.function = gmc.command; summary.length = gmc.size;
+                summary.result = gmc.statusOrMaxResponse;
+            }
+            if (faultNotice) {
+                gmcMmuFaultPending_=true;++mmuFaultEvents_;
+                setProperty("NVGspControl-gmc-mmu-fault-pending",true);
+                setProperty("NVGspControl-gmc-mmu-fault-serviced",false);
+                setProperty("NVGspControl-gmc-mmu-fault-notice",assembled,assembledBytes);
+                setProperty("NVGspControl-mmu-fault-events",mmuFaultEvents_,32);
+                noteGpuEventLocked("GMC MMU fault queued; new diagnostic allocation/kick blocked");
+                auto &summary=records[recordCount++];
+                summary.ringIndex=readPtr;summary.elementCount=elementCount;
+                summary.function=mmuNotice.command;summary.length=mmuNotice.size;
+                summary.result=0;
+            }
+            if (hsRequest) {
+                setProperty("NVGspControl-gmc-hs-packet", assembled, assembledBytes);
+                nvgsp::GmcHsResult result{};
+                const auto *meta = gsp_.metadata();
+                Bar0Io io{doorbellMap_};
+                const auto reset = [&io](bool riscv) {
+                    return resetPulse(io, 0x1103c0, 0x1100f4) &&
+                        nvgsp::selectGspCore(io, riscv);
+                };
+                hsOk = nvgsp::executeGmcHs(io, hs, meta ? meta->fbSize : 0,
+                    init_.libosArgsBus(), gsp_.appVersion(), reset, &result);
+                setProperty("NVGspControl-gmc-hs-ok", hsOk);
+                if (hsOk && !gmcInitReady_) {
+                    clock_interval_to_deadline(10, kSecondScale, &gmcHsResumeDeadline_);
+                    setProperty("NVGspControl-gmc-resume-timeout", false);
+                }
+                setProperty("NVGspControl-gmc-hs-stage", result.stage, 32);
+                setProperty("NVGspControl-gmc-hs-dma", result.dmaTransfers, 32);
+                setProperty("NVGspControl-gmc-hs-mailbox0", result.mailbox0, 32);
+                setProperty("NVGspControl-gmc-hs-sec2-mailbox0", result.sec2Mailbox0, 32);
+                setProperty("NVGspControl-gmc-hs-handoff", result.handoff, 32);
+                setProperty("NVGspControl-gmc-hs-riscv-cpuctl", result.riscvCpuCtl, 32);
+                auto &summary = records[recordCount++];
+                summary.ringIndex = readPtr; summary.elementCount = elementCount;
+                summary.function = nvgsp::kGmcExecHs; summary.length = sizeof(hs);
+                summary.result = hsOk ? 0 : 0xffffffffU;
+            }
+            if (assembled) IOFree(assembled, assembledBytes);
+            if (!responseOk && !hsRequest && !faultNotice) {
+                setProperty("NVGspControl-gmc-blocked", true);
+                badReason = 11; break;
+            }
+            readPtr = (readPtr + elementCount) % header.msgCount;
+            consumed += elementCount;
+            if (!init_.publishStatusReadPtr(readPtr)) { badReason = 7; break; }
+            if (hsRequest && !hsOk) { badReason = 12; break; }
+            continue;
+        }
+        __builtin_memcpy(&rpc, entry + sizeof(q), sizeof(rpc));
         uint64_t messageBytes = static_cast<uint64_t>(sizeof(q)) + rpc.length;
         // 0.100.0: a large reply (e.g. ALLOC_MEMORY memlist echo) announces its
         // full length in the first element; the rest follows as CONTINUATION
         // records (fn 71, consumed below). Keep only the first part.
         if (largeReplyOk_ && rpc.length >= sizeof(rpc) &&
-            messageBytes > q.elementCount * 4096ULL)
-            messageBytes = q.elementCount * 4096ULL;
-        if (rpc.length < sizeof(rpc) || messageBytes > q.elementCount * 4096ULL) {
+            messageBytes > elementCount * 4096ULL)
+            messageBytes = elementCount * 4096ULL;
+        if (rpc.length < sizeof(rpc) || rpc.length > q.nvdmPayloadSize ||
+            messageBytes > q.mctpPayloadSize ||
+            messageBytes > elementCount * 4096ULL) {
             badReason = 4; break;
         }
-        UInt64 checksum = 0;
-        for (uint64_t offset = 0; offset < messageBytes; offset += 8) {
-            const UInt32 slot = (readPtr + static_cast<UInt32>(offset / 4096)) % header.msgCount;
-            const UInt8 *part = init_.statusEntry(slot);
-            UInt64 word = 0;
-            if (!part) { badReason = 5; break; }
-            __builtin_memcpy(&word, part + (offset % 4096), sizeof(word));
-            checksum ^= word;
-        }
-        if (badReason) break;
 
         auto &summary = records[recordCount++];
         summary.ringIndex = readPtr;
-        summary.queueSequence = q.sequence;
-        summary.elementCount = q.elementCount;
-        summary.checksum = static_cast<UInt32>(checksum >> 32) ^
-                           static_cast<UInt32>(checksum);
+        summary.queueSequence = q.mctpHeader;
+        summary.elementCount = elementCount;
+        summary.checksum = 0;
         summary.headerVersion = rpc.headerVersion;
         summary.signature = rpc.signature;
         summary.length = rpc.length;
@@ -6746,8 +8407,7 @@ IOReturn NVGspControl::pollStatusLocked() {
         summary.privateResult = rpc.privateResult;
         summary.rpcSequence = rpc.sequence;
 
-        if (summary.checksum || q.sequence != statusSequence_ ||
-            rpc.headerVersion != kRpcHeaderVersion || rpc.signature != kRpcSignature) {
+        if (rpc.headerVersion != kRpcHeaderVersion || rpc.signature != kRpcSignature) {
             badReason = 6; break;
         }
         bool sequencerOk = false;
@@ -6791,13 +8451,13 @@ IOReturn NVGspControl::pollStatusLocked() {
             ++osErrors;
             // 0.138.3: keep the last Xid text (rpc_os_error_log_v17_00:
             // exceptType, runlistId, chid, errString[0x100] at payload 80).
-            if (messageBytes > 80 + 12) {
+            if (messageBytes > 56 + 12) {
                 char text[160]{};
                 const uint64_t avail = messageBytes - 80 - 12;
                 const UInt32 n = static_cast<UInt32>(avail < sizeof(text) - 1 ? avail : sizeof(text) - 1);
-                __builtin_memcpy(text, entry + 80 + 12, n);
+                __builtin_memcpy(text, entry + 56 + 16, n > 4 ? n - 4 : n);   // 0.180.137: text at +16
                 UInt32 hdr[3]{};
-                __builtin_memcpy(hdr, entry + 80, sizeof(hdr));
+                __builtin_memcpy(hdr, entry + 56, sizeof(hdr));
                 setProperty("NVGspControl-os-error-last", text);
                 setProperty("NVGspControl-os-error-last-type", hdr[0], 32);
                 // 0.164.0: and the last 8, oldest first
@@ -6823,8 +8483,9 @@ IOReturn NVGspControl::pollStatusLocked() {
         constexpr UInt32 kRcTriggered = 0x1004, kMmuFaultQueued = 0x1005;
         if (rpc.function == kRcTriggered) {
             UInt32 rc[10]{};
-            if (messageBytes >= 80 + sizeof(rc))
-                __builtin_memcpy(rc, entry + 80, sizeof(rc));
+            if (messageBytes >= 56 + sizeof(rc))
+                __builtin_memcpy(rc, entry + 56, sizeof(rc));
+            rcChidLog_[rcEvents_ % 8] = rc[1];   // 0.180.183: attribution of RC bursts
             ++rcEvents_;
             setProperty("NVGspControl-rc-count", rcEvents_, 32);
             setProperty("NVGspControl-rc-engine", rc[0], 32);
@@ -6904,17 +8565,17 @@ IOReturn NVGspControl::pollStatusLocked() {
         // 0.89.0: POST_EVENT (NV_VGPU_MSG_EVENT_POST_EVENT 0x1003,
         // rpc_post_event_v17_00 @80): hotplug = notifyIndex 1, eventData
         // {plugDisplayMask, unplugDisplayMask} (nouveau r535_disp_hpd).
-        if (rpc.function == 0x1003 && messageBytes >= 117) {
+        if (rpc.function == 0x1003 && messageBytes >= 93) {
             UInt32 hEvent = 0, notifyIndex = 0, dataSize = 0, plug = 0, unplug = 0;
-            __builtin_memcpy(&hEvent, entry + 84, 4);
-            __builtin_memcpy(&notifyIndex, entry + 88, 4);
-            __builtin_memcpy(&dataSize, entry + 104, 4);
+            __builtin_memcpy(&hEvent, entry + 60, 4);
+            __builtin_memcpy(&notifyIndex, entry + 64, 4);
+            __builtin_memcpy(&dataSize, entry + 80, 4);
             ++postEvents_;
             setProperty("NVGspControl-post-events", postEvents_, 32);
             setProperty("NVGspControl-post-event-last", (UInt64(hEvent) << 32) | notifyIndex, 64);
             if ((notifyIndex & 0xffff) == 1 && dataSize >= 8) {
-                __builtin_memcpy(&plug, entry + 109, 4);
-                __builtin_memcpy(&unplug, entry + 113, 4);
+                __builtin_memcpy(&plug, entry + 85, 4);
+                __builtin_memcpy(&unplug, entry + 89, 4);
                 ++hotplugs_;
                 hotplugPlug_ |= plug;
                 hotplugUnplug_ |= unplug;
@@ -6928,9 +8589,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-mmu-fault-events", mmuFaultEvents_, 32);
             // 0.158.0: raw payload of the last one (layout not in the open
             // headers; kept for decoding next to the RC that follows)
-            if (messageBytes > 80)
+            if (messageBytes > 56)
                 setProperty("NVGspControl-mmu-fault-queued-last",
-                            const_cast<void *>(static_cast<const void *>(entry + 80)),
+                            const_cast<void *>(static_cast<const void *>(entry + 56)),
                             static_cast<unsigned>(messageBytes - 80 < 64 ? messageBytes - 80 : 64));
         }
         // 0.52.0: every other GSP event (0x1000..0x1fff, e.g. 0x100F
@@ -6947,7 +8608,22 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-other-event-last", rpc.function, 32);
         }
         const bool diagnosticEvent = otherEvent;
-        const bool expectedPostInit =
+        const bool lateReply = nvgsp::rpcLateMatch615(userRpcLatePending_,rpc.function,rpc.sequence,
+            userRpcLateFunction_,userRpcLateSeq_,userRpcLateGeneration_,gpuResets_);
+        if (lateReply) {
+            const UInt32 n=messageBytes<4096 ? static_cast<UInt32>(messageBytes) : 4096;
+            OSData *lateData=OSData::withBytes(entry,n);
+            if (!lateData) {badReason=46;break;}
+            const bool retained=setProperty("NVGspControl-user-rpc-late-reply",lateData);
+            lateData->release();
+            if (!retained) {badReason=46;break;}
+            setProperty("NVGspControl-user-rpc-late-reply-bytes",static_cast<UInt32>(messageBytes),32);
+            setProperty("NVGspControl-user-rpc-late-reply-truncated",n!=messageBytes);
+            setProperty("NVGspControl-user-rpc-late-result",rpc.result,32);
+            setProperty("NVGspControl-user-rpc-late-pending",false);
+            userRpcLatePending_=false;
+        }
+        const bool expectedPostInit = lateReply ||
             (rpc.function == 1 && postInitPhase_ == 1) ||
             (rpc.function == 64 && postInitPhase_ == 2) ||
             (rpc.function == 65 && postInitPhase_ == 3) ||
@@ -7047,25 +8723,28 @@ IOReturn NVGspControl::pollStatusLocked() {
             (rpc.function == 15 && postInitPhase_ == 31) ||
             (rpc.function == 10 && postInitPhase_ == 32) ||
             (rpc.function == 76 && postInitPhase_ == 33 && pingOutstanding_) ||
-            (postInitPhase_ == 33 && userRpcOutstanding_ &&
-             rpc.function == userRpcFunction_) ||
+            (userRpcOutstanding_ && rpc.function == userRpcFunction_) ||
             (postInitPhase_ == 33 && rpc.function == 71);   // 0.100.0 continuation
         // 0.80.0: generic user RPC reply (raw status-queue entry copy).
         // 0.178.9: and the request's sequence when the reply carries one; a
         // reply to some other RPC with the same function used to complete it
         // (short reply, client channel open failed at stage 12)
-        const bool seqOk = !rpc.sequence || rpc.sequence == userRpcSeq_;
-        if (postInitPhase_ == 33 && userRpcOutstanding_ && rpc.function == userRpcFunction_ && !seqOk) {
+        const bool seqOk = nativeRpcReplyTarget_ ? rpc.sequence==userRpcSeq_ :
+            !rpc.sequence || rpc.sequence == userRpcSeq_;
+        if (userRpcOutstanding_ && rpc.function == userRpcFunction_ && !seqOk) {
             ++userRpcSeqMismatch_;
             setProperty("NVGspControl-user-rpc-seq-mismatch", userRpcSeqMismatch_, 32);
         }
-        if (postInitPhase_ == 33 && userRpcOutstanding_ && rpc.sequence)
+        if (userRpcOutstanding_ && rpc.sequence)
             setProperty("NVGspControl-user-rpc-seq-echo", true);
-        if (postInitPhase_ == 33 && userRpcOutstanding_ &&
-            rpc.function == userRpcFunction_ && seqOk) {
-            const UInt32 n = messageBytes < sizeof(userRpcReply_)
-                ? static_cast<UInt32>(messageBytes) : sizeof(userRpcReply_);
-            __builtin_memcpy(userRpcReply_, entry, n);
+        if (userRpcOutstanding_ && rpc.function == userRpcFunction_ && seqOk) {
+            const UInt32 capacity=nativeRpcReplyTarget_ ? nativeRpcReplyCapacity_ : sizeof(userRpcReply_);
+            const UInt32 n=messageBytes<capacity ? static_cast<UInt32>(messageBytes) : capacity;
+            UInt8 *target=nativeRpcReplyTarget_ ? nativeRpcReplyTarget_ : userRpcReply_;
+            // A multi-element reply may wrap the ring. The local first-page
+            // snapshot cannot be read past 4096 bytes.
+            if(!nvgsp::copyRpcReplyPages615(target,capacity,n,readPtr,header.msgCount,
+                    [&](UInt32 slot){return init_.statusEntry(slot);})) {badReason=47;break;}
             userRpcReplyBytes_ = n;
             userRpcResult_ = rpc.result;
             userRpcOutstanding_ = false;
@@ -7096,8 +8775,8 @@ IOReturn NVGspControl::pollStatusLocked() {
         statusSequence_++;
         if (!profFirst_) profFirst_ = mach_absolute_time();
         ++profRecords_;
-        readPtr = (readPtr + q.elementCount) % header.msgCount;
-        consumed += q.elementCount;
+        readPtr = (readPtr + elementCount) % header.msgCount;
+        consumed += elementCount;
         idleWaits = 0;
         if (!init_.publishStatusReadPtr(readPtr)) { badReason = 7; break; }
         if (rpc.function == kInitDone) {
@@ -7147,16 +8826,13 @@ IOReturn NVGspControl::pollStatusLocked() {
                 }
             }
         }
-        if (rpc.function == 76 && postInitPhase_ == 5) {
+        if (rpc.function == 76 && (postInitPhase_ == 5 || postInitPhase_ == 7)) {
+            const bool devices = postInitPhase_ == 5;
+            const UInt32 command = devices ? 0x20800a40 : 0x00800292;
+            const UInt32 expectedBytes = devices ? nvgsp::kDeviceInfo615Bytes :
+                nvgsp::kClassList615Bytes;
+            const UInt32 object = devices ? internalSubdevice_ : internalDevice_;
             const UInt32 assembledBytes = static_cast<UInt32>(messageBytes);
-            UInt32 controlClient = 0, controlObject = 0, controlCommand = 0;
-            UInt32 controlFlags = 0;
-            bool controlHeaderPresent = false, paramsInBounds = false;
-            setProperty("NVGspControl-device-rpc-result", rpc.result, 32);
-            setProperty("NVGspControl-device-rpc-private-result",
-                        rpc.privateResult, 32);
-            setProperty("NVGspControl-device-rpc-length", rpc.length, 32);
-            setProperty("NVGspControl-device-record-bytes", assembledBytes, 32);
             UInt8 *assembled = static_cast<UInt8 *>(IOMalloc(assembledBytes));
             if (assembled) {
                 for (UInt32 offset = 0; offset < assembledBytes; ++offset) {
@@ -7164,275 +8840,193 @@ IOReturn NVGspControl::pollStatusLocked() {
                     const UInt8 *part = init_.statusEntry(slot);
                     assembled[offset] = part ? part[offset % 4096] : 0;
                 }
-                const UInt32 headBytes = assembledBytes < 232
-                    ? assembledBytes - (assembledBytes >= 80 ? 80 : assembledBytes)
-                    : 152;
-                if (headBytes)
-                    setProperty("NVGspControl-device-payload-head",
-                                assembled + 80, headBytes);
-                if (assembledBytes >= 104) {
-                    controlHeaderPresent = true;
-                    __builtin_memcpy(&controlClient, assembled + 80, 4);
-                    __builtin_memcpy(&controlObject, assembled + 84, 4);
-                    __builtin_memcpy(&controlCommand, assembled + 88, 4);
-                    __builtin_memcpy(&deviceInfoStatus, assembled + 92, 4);
-                    __builtin_memcpy(&deviceInfoBytes, assembled + 96, 4);
-                    __builtin_memcpy(&controlFlags, assembled + 100, 4);
-                    paramsInBounds = deviceInfoBytes <= assembledBytes - 104;
-                    if (paramsInBounds && deviceInfoBytes) {
+                nvgsp::ControlReply615 reply;
+                const bool valid = nvgsp::decodeControlReply615(assembled,
+                    assembledBytes, internalClient_, object, command, expectedBytes, reply);
+                UInt32 count = 0;
+                const bool contentValid = valid && reply.successful() &&
+                    (devices ? nvgsp::deviceInfoCount615(reply.params, expectedBytes, count) :
+                               nvgsp::classListCount615(reply.params, expectedBytes, count));
+                if (devices) {
+                    deviceInfoStatus = valid ? reply.header.status : ~0U;
+                    setProperty("NVGspControl-device-control-header-present", valid);
+                    setProperty("NVGspControl-device-control-status", deviceInfoStatus, 32);
+                    setProperty("NVGspControl-device-control-params-bytes", valid ? reply.header.paramsBytes : 0, 32);
+                    setProperty("NVGspControl-device-control-command", valid ? reply.header.command : 0, 32);
+                    setProperty("NVGspControl-device-rpc-result", rpc.result, 32);
+                    setProperty("NVGspControl-device-rpc-private-result", rpc.privateResult, 32);
+                    if (contentValid) {
+                        deviceInfoBytes = expectedBytes;
                         deviceInfo = static_cast<UInt8 *>(IOMalloc(deviceInfoBytes));
-                        if (deviceInfo)
-                            __builtin_memcpy(deviceInfo, assembled + 104,
-                                             deviceInfoBytes);
+                        if (deviceInfo) __builtin_memcpy(deviceInfo, reply.params, deviceInfoBytes);
                     }
+                    deviceInfoResponse = contentValid && deviceInfo;
+                } else {
+                    classListStatus = valid ? reply.header.status : ~0U;
+                    setProperty("NVGspControl-class-list-status", classListStatus, 32);
+                    setProperty("NVGspControl-class-list-params-bytes", valid ? reply.header.paramsBytes : 0, 32);
+                    setProperty("NVGspControl-class-list-rpc-result", rpc.result, 32);
+                    setProperty("NVGspControl-class-list-rpc-private-result", rpc.privateResult, 32);
+                    if (contentValid) __builtin_memcpy(classList, reply.params, sizeof(classList));
+                    classListResponse = contentValid;
+                }
+                if (!contentValid) {
+                    setProperty("NVGspControl-runtime-control-rejected", true);
+                    badReason = 40; // exact615 header/identity/status/count gate
                 }
                 IOFree(assembled, assembledBytes);
-            }
-            setProperty("NVGspControl-device-control-header-present",
-                        controlHeaderPresent);
-            setProperty("NVGspControl-device-control-client", controlClient, 32);
-            setProperty("NVGspControl-device-control-object", controlObject, 32);
-            setProperty("NVGspControl-device-control-command", controlCommand, 32);
-            setProperty("NVGspControl-device-control-status", deviceInfoStatus, 32);
-            setProperty("NVGspControl-device-control-params-bytes",
-                        deviceInfoBytes, 32);
-            setProperty("NVGspControl-device-control-flags", controlFlags, 32);
-            setProperty("NVGspControl-device-control-params-in-bounds",
-                        paramsInBounds);
-            setProperty("NVGspControl-device-control-params-allocated",
-                        deviceInfo != nullptr);
-            deviceInfoResponse = rpc.result == 0 && deviceInfoStatus == 0 &&
-                deviceInfo && deviceInfoBytes >= 4;
-        }
-        if (rpc.function == 76 && postInitPhase_ == 7) {
-            const UInt32 assembledBytes = static_cast<UInt32>(messageBytes);
-            UInt8 *assembled = static_cast<UInt8 *>(IOMalloc(assembledBytes));
-            if (assembled) {
-                for (UInt32 offset = 0; offset < assembledBytes; ++offset) {
-                    const UInt32 slot = (summary.ringIndex + offset / 4096) % header.msgCount;
-                    const UInt8 *part = init_.statusEntry(slot);
-                    assembled[offset] = part ? part[offset % 4096] : 0;
-                }
-                UInt32 paramsBytes = 0, flags = 0;
-                if (assembledBytes >= 104) {
-                    __builtin_memcpy(&classListStatus, assembled + 92, 4);
-                    __builtin_memcpy(&paramsBytes, assembled + 96, 4);
-                    __builtin_memcpy(&flags, assembled + 100, 4);
-                    if (paramsBytes == sizeof(classList) &&
-                        paramsBytes <= assembledBytes - 104)
-                        __builtin_memcpy(classList, assembled + 104,
-                                         sizeof(classList));
-                }
-                setProperty("NVGspControl-class-list-rpc-result", rpc.result, 32);
-                setProperty("NVGspControl-class-list-rpc-private-result",
-                            rpc.privateResult, 32);
-                setProperty("NVGspControl-class-list-status", classListStatus, 32);
-                setProperty("NVGspControl-class-list-params-bytes", paramsBytes, 32);
-                setProperty("NVGspControl-class-list-flags", flags, 32);
-                classListResponse = rpc.result == 0 && rpc.privateResult == 0 &&
-                    classListStatus == 0 && paramsBytes == sizeof(classList);
-                IOFree(assembled, assembledBytes);
-            }
+            } else badReason = 11;
         }
         if (rpc.function == 103 && postInitPhase_ == 9) {
-            UInt32 allocStatus = ~0U, paramsBytes = 0, flags = 0;
-            if (messageBytes >= 112) {
-                UInt8 allocHead[32]{};
-                for (UInt32 offset = 0; offset < sizeof(allocHead); ++offset) {
-                    const UInt32 absolute = 80 + offset;
-                    const UInt32 slot = (summary.ringIndex + absolute / 4096) % header.msgCount;
-                    const UInt8 *part = init_.statusEntry(slot);
-                    allocHead[offset] = part ? part[absolute % 4096] : 0;
-                }
-                __builtin_memcpy(&allocStatus, allocHead + 16, 4);
-                __builtin_memcpy(&paramsBytes, allocHead + 20, 4);
-                __builtin_memcpy(&flags, allocHead + 24, 4);
-                setProperty("NVGspControl-client-alloc-head", allocHead,
-                            sizeof(allocHead));
-            }
+            const auto reply = nvgsp::decodeRootClient615(entry,
+                messageBytes <= 4096 ? static_cast<size_t>(messageBytes) : 0);
             setProperty("NVGspControl-client-alloc-rpc-result", rpc.result, 32);
-            setProperty("NVGspControl-client-alloc-rpc-private-result",
-                        rpc.privateResult, 32);
-            setProperty("NVGspControl-client-alloc-status", allocStatus, 32);
-            setProperty("NVGspControl-client-alloc-params-bytes", paramsBytes, 32);
-            setProperty("NVGspControl-client-alloc-flags", flags, 32);
-            clientAllocResponse = rpc.result == 0 && rpc.privateResult == 0 &&
-                allocStatus == 0;
+            setProperty("NVGspControl-client-alloc-rpc-private-result", rpc.privateResult, 32);
+            setProperty("NVGspControl-client-alloc-header-valid", reply.valid);
+            setProperty("NVGspControl-client-alloc-status", reply.status, 32);
+            setProperty("NVGspControl-client-alloc-params-bytes", reply.paramsBytes, 32);
+            setProperty("NVGspControl-client-alloc-flags", reply.flags, 32);
+            if (messageBytes >= 88) {
+                UInt8 allocHead[32]{};
+                __builtin_memcpy(allocHead, entry+56, sizeof(allocHead));
+                setProperty("NVGspControl-client-alloc-head", allocHead, sizeof(allocHead));
+            }
+            clientAllocResponse = reply.successful();
+            if (!clientAllocResponse) badReason = 41;
         }
         if (rpc.function == 10 && postInitPhase_ == 11) {
-            UInt32 freeStatus = ~0U;
-            if (messageBytes >= 96) {
-                UInt8 statusBytes[4]{};
-                for (UInt32 offset = 0; offset < sizeof(statusBytes); ++offset) {
-                    const UInt32 absolute = 92 + offset;
-                    const UInt32 slot = (summary.ringIndex + absolute / 4096) % header.msgCount;
-                    const UInt8 *part = init_.statusEntry(slot);
-                    statusBytes[offset] = part ? part[absolute % 4096] : 0;
-                }
-                __builtin_memcpy(&freeStatus, statusBytes, 4);
-            }
+            const auto reply = nvgsp::decodeRootFree615(entry,
+                messageBytes <= 4096 ? static_cast<size_t>(messageBytes) : 0);
             setProperty("NVGspControl-client-free-rpc-result", rpc.result, 32);
-            setProperty("NVGspControl-client-free-rpc-private-result",
-                        rpc.privateResult, 32);
-            setProperty("NVGspControl-client-free-status", freeStatus, 32);
-            clientFreeResponse = rpc.result == 0 && rpc.privateResult == 0 &&
-                freeStatus == 0;
+            setProperty("NVGspControl-client-free-rpc-private-result", rpc.privateResult, 32);
+            setProperty("NVGspControl-client-free-header-valid", reply.valid);
+            setProperty("NVGspControl-client-free-status", reply.status, 32);
+            clientFreeResponse = reply.successful();
+            if (!clientFreeResponse) badReason = 42;
         }
-        if (rpc.function == 76 && postInitPhase_ == 13) {
-            UInt32 controlStatus = ~0U, paramsBytes = 0, flags = 0;
-            if (messageBytes >= 108) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
-                __builtin_memcpy(&flags, entry + 100, 4);
-                if (paramsBytes == sizeof(deviceIds))
-                    __builtin_memcpy(&deviceIds, entry + 104, 4);
-            }
-            setProperty("NVGspControl-device-ids-rpc-result", rpc.result, 32);
-            setProperty("NVGspControl-device-ids-rpc-private-result",
-                        rpc.privateResult, 32);
-            setProperty("NVGspControl-device-ids-status", controlStatus, 32);
-            setProperty("NVGspControl-device-ids-params-bytes", paramsBytes, 32);
-            setProperty("NVGspControl-device-ids-flags", flags, 32);
-            deviceIdsResponse = rpc.result == 0 && rpc.privateResult == 0 &&
-                controlStatus == 0 && paramsBytes == sizeof(deviceIds);
-        }
-        if (rpc.function == 76 && postInitPhase_ == 15) {
-            UInt32 controlStatus = ~0U, paramsBytes = 0, flags = 0;
-            if (messageBytes >= 104 + sizeof(attachedIds)) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
-                __builtin_memcpy(&flags, entry + 100, 4);
-                if (paramsBytes == sizeof(attachedIds))
-                    __builtin_memcpy(attachedIds, entry + 104,
-                                     sizeof(attachedIds));
-            }
-            setProperty("NVGspControl-attached-ids-rpc-result", rpc.result, 32);
-            setProperty("NVGspControl-attached-ids-rpc-private-result",
-                        rpc.privateResult, 32);
-            setProperty("NVGspControl-attached-ids-status", controlStatus, 32);
-            setProperty("NVGspControl-attached-ids-params-bytes", paramsBytes, 32);
-            setProperty("NVGspControl-attached-ids-flags", flags, 32);
-            attachedIdsResponse = rpc.result == 0 && rpc.privateResult == 0 &&
-                controlStatus == 0 && paramsBytes == sizeof(attachedIds);
-        }
-        if (rpc.function == 103 && (postInitPhase_ == 17 || postInitPhase_ == 19)) {
-            UInt32 allocStatus = ~0U, paramsBytes = 0, flags = 0;
-            if (messageBytes >= 112) {
-                __builtin_memcpy(&allocStatus, entry + 96, 4);
-                __builtin_memcpy(&paramsBytes, entry + 100, 4);
-                __builtin_memcpy(&flags, entry + 104, 4);
-            }
-            const bool ok = rpc.result == 0 && rpc.privateResult == 0 &&
-                allocStatus == 0;
-            if (postInitPhase_ == 17) {
-                setProperty("NVGspControl-owned-client-rpc-result", rpc.result, 32);
-                setProperty("NVGspControl-owned-client-private-result",
-                            rpc.privateResult, 32);
-                setProperty("NVGspControl-owned-client-status", allocStatus, 32);
-                setProperty("NVGspControl-owned-client-params-bytes", paramsBytes, 32);
-                setProperty("NVGspControl-owned-client-flags", flags, 32);
-                ownedClientResponse = ok;
+        if (rpc.function == 76 && (postInitPhase_ == 13 || postInitPhase_ == 15)) {
+            const bool attached = postInitPhase_ == 15;
+            const UInt32 paramsBytes = attached ? sizeof(attachedIds) : sizeof(deviceIds);
+            const UInt32 command = attached ? 0x201 : 0x204;
+            nvgsp::ControlReply615 reply;
+            bool valid = messageBytes <= 4096 && nvgsp::decodeControlReply615(entry,
+                static_cast<size_t>(messageBytes), internalClient_, internalClient_,
+                command, paramsBytes, reply);
+            const UInt32 status = valid ? reply.header.status : ~0U;
+            valid = valid && reply.successful();
+            if (attached) {
+                if (valid) __builtin_memcpy(attachedIds, reply.params, sizeof(attachedIds));
+                attachedIdsResponse = valid && attachedIds[0] != ~0U;
+                setProperty("NVGspControl-attached-ids-status", status, 32);
+                if (!attachedIdsResponse) badReason = 43;
             } else {
-                setProperty("NVGspControl-device-alloc-rpc-result", rpc.result, 32);
-                setProperty("NVGspControl-device-alloc-private-result",
-                            rpc.privateResult, 32);
-                setProperty("NVGspControl-device-alloc-status", allocStatus, 32);
-                setProperty("NVGspControl-device-alloc-params-bytes", paramsBytes, 32);
-                setProperty("NVGspControl-device-alloc-flags", flags, 32);
+                if (valid) __builtin_memcpy(&deviceIds, reply.params, sizeof(deviceIds));
+                deviceIdsResponse = valid && deviceIds;
+                setProperty("NVGspControl-device-ids-status", status, 32);
+                if (!deviceIdsResponse) badReason = 43;
+            }
+        }
+        if (rpc.function == 103 && (postInitPhase_ == 17 || postInitPhase_ == 19 ||
+                                    postInitPhase_ == 20 || postInitPhase_ == 23)) {
+            const bool root = postInitPhase_ == 17;
+            const bool device = postInitPhase_ == 19;
+            const bool subdevice = postInitPhase_ == 20;
+            const UInt8 *params = nullptr;
+            const UInt32 parent = device ? nvgsp::kLifecycleClient615 : nvgsp::kLifecycleDevice615;
+            const UInt32 object = device ? nvgsp::kLifecycleDevice615 :
+                subdevice ? nvgsp::kLifecycleSubdevice615 : nvgsp::kLifecycleVaspace615;
+            const UInt32 objectClass = device ? 0x80 : subdevice ? 0x2080 : 0x90f1;
+            const UInt32 paramsBytes = device ? sizeof(nvgsp::DeviceParams615) :
+                subdevice ? 4 : sizeof(nvgsp::VaspaceParams615);
+            const size_t bytes = messageBytes <= 4096 ? static_cast<size_t>(messageBytes) : 0;
+            const auto reply = root ? nvgsp::decodeRootClient615(entry, bytes) :
+                nvgsp::decodeAlloc615(entry, bytes, parent, object, objectClass, paramsBytes, &params);
+            const bool ok = reply.successful();
+            if (root) {
+                setProperty("NVGspControl-owned-client-status", reply.status, 32);
+                setProperty("NVGspControl-owned-client-header-valid", reply.valid);
+                ownedClientResponse = ok;
+            } else if (device) {
+                setProperty("NVGspControl-device-alloc-status", reply.status, 32);
+                setProperty("NVGspControl-device-alloc-header-valid", reply.valid);
                 deviceAllocResponse = ok;
+            } else if (subdevice) {
+                setProperty("NVGspControl-subdevice-alloc-status", reply.status, 32);
+                setProperty("NVGspControl-subdevice-alloc-header-valid", reply.valid);
+                subdeviceAllocResponse = ok;
+            } else {
+                setProperty("NVGspControl-vaspace-alloc-status", reply.status, 32);
+                setProperty("NVGspControl-vaspace-alloc-header-valid", reply.valid);
+                setProperty("NVGspControl-vaspace-alloc-params-bytes", reply.paramsBytes, 32);
+                if (ok && params) {
+                    nvgsp::VaspaceParams615 returned{};
+                    __builtin_memcpy(&returned, params, sizeof(returned));
+                    setProperty("NVGspControl-vaspace-alloc-returned-params", &returned, sizeof(returned));
+                    setProperty("NVGspControl-vaspace-size", returned.vaSize, 64);
+                    setProperty("NVGspControl-vaspace-base", returned.vaBase, 64);
+                    setProperty("NVGspControl-vaspace-big-page-size", returned.bigPageSize, 32);
+                    setProperty("NVGspControl-vaspace-pasid", returned.pasid, 32);
+                }
+                vaspaceAllocResponse = ok;
             }
-        }
-        if (rpc.function == 103 && postInitPhase_ == 20) {
-            UInt32 allocStatus = ~0U, paramsBytes = 0, flags = 0;
-            if (messageBytes >= 112) {
-                __builtin_memcpy(&allocStatus, entry + 96, 4);
-                __builtin_memcpy(&paramsBytes, entry + 100, 4);
-                __builtin_memcpy(&flags, entry + 104, 4);
+            if (!ok) {
+                setProperty("NVGspControl-allocation-rejected-phase", postInitPhase_, 32);
+                setProperty("NVGspControl-allocation-rpc-result", rpc.result, 32);
+                setProperty("NVGspControl-allocation-private-result", rpc.privateResult, 32);
+                badReason = 44;
             }
-            setProperty("NVGspControl-subdevice-alloc-rpc-result", rpc.result, 32);
-            setProperty("NVGspControl-subdevice-alloc-private-result",
-                        rpc.privateResult, 32);
-            setProperty("NVGspControl-subdevice-alloc-status", allocStatus, 32);
-            setProperty("NVGspControl-subdevice-alloc-params-bytes", paramsBytes, 32);
-            setProperty("NVGspControl-subdevice-alloc-flags", flags, 32);
-            subdeviceAllocResponse = rpc.result == 0 && rpc.privateResult == 0 &&
-                allocStatus == 0;
-        }
-        if (rpc.function == 103 && postInitPhase_ == 23) {
-            UInt32 allocStatus = ~0U, paramsBytes = 0, flags = 0;
-            UInt8 params[48]{};
-            if (messageBytes >= 112) {
-                __builtin_memcpy(&allocStatus, entry + 96, 4);
-                __builtin_memcpy(&paramsBytes, entry + 100, 4);
-                __builtin_memcpy(&flags, entry + 104, 4);
-                if (paramsBytes == sizeof(params) && messageBytes >= 112 + sizeof(params))
-                    __builtin_memcpy(params, entry + 112, sizeof(params));
-            }
-            setProperty("NVGspControl-vaspace-alloc-rpc-result", rpc.result, 32);
-            setProperty("NVGspControl-vaspace-alloc-private-result",
-                        rpc.privateResult, 32);
-            setProperty("NVGspControl-vaspace-alloc-status", allocStatus, 32);
-            setProperty("NVGspControl-vaspace-alloc-params-bytes", paramsBytes, 32);
-            setProperty("NVGspControl-vaspace-alloc-flags", flags, 32);
-            if (paramsBytes == sizeof(params)) {
-                UInt64 vaSize = 0, vaBase = 0;
-                UInt32 bigPageSize = 0;
-                __builtin_memcpy(&vaSize, params + 8, 8);
-                __builtin_memcpy(&bigPageSize, params + 32, 4);
-                __builtin_memcpy(&vaBase, params + 40, 8);
-                setProperty("NVGspControl-vaspace-alloc-returned-params",
-                            params, sizeof(params));
-                setProperty("NVGspControl-vaspace-size", vaSize, 64);
-                setProperty("NVGspControl-vaspace-big-page-size", bigPageSize, 32);
-                setProperty("NVGspControl-vaspace-base", vaBase, 64);
-            }
-            vaspaceAllocResponse = rpc.result == 0 && rpc.privateResult == 0 &&
-                allocStatus == 0 && paramsBytes == sizeof(params);
         }
         if (rpc.function == 103 && postInitPhase_ == 26) {
-            UInt32 allocStatus = ~0U, paramsBytes = 0, flags = 0;
-            UInt8 params[128]{};
-            if (messageBytes >= 112) {
-                __builtin_memcpy(&allocStatus, entry + 96, 4);
-                __builtin_memcpy(&paramsBytes, entry + 100, 4);
-                __builtin_memcpy(&flags, entry + 104, 4);
-                if (paramsBytes == sizeof(params) && messageBytes >= 112 + sizeof(params))
-                    __builtin_memcpy(params, entry + 112, sizeof(params));
-            }
+            const UInt8 *params = nullptr;
+            const auto reply = nvgsp::decodeAlloc615(entry,
+                messageBytes <= 4096 ? static_cast<size_t>(messageBytes) : 0,
+                nvgsp::kLifecycleSubdevice615, nvgsp::kLifecycleMemory615, 0x40,
+                sizeof(nvgsp::MemoryParams615), &params);
             setProperty("NVGspControl-local-memory-alloc-rpc-result", rpc.result, 32);
-            setProperty("NVGspControl-local-memory-alloc-private-result",
-                        rpc.privateResult, 32);
-            setProperty("NVGspControl-local-memory-alloc-status", allocStatus, 32);
-            setProperty("NVGspControl-local-memory-alloc-params-bytes", paramsBytes, 32);
-            setProperty("NVGspControl-local-memory-alloc-flags", flags, 32);
-            if (paramsBytes == sizeof(params)) {
-                UInt32 attr = 0;
-                UInt64 size = 0, offset = 0, limit = 0;
-                __builtin_memcpy(&attr, params + 24, 4);
-                __builtin_memcpy(&size, params + 64, 8);
-                __builtin_memcpy(&offset, params + 80, 8);
-                __builtin_memcpy(&limit, params + 88, 8);
-                localMemoryOffset_ = offset;
-                setProperty("NVGspControl-local-memory-returned-params",
-                            params, sizeof(params));
-                setProperty("NVGspControl-local-memory-attr", attr, 32);
-                setProperty("NVGspControl-local-memory-size", size, 64);
-                setProperty("NVGspControl-local-memory-offset", offset, 64);
-                setProperty("NVGspControl-local-memory-limit", limit, 64);
+            setProperty("NVGspControl-local-memory-alloc-private-result", rpc.privateResult, 32);
+            setProperty("NVGspControl-local-memory-alloc-status", reply.status, 32);
+            setProperty("NVGspControl-local-memory-alloc-header-valid", reply.valid);
+            setProperty("NVGspControl-local-memory-alloc-params-bytes", reply.paramsBytes, 32);
+            bool rangeOk = false;
+            if (reply.valid && params) {
+                nvgsp::MemoryParams615 returned{};
+                __builtin_memcpy(&returned, params, sizeof(returned));
+                setProperty("NVGspControl-local-memory-returned-params", &returned, sizeof(returned));
+                const nvgsp::GmcFbRegion *allocationRegion = nullptr;
+                if (reply.successful()) {
+                    for (UInt32 i=0;i<gmcConfig_.regionCount;++i) {
+                        const auto &r = gmcConfig_.regions[i];
+                        if (nvgsp::memoryProbeRegion615(returned, gmcConfig_.fbBytes,
+                            r.base, r.limit, r.flags, r.tag)) allocationRegion = &r;
+                    }
+                }
+                rangeOk = allocationRegion != nullptr;
+                if (rangeOk) {
+                    setProperty("NVGspControl-local-memory-heap-base", allocationRegion->base, 64);
+                    setProperty("NVGspControl-local-memory-heap-limit", allocationRegion->limit, 64);
+                    setProperty("NVGspControl-local-memory-heap-tag", allocationRegion->tag, 32);
+                    setProperty("NVGspControl-local-memory-absolute-limit", returned.offset+returned.limit, 64);
+                    localMemoryOffset_ = returned.offset;
+                    setProperty("NVGspControl-local-memory-attr", returned.attr, 32);
+                    setProperty("NVGspControl-local-memory-size", returned.size, 64);
+                    setProperty("NVGspControl-local-memory-offset", returned.offset, 64);
+                    setProperty("NVGspControl-local-memory-limit", returned.limit, 64);
+                }
             }
-            localMemoryAllocResponse = rpc.result == 0 && rpc.privateResult == 0 &&
-                allocStatus == 0 && paramsBytes == sizeof(params);
+            setProperty("NVGspControl-local-memory-range-valid", rangeOk);
+            localMemoryAllocResponse = rangeOk;
+            if (!rangeOk) badReason = 46;
         }
         if (rpc.function == 103 &&
             (postInitPhase_ == 42 || postInitPhase_ == 43)) {
             UInt32 allocStatus = ~0U, paramsBytes = 0, flags = 0;
             UInt8 params[128]{};
-            if (messageBytes >= 112) {
-                __builtin_memcpy(&allocStatus, entry + 96, 4);
-                __builtin_memcpy(&paramsBytes, entry + 100, 4);
-                __builtin_memcpy(&flags, entry + 104, 4);
-                if (paramsBytes == sizeof(params) && messageBytes >= 112 + sizeof(params))
-                    __builtin_memcpy(params, entry + 112, sizeof(params));
+            if (messageBytes >= 88) {
+                __builtin_memcpy(&allocStatus, entry + 72, 4);
+                __builtin_memcpy(&paramsBytes, entry + 76, 4);
+                __builtin_memcpy(&flags, entry + 80, 4);
+                if (paramsBytes == sizeof(params) && messageBytes >= 88 + sizeof(params))
+                    __builtin_memcpy(params, entry + 88, sizeof(params));
             }
             const bool isGpfifo = (postInitPhase_ == 42);
             setProperty(isGpfifo ? "NVGspControl-gpfifo-backing-rpc-result"
@@ -7486,12 +9080,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             methodSizeAnswered = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0, flags = 0;
             UInt32 bytes = 0;
-            if (messageBytes >= 108) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
-                __builtin_memcpy(&flags, entry + 100, 4);
+            if (messageBytes >= 84) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
+                __builtin_memcpy(&flags, entry + 76, 4);
                 if (paramsBytes == 4)
-                    __builtin_memcpy(&bytes, entry + 104, 4);
+                    __builtin_memcpy(&bytes, entry + 80, 4);
             }
             methodBufferBytes_ = bytes;
             setProperty("NVGspControl-method-buffer-size-rpc-result",
@@ -7510,13 +9104,13 @@ IOReturn NVGspControl::pollStatusLocked() {
             (postInitPhase_ == 50 || postInitPhase_ == 51)) {
             UInt32 allocStatus = ~0U, paramsBytes = 0, flags = 0;
             UInt8 params[128]{};
-            if (messageBytes >= 112) {
-                __builtin_memcpy(&allocStatus, entry + 96, 4);
-                __builtin_memcpy(&paramsBytes, entry + 100, 4);
-                __builtin_memcpy(&flags, entry + 104, 4);
+            if (messageBytes >= 88) {
+                __builtin_memcpy(&allocStatus, entry + 72, 4);
+                __builtin_memcpy(&paramsBytes, entry + 76, 4);
+                __builtin_memcpy(&flags, entry + 80, 4);
                 if (paramsBytes == sizeof(params) &&
-                    messageBytes >= 112 + sizeof(params))
-                    __builtin_memcpy(params, entry + 112, sizeof(params));
+                    messageBytes >= 88 + sizeof(params))
+                    __builtin_memcpy(params, entry + 88, sizeof(params));
             }
             const bool isInstance = postInitPhase_ == 50;
             if (isInstance)
@@ -7572,12 +9166,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             channelAllocReturned = true;
             UInt32 allocStatus = ~0U, paramsBytes = 0, flags = 0;
             UInt8 params[368]{};
-            if (messageBytes >= 112) {
-                __builtin_memcpy(&allocStatus, entry + 96, 4);
-                __builtin_memcpy(&paramsBytes, entry + 100, 4);
-                __builtin_memcpy(&flags, entry + 104, 4);
-                if (paramsBytes == sizeof(params) && messageBytes >= 112 + sizeof(params))
-                    __builtin_memcpy(params, entry + 112, sizeof(params));
+            if (messageBytes >= 88) {
+                __builtin_memcpy(&allocStatus, entry + 72, 4);
+                __builtin_memcpy(&paramsBytes, entry + 76, 4);
+                __builtin_memcpy(&flags, entry + 80, 4);
+                if (paramsBytes == sizeof(params) && messageBytes >= 88 + sizeof(params))
+                    __builtin_memcpy(params, entry + 88, sizeof(params));
             }
             setProperty("NVGspControl-channel-alloc-rpc-result", rpc.result, 32);
             setProperty("NVGspControl-channel-alloc-private-result",
@@ -7620,10 +9214,10 @@ IOReturn NVGspControl::pollStatusLocked() {
             (postInitPhase_ == 52 || postInitPhase_ == 53)) {
             const bool isBind = postInitPhase_ == 52;
             UInt32 controlStatus = ~0U, paramsBytes = 0, flags = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
-                __builtin_memcpy(&flags, entry + 100, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
+                __builtin_memcpy(&flags, entry + 76, 4);
             }
             setProperty(isBind ? "NVGspControl-channel-bind-rpc-result"
                                : "NVGspControl-channel-schedule-rpc-result",
@@ -7655,10 +9249,10 @@ IOReturn NVGspControl::pollStatusLocked() {
             (postInitPhase_ == 54 || postInitPhase_ == 55)) {
             const bool isTsgBind = postInitPhase_ == 54;
             UInt32 controlStatus = ~0U, paramsBytes = 0, flags = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
-                __builtin_memcpy(&flags, entry + 100, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
+                __builtin_memcpy(&flags, entry + 76, 4);
             }
             setProperty(isTsgBind ? "NVGspControl-tsg-bind-rpc-result"
                                   : "NVGspControl-tsg-schedule-rpc-result",
@@ -7690,12 +9284,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             tsgInfoReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0, flags = 0;
             UInt32 hwId = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
-                __builtin_memcpy(&flags, entry + 100, 4);
-                if (paramsBytes == 4 && messageBytes >= 108)
-                    __builtin_memcpy(&hwId, entry + 104, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
+                __builtin_memcpy(&flags, entry + 76, 4);
+                if (paramsBytes == 4 && messageBytes >= 84)
+                    __builtin_memcpy(&hwId, entry + 80, 4);
             }
             tsgHwId_ = hwId;
             setProperty("NVGspControl-tsg-info-rpc-result", rpc.result, 32);
@@ -7712,10 +9306,10 @@ IOReturn NVGspControl::pollStatusLocked() {
         if (rpc.function == 76 && postInitPhase_ == 57) {
             tsgTimesliceReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0, flags = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
-                __builtin_memcpy(&flags, entry + 100, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
+                __builtin_memcpy(&flags, entry + 76, 4);
             }
             setProperty("NVGspControl-tsg-timeslice-rpc-result",
                         rpc.result, 32);
@@ -7735,10 +9329,10 @@ IOReturn NVGspControl::pollStatusLocked() {
         if (rpc.function == 76 &&
             postInitPhase_ >= 58 && postInitPhase_ <= 63) {
             UInt32 controlStatus = ~0U, paramsBytes = 0, flags = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
-                __builtin_memcpy(&flags, entry + 100, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
+                __builtin_memcpy(&flags, entry + 76, 4);
             }
             const bool ok = rpc.result == 0 && rpc.privateResult == 0 &&
                 controlStatus == 0;
@@ -7746,9 +9340,9 @@ IOReturn NVGspControl::pollStatusLocked() {
                 fifoInfoReturned = true;
                 fifoInfoResponse = ok;
                 UInt32 groups = 0, chram = 0;
-                if (messageBytes >= 104 + 20) {
-                    __builtin_memcpy(&groups, entry + 104 + 8, 4);
-                    __builtin_memcpy(&chram, entry + 104 + 16, 4);
+                if (messageBytes >= 80 + 20) {
+                    __builtin_memcpy(&groups, entry + 80 + 8, 4);
+                    __builtin_memcpy(&chram, entry + 80 + 16, 4);
                 }
                 setProperty("NVGspControl-fifo-info-status",
                             controlStatus, 32);
@@ -7760,9 +9354,9 @@ IOReturn NVGspControl::pollStatusLocked() {
                 userdLocReturned = true;
                 userdLocResponse = ok;
                 UInt32 aperture = 0, attribute = 0;
-                if (messageBytes >= 104 + 8) {
-                    __builtin_memcpy(&aperture, entry + 104, 4);
-                    __builtin_memcpy(&attribute, entry + 104 + 4, 4);
+                if (messageBytes >= 80 + 8) {
+                    __builtin_memcpy(&aperture, entry + 80, 4);
+                    __builtin_memcpy(&attribute, entry + 80 + 4, 4);
                 }
                 setProperty("NVGspControl-userd-loc-status",
                             controlStatus, 32);
@@ -7774,9 +9368,9 @@ IOReturn NVGspControl::pollStatusLocked() {
                 partnerReturned = true;
                 partnerResponse = ok;
                 UInt32 numPartners = 0, partner0 = 0;
-                if (messageBytes >= 104 + 20) {
-                    __builtin_memcpy(&numPartners, entry + 104 + 12, 4);
-                    __builtin_memcpy(&partner0, entry + 104 + 16, 4);
+                if (messageBytes >= 80 + 20) {
+                    __builtin_memcpy(&numPartners, entry + 80 + 12, 4);
+                    __builtin_memcpy(&partner0, entry + 80 + 16, 4);
                 }
                 setProperty("NVGspControl-partner-status",
                             controlStatus, 32);
@@ -7788,9 +9382,9 @@ IOReturn NVGspControl::pollStatusLocked() {
                 priBaseReturned = true;
                 priBaseResponse = ok;
                 UInt32 priBase0 = 0, runlistId0 = 0;
-                if (messageBytes >= 104 + 676) {
-                    __builtin_memcpy(&priBase0, entry + 104 + 336, 4);
-                    __builtin_memcpy(&runlistId0, entry + 104 + 672, 4);
+                if (messageBytes >= 80 + 676) {
+                    __builtin_memcpy(&priBase0, entry + 80 + 336, 4);
+                    __builtin_memcpy(&runlistId0, entry + 80 + 672, 4);
                 }
                 setProperty("NVGspControl-pribase-status",
                             controlStatus, 32);
@@ -7802,8 +9396,8 @@ IOReturn NVGspControl::pollStatusLocked() {
                 tokenReturned = true;
                 tokenResponse = ok;
                 UInt32 token = 0;
-                if (messageBytes >= 104 + 4)
-                    __builtin_memcpy(&token, entry + 104, 4);
+                if (messageBytes >= 80 + 4)
+                    __builtin_memcpy(&token, entry + 80, 4);
                 setProperty("NVGspControl-submit-token-status",
                             controlStatus, 32);
                 setProperty("NVGspControl-submit-token", token, 32);
@@ -7839,9 +9433,9 @@ IOReturn NVGspControl::pollStatusLocked() {
         if (rpc.function == 103 &&
             postInitPhase_ >= 64 && postInitPhase_ <= 68) {
             UInt32 allocStatus = ~0U, paramsBytes = 0;
-            if (messageBytes >= 112) {
-                __builtin_memcpy(&allocStatus, entry + 96, 4);
-                __builtin_memcpy(&paramsBytes, entry + 100, 4);
+            if (messageBytes >= 88) {
+                __builtin_memcpy(&allocStatus, entry + 72, 4);
+                __builtin_memcpy(&paramsBytes, entry + 76, 4);
             }
             const bool ok = rpc.result == 0 && rpc.privateResult == 0 &&
                 allocStatus == 0;
@@ -7855,9 +9449,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             } else if (postInitPhase_ == 65) {
                 pbBackingReturned = true;
                 UInt64 size = 0, offset = 0;
-                if (paramsBytes == 128 && messageBytes >= 112 + 128) {
-                    __builtin_memcpy(&size, entry + 112 + 64, 8);
-                    __builtin_memcpy(&offset, entry + 112 + 80, 8);
+                if (paramsBytes == 128 && messageBytes >= 88 + 128) {
+                    __builtin_memcpy(&size, entry + 88 + 64, 8);
+                    __builtin_memcpy(&offset, entry + 88 + 80, 8);
                 }
                 pbBackingResponse = ok && paramsBytes == 128 && size != 0;
                 if (pbBackingResponse)
@@ -7875,9 +9469,9 @@ IOReturn NVGspControl::pollStatusLocked() {
             } else if (postInitPhase_ == 67) {
                 notifyBackingReturned = true;
                 UInt64 size = 0, offset = 0;
-                if (paramsBytes == 128 && messageBytes >= 112 + 128) {
-                    __builtin_memcpy(&size, entry + 112 + 64, 8);
-                    __builtin_memcpy(&offset, entry + 112 + 80, 8);
+                if (paramsBytes == 128 && messageBytes >= 88 + 128) {
+                    __builtin_memcpy(&size, entry + 88 + 64, 8);
+                    __builtin_memcpy(&offset, entry + 88 + 80, 8);
                 }
                 notifyBackingResponse = ok && paramsBytes == 128 &&
                     size != 0;
@@ -7902,10 +9496,10 @@ IOReturn NVGspControl::pollStatusLocked() {
         if (rpc.function == 76 && postInitPhase_ == 69) {
             dispPbProgramReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0, flags = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
-                __builtin_memcpy(&flags, entry + 100, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
+                __builtin_memcpy(&flags, entry + 76, 4);
             }
             dispPbProgramResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
@@ -7922,9 +9516,9 @@ IOReturn NVGspControl::pollStatusLocked() {
         }
         if (rpc.function == 76 && postInitPhase_ == 70) {
             UInt32 controlStatus = ~0U, paramsBytes = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
             dispKickFlushReturned = true;
             dispKickFlushResponse = rpc.result == 0 &&
@@ -7941,10 +9535,10 @@ IOReturn NVGspControl::pollStatusLocked() {
         if (rpc.function == 76 && postInitPhase_ == 71) {
             dispHandlerProbe1Returned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0, flags = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
-                __builtin_memcpy(&flags, entry + 100, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
+                __builtin_memcpy(&flags, entry + 76, 4);
             }
             dispHandlerProbe1Response = rpc.result == 0 &&
                 rpc.privateResult == 0 &&
@@ -7962,10 +9556,10 @@ IOReturn NVGspControl::pollStatusLocked() {
         if (rpc.function == 76 && postInitPhase_ == 72) {
             dispHandlerProbe2Returned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0, flags = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
-                __builtin_memcpy(&flags, entry + 100, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
+                __builtin_memcpy(&flags, entry + 76, 4);
             }
             dispHandlerProbe2Response = rpc.result == 0 &&
                 rpc.privateResult == 0 &&
@@ -7990,10 +9584,10 @@ IOReturn NVGspControl::pollStatusLocked() {
             for (UInt32 i = 0; i < 6; ++i) {
                 const uint64_t need = 92ULL + (i + 1) * 4;
                 if (messageBytes >= need)
-                    __builtin_memcpy(&words[i], entry + 92 + i * 4, 4);
+                    __builtin_memcpy(&words[i], entry + 68 + i * 4, 4);
             }
             sched97chanResponse = rpc.result == 0 &&
-                rpc.privateResult == 0 && messageBytes >= 96;
+                rpc.privateResult == 0 && messageBytes >= 72;
             setProperty("NVGspControl-sched97chan-rpc-result",
                         rpc.result, 32);
             setProperty("NVGspControl-sched97chan-private-result",
@@ -8012,10 +9606,10 @@ IOReturn NVGspControl::pollStatusLocked() {
             for (UInt32 i = 0; i < 6; ++i) {
                 const uint64_t need = 92ULL + (i + 1) * 4;
                 if (messageBytes >= need)
-                    __builtin_memcpy(&words[i], entry + 92 + i * 4, 4);
+                    __builtin_memcpy(&words[i], entry + 68 + i * 4, 4);
             }
             sched97tsgResponse = rpc.result == 0 &&
-                rpc.privateResult == 0 && messageBytes >= 96;
+                rpc.privateResult == 0 && messageBytes >= 72;
             setProperty("NVGspControl-sched97tsg-rpc-result",
                         rpc.result, 32);
             setProperty("NVGspControl-sched97tsg-private-result",
@@ -8032,9 +9626,9 @@ IOReturn NVGspControl::pollStatusLocked() {
         if (rpc.function == 103 && postInitPhase_ == 75) {
             dispC372Returned = true;
             UInt32 allocStatus = ~0U, paramsBytes = 0;
-            if (messageBytes >= 112) {
-                __builtin_memcpy(&allocStatus, entry + 96, 4);
-                __builtin_memcpy(&paramsBytes, entry + 100, 4);
+            if (messageBytes >= 88) {
+                __builtin_memcpy(&allocStatus, entry + 72, 4);
+                __builtin_memcpy(&paramsBytes, entry + 76, 4);
             }
             dispC372Response = rpc.result == 0 &&
                 rpc.privateResult == 0 && allocStatus == 0;
@@ -8048,9 +9642,9 @@ IOReturn NVGspControl::pollStatusLocked() {
         if (rpc.function == 103 && postInitPhase_ == 76) {
             dispCommonReturned = true;
             UInt32 allocStatus = ~0U, paramsBytes = 0;
-            if (messageBytes >= 112) {
-                __builtin_memcpy(&allocStatus, entry + 96, 4);
-                __builtin_memcpy(&paramsBytes, entry + 100, 4);
+            if (messageBytes >= 88) {
+                __builtin_memcpy(&allocStatus, entry + 72, 4);
+                __builtin_memcpy(&paramsBytes, entry + 76, 4);
             }
             dispCommonResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && allocStatus == 0;
@@ -8065,13 +9659,13 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispSysSupportedReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 mask = 0, maskDdc = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 116) {
-                __builtin_memcpy(&mask, entry + 108, 4);
-                __builtin_memcpy(&maskDdc, entry + 112, 4);
+            if (messageBytes >= 92) {
+                __builtin_memcpy(&mask, entry + 84, 4);
+                __builtin_memcpy(&maskDdc, entry + 88, 4);
             }
             dispSysSupportedResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
@@ -8089,12 +9683,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispSysNumHeadsReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 numHeads = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 116)
-                __builtin_memcpy(&numHeads, entry + 112, 4);
+            if (messageBytes >= 92)
+                __builtin_memcpy(&numHeads, entry + 88, 4);
             dispSysNumHeadsResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
                 paramsBytes == 12;
@@ -8109,12 +9703,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispSysActiveReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 displayId = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 120)
-                __builtin_memcpy(&displayId, entry + 116, 4);
+            if (messageBytes >= 96)
+                __builtin_memcpy(&displayId, entry + 92, 4);
             dispSysActiveResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
                 paramsBytes == 16;
@@ -8129,12 +9723,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispSysActive1Returned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 displayId = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 120)
-                __builtin_memcpy(&displayId, entry + 116, 4);
+            if (messageBytes >= 96)
+                __builtin_memcpy(&displayId, entry + 92, 4);
             dispSysActive1Response = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
                 paramsBytes == 16;
@@ -8148,12 +9742,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispSysActive2Returned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 displayId = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 120)
-                __builtin_memcpy(&displayId, entry + 116, 4);
+            if (messageBytes >= 96)
+                __builtin_memcpy(&displayId, entry + 92, 4);
             dispSysActive2Response = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
                 paramsBytes == 16;
@@ -8167,12 +9761,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispSysActive3Returned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 displayId = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 120)
-                __builtin_memcpy(&displayId, entry + 116, 4);
+            if (messageBytes >= 96)
+                __builtin_memcpy(&displayId, entry + 92, 4);
             dispSysActive3Response = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
                 paramsBytes == 16;
@@ -8187,12 +9781,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispConnectReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 connMask = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 116)
-                __builtin_memcpy(&connMask, entry + 112, 4);
+            if (messageBytes >= 92)
+                __builtin_memcpy(&connMask, entry + 88, 4);
             dispConnectResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
                 paramsBytes == 16;
@@ -8207,12 +9801,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispBootDisplaysReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 bootMask = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 112)
-                __builtin_memcpy(&bootMask, entry + 108, 4);
+            if (messageBytes >= 88)
+                __builtin_memcpy(&bootMask, entry + 84, 4);
             dispBootDisplaysResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
                 paramsBytes == 8;
@@ -8228,12 +9822,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispScanlineReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 scanline = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 116)
-                __builtin_memcpy(&scanline, entry + 112, 4);
+            if (messageBytes >= 92)
+                __builtin_memcpy(&scanline, entry + 88, 4);
             dispScanlineResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
                 paramsBytes == 20;
@@ -8248,12 +9842,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispVblankReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 counter = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 120)
-                __builtin_memcpy(&counter, entry + 116, 4);
+            if (messageBytes >= 96)
+                __builtin_memcpy(&counter, entry + 92, 4);
             dispVblankResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
                 paramsBytes == 16;
@@ -8268,12 +9862,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispRoutingReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 routeMap = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 124)
-                __builtin_memcpy(&routeMap, entry + 120, 4);
+            if (messageBytes >= 100)
+                __builtin_memcpy(&routeMap, entry + 96, 4);
             dispRoutingResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
                 paramsBytes == 20;
@@ -8289,13 +9883,13 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispViewportReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 pointX = 0, pointY = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 120) {
-                __builtin_memcpy(&pointX, entry + 112, 4);
-                __builtin_memcpy(&pointY, entry + 116, 4);
+            if (messageBytes >= 96) {
+                __builtin_memcpy(&pointX, entry + 88, 4);
+                __builtin_memcpy(&pointY, entry + 92, 4);
             }
             dispViewportResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
@@ -8313,13 +9907,13 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispDfpReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 dfpFlags = 0, uhbr = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 120) {
-                __builtin_memcpy(&dfpFlags, entry + 112, 4);
-                __builtin_memcpy(&uhbr, entry + 116, 4);
+            if (messageBytes >= 96) {
+                __builtin_memcpy(&dfpFlags, entry + 88, 4);
+                __builtin_memcpy(&uhbr, entry + 92, 4);
             }
             dispDfpResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
@@ -8341,22 +9935,22 @@ IOReturn NVGspControl::pollStatusLocked() {
             UInt32 edidSize = 0;
             UInt64 edidHash = 1469598103934665603ULL;
             UInt64 edidW[4]{};
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 120)
-                __builtin_memcpy(&edidSize, entry + 112, 4);
+            if (messageBytes >= 96)
+                __builtin_memcpy(&edidSize, entry + 88, 4);
             if (edidSize > 0 && edidSize <= 2048 &&
-                messageBytes >= 120 + edidSize) {
+                messageBytes >= 96 + edidSize) {
                 for (UInt32 off = 0; off < edidSize; ++off) {
                     UInt8 byte = 0;
                     const UInt32 slot =
-                        (readPtr + (120 + off) / 4096) % header.msgCount;
+                        (readPtr + (96 + off) / 4096) % header.msgCount;
                     const UInt8 *part = init_.statusEntry(slot);
                     if (part)
                         __builtin_memcpy(
-                            &byte, part + ((120 + off) % 4096), 1);
+                            &byte, part + ((96 + off) % 4096), 1);
                     edidHash ^= byte;
                     edidHash *= 1099511628211ULL;
                 }
@@ -8368,12 +9962,12 @@ IOReturn NVGspControl::pollStatusLocked() {
                         UInt8 byte = 0;
                         const UInt32 off = w * 8 + b;
                         const UInt32 slot =
-                            (readPtr + (120 + off) / 4096) %
+                            (readPtr + (96 + off) / 4096) %
                             header.msgCount;
                         const UInt8 *part = init_.statusEntry(slot);
                         if (part)
                             __builtin_memcpy(
-                                &byte, part + ((120 + off) % 4096), 1);
+                                &byte, part + ((96 + off) % 4096), 1);
                         word |= static_cast<UInt64>(byte) << (b * 8);
                     }
                     edidW[w] = word;
@@ -8401,14 +9995,14 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispPclkReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 pclk = 0, orPclk = 0, vbPclk = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 124) {
-                __builtin_memcpy(&pclk, entry + 112, 4);
-                __builtin_memcpy(&orPclk, entry + 116, 4);
-                __builtin_memcpy(&vbPclk, entry + 120, 4);
+            if (messageBytes >= 100) {
+                __builtin_memcpy(&pclk, entry + 88, 4);
+                __builtin_memcpy(&orPclk, entry + 92, 4);
+                __builtin_memcpy(&vbPclk, entry + 96, 4);
             }
             dispPclkResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
@@ -8430,18 +10024,18 @@ IOReturn NVGspControl::pollStatusLocked() {
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 orType = 0, orProto = 0, dcbIndex = 0;
             UInt8 litByVbios = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 120) {
-                __builtin_memcpy(&orType, entry + 116, 4);
-                __builtin_memcpy(&orProto, entry + 120, 4);
+            if (messageBytes >= 96) {
+                __builtin_memcpy(&orType, entry + 92, 4);
+                __builtin_memcpy(&orProto, entry + 96, 4);
             }
-            if (messageBytes >= 144)
-                __builtin_memcpy(&dcbIndex, entry + 140, 4);
-            if (messageBytes >= 156)
-                __builtin_memcpy(&litByVbios, entry + 152, 1);
+            if (messageBytes >= 120)
+                __builtin_memcpy(&dcbIndex, entry + 116, 4);
+            if (messageBytes >= 132)
+                __builtin_memcpy(&litByVbios, entry + 128, 1);
             dispOrResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
                 paramsBytes == 52;
@@ -8462,12 +10056,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispCapsReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt16 caps = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 106)
-                __builtin_memcpy(&caps, entry + 104, 2);
+            if (messageBytes >= 82)
+                __builtin_memcpy(&caps, entry + 80, 2);
             dispCapsResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
                 paramsBytes == 2;
@@ -8482,12 +10076,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispVbEnReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt8 enabled = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 113)
-                __builtin_memcpy(&enabled, entry + 112, 1);
+            if (messageBytes >= 89)
+                __builtin_memcpy(&enabled, entry + 88, 1);
             dispVbEnResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
                 paramsBytes == 12;
@@ -8502,12 +10096,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispImpReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt8 possible = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 2009)
-                __builtin_memcpy(&possible, entry + 2008, 1);
+            if (messageBytes >= 1985)
+                __builtin_memcpy(&possible, entry + 1984, 1);
             dispImpResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
                 paramsBytes == 2048;
@@ -8522,12 +10116,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispModeReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt8 possible = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 2009)
-                __builtin_memcpy(&possible, entry + 2008, 1);
+            if (messageBytes >= 1985)
+                __builtin_memcpy(&possible, entry + 1984, 1);
             dispModeResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
                 paramsBytes == 2048;
@@ -8544,18 +10138,18 @@ IOReturn NVGspControl::pollStatusLocked() {
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 connFlags = 0, connCount = 0;
             UInt32 connIndex = 0, connType = 0, connLoc = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 124) {
-                __builtin_memcpy(&connFlags, entry + 112, 4);
-                __builtin_memcpy(&connCount, entry + 120, 4);
+            if (messageBytes >= 100) {
+                __builtin_memcpy(&connFlags, entry + 88, 4);
+                __builtin_memcpy(&connCount, entry + 96, 4);
             }
-            if (messageBytes >= 136) {
-                __builtin_memcpy(&connIndex, entry + 124, 4);
-                __builtin_memcpy(&connType, entry + 128, 4);
-                __builtin_memcpy(&connLoc, entry + 132, 4);
+            if (messageBytes >= 112) {
+                __builtin_memcpy(&connIndex, entry + 100, 4);
+                __builtin_memcpy(&connType, entry + 104, 4);
+                __builtin_memcpy(&connLoc, entry + 108, 4);
             }
             dispConnResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
@@ -8580,17 +10174,17 @@ IOReturn NVGspControl::pollStatusLocked() {
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 arch = 0, impl = 0, rev = 0;
             UInt8 subRev = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 116) {
-                __builtin_memcpy(&arch, entry + 104, 4);
-                __builtin_memcpy(&impl, entry + 108, 4);
-                __builtin_memcpy(&rev, entry + 112, 4);
+            if (messageBytes >= 92) {
+                __builtin_memcpy(&arch, entry + 80, 4);
+                __builtin_memcpy(&impl, entry + 84, 4);
+                __builtin_memcpy(&rev, entry + 88, 4);
             }
-            if (messageBytes >= 117)
-                __builtin_memcpy(&subRev, entry + 116, 1);
+            if (messageBytes >= 93)
+                __builtin_memcpy(&subRev, entry + 92, 1);
             dispArchResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
                 paramsBytes == 13;
@@ -8611,11 +10205,11 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispNameReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt64 nameW[4]{};
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 140) {
+            if (messageBytes >= 116) {
                 for (UInt32 w = 0; w < 4; ++w) {
                     UInt64 word = 0;
                     for (UInt32 b = 0; b < 8; ++b) {
@@ -8649,13 +10243,13 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispFifoReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 fifoCount = 0, fifoInUse = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 112) {
-                __builtin_memcpy(&fifoCount, entry + 104, 4);
-                __builtin_memcpy(&fifoInUse, entry + 108, 4);
+            if (messageBytes >= 88) {
+                __builtin_memcpy(&fifoCount, entry + 80, 4);
+                __builtin_memcpy(&fifoInUse, entry + 84, 4);
             }
             dispFifoResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
@@ -8677,11 +10271,11 @@ IOReturn NVGspControl::pollStatusLocked() {
             UInt32 popCount = 0, word0 = 0, word1 = 0;
             UInt32 words[8]{};
             UInt64 maskHash = 1469598103934665603ULL;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 108 + 512) {
+            if (messageBytes >= 84 + 512) {
                 for (UInt32 w = 0; w < 128; ++w) {
                     UInt32 word = 0;
                     const UInt32 off = w * 4;
@@ -8740,9 +10334,9 @@ IOReturn NVGspControl::pollStatusLocked() {
         if (rpc.function == 76 && postInitPhase_ == 102) {
             dispGrBindReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
             dispGrBindResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
@@ -8761,11 +10355,11 @@ IOReturn NVGspControl::pollStatusLocked() {
             UInt32 popCount = 0, word0 = 0, word1 = 0;
             UInt32 words[8]{};
             UInt64 maskHash = 1469598103934665603ULL;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 108 + 512) {
+            if (messageBytes >= 84 + 512) {
                 for (UInt32 w = 0; w < 128; ++w) {
                     UInt32 word = 0;
                     const UInt32 off = w * 4;
@@ -8829,11 +10423,11 @@ IOReturn NVGspControl::pollStatusLocked() {
             UInt32 popCount = 0, word0 = 0, word1 = 0;
             UInt32 words[8]{};
             UInt64 maskHash = 1469598103934665603ULL;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 108 + 512) {
+            if (messageBytes >= 84 + 512) {
                 for (UInt32 w = 0; w < 128; ++w) {
                     UInt32 word = 0;
                     const UInt32 off = w * 4;
@@ -8922,9 +10516,9 @@ IOReturn NVGspControl::pollStatusLocked() {
         if (rpc.function == 76 && postInitPhase_ == 107) {
             dispSchedReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
             dispSchedResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
@@ -8942,11 +10536,11 @@ IOReturn NVGspControl::pollStatusLocked() {
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 popCount = 0, word0 = 0, word1 = 0;
             UInt64 maskHash = 1469598103934665603ULL;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 108 + 512) {
+            if (messageBytes >= 84 + 512) {
                 for (UInt32 w = 0; w < 128; ++w) {
                     UInt32 word = 0;
                     const UInt32 off = w * 4;
@@ -8993,11 +10587,11 @@ IOReturn NVGspControl::pollStatusLocked() {
             UInt32 popCount = 0, word0 = 0, word1 = 0;
             UInt32 words[8]{};
             UInt64 maskHash = 1469598103934665603ULL;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 108 + 512) {
+            if (messageBytes >= 84 + 512) {
                 for (UInt32 w = 0; w < 128; ++w) {
                     UInt32 word = 0;
                     const UInt32 off = w * 4;
@@ -9081,23 +10675,23 @@ IOReturn NVGspControl::pollStatusLocked() {
             UInt64 entryName[12]{};
             UInt32 entryPbdma[12]{};
             UInt32 entryCount[12]{};
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 116) {
-                __builtin_memcpy(&numEntries, entry + 108, 4);
-                __builtin_memcpy(&more, entry + 112, 1);
+            if (messageBytes >= 92) {
+                __builtin_memcpy(&numEntries, entry + 84, 4);
+                __builtin_memcpy(&more, entry + 88, 1);
             }
-            if (messageBytes >= 220) {
-                __builtin_memcpy(&pbdmaId0, entry + 184, 4);
-                __builtin_memcpy(&pbdmaId1, entry + 188, 4);
-                __builtin_memcpy(&numPbdmas, entry + 196, 4);
+            if (messageBytes >= 196) {
+                __builtin_memcpy(&pbdmaId0, entry + 160, 4);
+                __builtin_memcpy(&pbdmaId1, entry + 164, 4);
+                __builtin_memcpy(&numPbdmas, entry + 172, 4);
                 for (UInt32 b = 0; b < 8; ++b) {
                     UInt8 byte = 0;
-                    __builtin_memcpy(&byte, entry + 200 + b, 1);
+                    __builtin_memcpy(&byte, entry + 176 + b, 1);
                     nameW0 |= static_cast<UInt64>(byte) << (b * 8);
-                    __builtin_memcpy(&byte, entry + 208 + b, 1);
+                    __builtin_memcpy(&byte, entry + 184 + b, 1);
                     nameW1 |= static_cast<UInt64>(byte) << (b * 8);
                 }
             }
@@ -9167,12 +10761,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispFifoCapsReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt16 caps = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 106)
-                __builtin_memcpy(&caps, entry + 104, 2);
+            if (messageBytes >= 82)
+                __builtin_memcpy(&caps, entry + 80, 2);
             dispFifoCapsResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
                 paramsBytes == 2;
@@ -9188,13 +10782,13 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispCtxPropReturned = true;
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 align = 0, ctxSize = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 116) {
-                __builtin_memcpy(&align, entry + 108, 4);
-                __builtin_memcpy(&ctxSize, entry + 112, 4);
+            if (messageBytes >= 92) {
+                __builtin_memcpy(&align, entry + 84, 4);
+                __builtin_memcpy(&ctxSize, entry + 88, 4);
             }
             dispCtxPropResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
@@ -9213,14 +10807,14 @@ IOReturn NVGspControl::pollStatusLocked() {
             UInt32 controlStatus = ~0U, paramsBytes = 0;
             UInt32 tpcMode = 0;
             UInt8 tpcEnable = 0;
-            if (messageBytes >= 104) {
-                __builtin_memcpy(&controlStatus, entry + 92, 4);
-                __builtin_memcpy(&paramsBytes, entry + 96, 4);
+            if (messageBytes >= 80) {
+                __builtin_memcpy(&controlStatus, entry + 68, 4);
+                __builtin_memcpy(&paramsBytes, entry + 72, 4);
             }
-            if (messageBytes >= 112)
-                __builtin_memcpy(&tpcMode, entry + 108, 4);
-            if (messageBytes >= 113)
-                __builtin_memcpy(&tpcEnable, entry + 112, 1);
+            if (messageBytes >= 88)
+                __builtin_memcpy(&tpcMode, entry + 84, 4);
+            if (messageBytes >= 89)
+                __builtin_memcpy(&tpcEnable, entry + 88, 1);
             dispTpcResponse = rpc.result == 0 &&
                 rpc.privateResult == 0 && controlStatus == 0 &&
                 paramsBytes == 32;
@@ -9236,12 +10830,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispInstMemReturned = true;
             UInt32 st = ~0U, pb = 0;
             UInt64 off = 0;
-            if (messageBytes >= 112) {
-                __builtin_memcpy(&st, entry + 96, 4);
-                __builtin_memcpy(&pb, entry + 100, 4);
+            if (messageBytes >= 88) {
+                __builtin_memcpy(&st, entry + 72, 4);
+                __builtin_memcpy(&pb, entry + 76, 4);
             }
-            if (pb == 128 && messageBytes >= 112 + 128)
-                __builtin_memcpy(&off, entry + 112 + 80, 8);
+            if (pb == 128 && messageBytes >= 88 + 128)
+                __builtin_memcpy(&off, entry + 88 + 80, 8);
             dispInstMemResponse = rpc.result == 0 && st == 0 && off &&
                 (off & 0xffff) == 0;
             if (dispInstMemResponse) dispInstOffset_ = off;
@@ -9251,7 +10845,7 @@ IOReturn NVGspControl::pollStatusLocked() {
         if (rpc.function == 76 && postInitPhase_ == 201) {
             dispInstWriteReturned = true;
             UInt32 cs = ~0U;
-            if (messageBytes >= 96) __builtin_memcpy(&cs, entry + 92, 4);
+            if (messageBytes >= 72) __builtin_memcpy(&cs, entry + 68, 4);
             dispInstWriteResponse = rpc.result == 0 && cs == 0;
             setProperty("NVGspControl-dispinst-write-rpc", rpc.result, 32);
             setProperty("NVGspControl-dispinst-write-status", cs, 32);
@@ -9262,14 +10856,14 @@ IOReturn NVGspControl::pollStatusLocked() {
             dispHealthReturned = true;
             UInt32 st = ~0U, v = 0;
             if (rpc.function == 103) {
-                if (messageBytes >= 100) __builtin_memcpy(&st, entry + 96, 4);
+                if (messageBytes >= 76) __builtin_memcpy(&st, entry + 72, 4);
                 setProperty("NVGspControl-dh-common-status", st, 32);
             } else {
-                if (messageBytes >= 96) __builtin_memcpy(&st, entry + 92, 4);
-                if (postInitPhase_ == 204 && messageBytes >= 120)
-                    __builtin_memcpy(&v, entry + 116, 4);
-                if (postInitPhase_ != 204 && messageBytes >= 116)
-                    __builtin_memcpy(&v, entry + 112, 4);
+                if (messageBytes >= 72) __builtin_memcpy(&st, entry + 68, 4);
+                if (postInitPhase_ == 204 && messageBytes >= 96)
+                    __builtin_memcpy(&v, entry + 92, 4);
+                if (postInitPhase_ != 204 && messageBytes >= 92)
+                    __builtin_memcpy(&v, entry + 88, 4);
                 setProperty(postInitPhase_ == 204 ? "NVGspControl-dh-active-display-id"
                             : postInitPhase_ == 205 ? "NVGspControl-dh-scanline-a"
                             : "NVGspControl-dh-scanline-b", v, 32);
@@ -9282,12 +10876,12 @@ IOReturn NVGspControl::pollStatusLocked() {
              postInitPhase_ <= 215)) {
             ceReturned = true;
             UInt32 st = ~0U;
-            if (rpc.function == 103 && messageBytes >= 100)
-                __builtin_memcpy(&st, entry + 96, 4);
-            if (rpc.function == 76 && messageBytes >= 96)
-                __builtin_memcpy(&st, entry + 92, 4);
-            if (postInitPhase_ == 215 && messageBytes >= 108)
-                __builtin_memcpy(&ceTokenReply, entry + 104, 4);
+            if (rpc.function == 103 && messageBytes >= 76)
+                __builtin_memcpy(&st, entry + 72, 4);
+            if (rpc.function == 76 && messageBytes >= 72)
+                __builtin_memcpy(&st, entry + 68, 4);
+            if (postInitPhase_ == 215 && messageBytes >= 84)
+                __builtin_memcpy(&ceTokenReply, entry + 80, 4);
             ceOk = rpc.result == 0 && st == 0;
             char key[48]{};
             size_t pos = 0;
@@ -9301,12 +10895,12 @@ IOReturn NVGspControl::pollStatusLocked() {
             ceUserdReturned = true;
             UInt32 st = ~0U, pb = 0;
             UInt64 off = 0;
-            if (messageBytes >= 112) {
-                __builtin_memcpy(&st, entry + 96, 4);
-                __builtin_memcpy(&pb, entry + 100, 4);
+            if (messageBytes >= 88) {
+                __builtin_memcpy(&st, entry + 72, 4);
+                __builtin_memcpy(&pb, entry + 76, 4);
             }
-            if (pb == 128 && messageBytes >= 240)
-                __builtin_memcpy(&off, entry + 112 + 80, 8);
+            if (pb == 128 && messageBytes >= 216)
+                __builtin_memcpy(&off, entry + 88 + 80, 8);
             const bool okAlloc = rpc.result == 0 && st == 0 && off;
             if (okAlloc && postInitPhase_ == 218) ceUserdOffset_ = off;
             if (okAlloc && postInitPhase_ == 219) ceInstOffset_ = off;
@@ -9324,19 +10918,19 @@ IOReturn NVGspControl::pollStatusLocked() {
         if (rpc.function == 76 && postInitPhase_ == 224) {
             perfReturned = true;
             UInt32 st = ~0U, done = 0, reply = ~0U;
-            if (messageBytes >= 104 + 48) {
-                __builtin_memcpy(&st, entry + 92, 4);
-                __builtin_memcpy(&done, entry + 140, 4);
-                __builtin_memcpy(&reply, entry + 144, 4);
+            if (messageBytes >= 80 + 48) {
+                __builtin_memcpy(&st, entry + 68, 4);
+                __builtin_memcpy(&done, entry + 116, 4);
+                __builtin_memcpy(&reply, entry + 120, 4);
             }
             auxLastStatus_ = st;
             auxLastReply_ = reply;
             auxOk_ = rpc.result == 0 && st == 0 && reply == 0;
             if (auxOk_ && done > 16) done = 16;
             if (auxOk_ && auxStep_ <= 2)
-                __builtin_memcpy(dpcd_ + auxStep_ * 16, entry + 124, done);
+                __builtin_memcpy(dpcd_ + auxStep_ * 16, entry + 100, done);
             if (auxOk_ && auxStep_ >= 4 && auxStep_ < 20) {
-                __builtin_memcpy(edid_ + (auxStep_ - 4) * 16, entry + 124, done);
+                __builtin_memcpy(edid_ + (auxStep_ - 4) * 16, entry + 100, done);
                 edidBytes_ = (auxStep_ - 4) * 16 + done;
             }
         }
@@ -9346,25 +10940,25 @@ IOReturn NVGspControl::pollStatusLocked() {
         if (rpc.function == 76 && postInitPhase_ == 223) {
             perfReturned = true;
             UInt32 st = ~0U, pb = 0, len = 0;
-            if (messageBytes >= 108) {
-                __builtin_memcpy(&st, entry + 92, 4);
-                __builtin_memcpy(&pb, entry + 96, 4);
-                __builtin_memcpy(&len, entry + 104, 4);
+            if (messageBytes >= 84) {
+                __builtin_memcpy(&st, entry + 68, 4);
+                __builtin_memcpy(&pb, entry + 72, 4);
+                __builtin_memcpy(&len, entry + 80, 4);
             }
             setProperty("NVGspControl-intr-table-rpc", rpc.result, 32);
             setProperty("NVGspControl-intr-table-status", st, 32);
             setProperty("NVGspControl-intr-table-params-bytes", pb, 32);
             setProperty("NVGspControl-intr-table-len", len, 32);
             if (rpc.result == 0 && st == 0 && pb == 2068 && len <= 128 &&
-                messageBytes >= 104 + 2068) {
-                setProperty("NVGspControl-intr-table", const_cast<UInt8 *>(entry + 108), len * 16);
-                setProperty("NVGspControl-intr-subtrees", const_cast<UInt8 *>(entry + 2156), 14);
+                messageBytes >= 80 + 2068) {
+                setProperty("NVGspControl-intr-table", const_cast<UInt8 *>(entry + 84), len * 16);
+                setProperty("NVGspControl-intr-subtrees", const_cast<UInt8 *>(entry + 2132), 14);
                 for (UInt32 i = 0; i < len; ++i) {
                     UInt16 eng = 0;
                     UInt32 stall = 0, nonStall = 0;
-                    __builtin_memcpy(&eng, entry + 108 + i * 16, 2);
-                    __builtin_memcpy(&stall, entry + 116 + i * 16, 4);
-                    __builtin_memcpy(&nonStall, entry + 120 + i * 16, 4);
+                    __builtin_memcpy(&eng, entry + 84 + i * 16, 2);
+                    __builtin_memcpy(&stall, entry + 92 + i * 16, 4);
+                    __builtin_memcpy(&nonStall, entry + 96 + i * 16, 4);
                     const char *name = eng == 50 ? "gsp" : eng == 2 ? "disp"
                         : eng == 4 ? "fifo" : eng == 15 ? "ce0"
                         : eng == 61 ? "nonreplay-fault" : nullptr;
@@ -9409,7 +11003,9 @@ IOReturn NVGspControl::pollStatusLocked() {
                         pci_->configRead16(kIOPCIConfigCommand), 16);
             // 0.70.0: arm the MSI path. 0.74.0: GSP stall (50), DISP stall
             // (2), GR non-stall (84) vectors from the table.
-            if ((experimentFlags_ & 8) && rpc.result == 0 && st == 0 &&
+            // 0.180.5: MSI arm is required for real display vblank pacing,
+            // not an experiment. Keep the same validated RPC/table gates.
+            if (rpc.result == 0 && st == 0 &&
                 pb == 2068 && len <= 128 && messageBytes >= 104 + 2068) {
                 UInt32 vecs[kVecCount] = {~0U, ~0U, ~0U, ~0U};
                 for (UInt32 i = 0; i < len; ++i) {
@@ -9971,7 +11567,7 @@ IOReturn NVGspControl::pollStatusLocked() {
         }
     }
 
-    if (initDone_ && initResult_ == 0 && !badReason) {
+    if ((gmcInitReady_ || (initDone_ && initResult_ == 0)) && !badReason) {
         // 0.7.0-0.8.1: unproven controls (CE size 49, BIND 52, SCHEDULE 53,
         // TSG BIND 54, TSG SCHEDULE 55, TSG GET_INFO 56, TSG TIMESLICE 57,
         // FIFO intel 58-61, token 62, flush 63, display allocs 64-67) must
@@ -10321,13 +11917,17 @@ IOReturn NVGspControl::pollStatusLocked() {
             // 0.57.0: with our window owning the screen the whole client
             // (display + GR channel, golden ctx, mappings) stays alive for
             // submitGr; GPFIFO PTE stays installed.
-            if (wndOwnsScreen_ && ceMapped_ && !ceStarted_) {
+            // 0.178.33: a reset-driven boot does not own the window, but clients
+            // still submit CE copies; bring the persistent CE channel up for
+            // the reset generation too (it only needs the mapped chunk/ctx).
+            if ((wndOwnsScreen_ || resetDriven_) && ceMapped_ && !ceStarted_) {
                 // 0.65.0: CE bring-up starts with an RPC USERD object (the
                 // GR channel got hUserdMemory 0xc0d00043; hUserdMemory 0
                 // made the CE channel alloc fail NO_MEMORY in 0.63/0.64).
                 ceStarted_ = true;
-                grPersistent_ = gr3dOk_ && ctxHugeInstalled_ != 0;
+                grPersistent_ = gr3dOk_ && ctxHugeInstalled_ != 0 && ctxBackingOffset_ != 0;
                 setProperty("NVGspControl-gr-persistent", grPersistent_);
+                setProperty("NVGspControl-gr-live", grPersistent_ && grSelfTestOk_);
                 syncRingSeqLocked(true, false);          // 0.164.0
                 publishSemVa();                          // 0.128.0
                 constexpr UInt32 kClientHandle = 0xc0d00001;
@@ -10353,9 +11953,10 @@ IOReturn NVGspControl::pollStatusLocked() {
                 }
             }
             if (wndOwnsScreen_) {
-                grPersistent_ = gr3dOk_ && ctxHugeInstalled_ != 0;
+                grPersistent_ = gr3dOk_ && ctxHugeInstalled_ != 0 && ctxBackingOffset_ != 0;
                 setProperty("NVGspControl-persistent-client", true);
                 setProperty("NVGspControl-gr-persistent", grPersistent_);
+                setProperty("NVGspControl-gr-live", grPersistent_ && grSelfTestOk_);
                 syncRingSeqLocked(true, false);          // 0.164.0
                 publishSemVa();                          // 0.128.0
                 postInitPhase_ = 33;
@@ -10493,28 +12094,17 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-internal-device", internalDevice_, 32);
             setProperty("NVGspControl-internal-subdevice", internalSubdevice_, 32);
         } else if (postInitPhase_ == 4) {
-            constexpr UInt32 kParamsBytes = 4 + 512 * 48;
-            UInt8 *control = static_cast<UInt8 *>(IOMalloc(24 + kParamsBytes));
-            if (!control) {
-                badReason = 11;
-            } else {
-                bzero(control, 24 + kParamsBytes);
-                const UInt32 command = 0x20800a40;
-                // This internal 0x20800a40 control is not present in the
-                // 570.144 FINN serializer table. NVIDIA's
-                // serverSerializeCtrlDown() therefore leaves the native
-                // v28.04 parameter block unchanged and sends flags=0.
-                const UInt32 serialized = 0;
-                __builtin_memcpy(control, &internalClient_, 4);
-                __builtin_memcpy(control + 4, &internalSubdevice_, 4);
-                __builtin_memcpy(control + 8, &command, 4);
-                __builtin_memcpy(control + 16, &kParamsBytes, 4);
-                __builtin_memcpy(control + 20, &serialized, 4);
-                if (init_.enqueueRpc(76, control, 24 + kParamsBytes))
-                    postInitPhase_ = 5;
-                else
-                    badReason = 12;
-                IOFree(control, 24 + kParamsBytes);
+            constexpr UInt32 kParamsBytes = nvgsp::kDeviceInfo615Bytes;
+            constexpr UInt32 kControlBytes = nvgsp::kControl615HeaderBytes + kParamsBytes;
+            UInt8 *control = static_cast<UInt8 *>(IOMalloc(kControlBytes));
+            if (!control) badReason = 11;
+            else {
+                bzero(control, kControlBytes);
+                if (nvgsp::buildControl615(control, kControlBytes, internalClient_,
+                    internalSubdevice_, 0x20800a40, kParamsBytes) &&
+                    init_.enqueueRpc(76, control, kControlBytes)) postInitPhase_ = 5;
+                else badReason = 12;
+                IOFree(control, kControlBytes);
             }
         } else if (deviceInfoResponse) {
             UInt32 entries = 0;
@@ -10524,21 +12114,15 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-device-info-status", deviceInfoStatus, 32);
             postInitPhase_ = 6;
         } else if (postInitPhase_ == 6) {
-            constexpr UInt32 kClassListBytes = sizeof(classList);
-            UInt8 control[24 + kClassListBytes]{};
-            const UInt32 command = 0x00800292;
-            __builtin_memcpy(control, &internalClient_, 4);
-            __builtin_memcpy(control + 4, &internalDevice_, 4);
-            __builtin_memcpy(control + 8, &command, 4);
-            __builtin_memcpy(control + 16, &kClassListBytes, 4);
-            if (init_.enqueueRpc(76, control, sizeof(control)))
-                postInitPhase_ = 7;
-            else
-                badReason = 13;
+            UInt8 control[nvgsp::kControl615HeaderBytes + nvgsp::kClassList615Bytes]{};
+            if (nvgsp::buildControl615(control, sizeof(control), internalClient_,
+                internalDevice_, 0x00800292, nvgsp::kClassList615Bytes) &&
+                init_.enqueueRpc(76, control, sizeof(control))) postInitPhase_ = 7;
+            else badReason = 13;
         } else if (classListResponse) {
             UInt32 count = 0;
             __builtin_memcpy(&count, classList, 4);
-            if (count <= 100) {
+            if (count && count <= nvgsp::kClassList615Capacity) {
                 setProperty("NVGspControl-class-list", classList + 4,
                             count * sizeof(UInt32));
                 setProperty("NVGspControl-class-list-count", count, 32);
@@ -10547,21 +12131,11 @@ IOReturn NVGspControl::pollStatusLocked() {
                 badReason = 14;
             }
         } else if (postInitPhase_ == 8) {
-            constexpr UInt32 kClientHandle = 0xc0d00001;
-            constexpr UInt32 kRootClientClass = 0x41;
-            constexpr UInt32 kRootParamsBytes = 120;
-            UInt8 alloc[32 + kRootParamsBytes]{};
-            __builtin_memcpy(alloc, &kClientHandle, 4);       // hClient
-            __builtin_memcpy(alloc + 8, &kClientHandle, 4);  // hObject
-            __builtin_memcpy(alloc + 12, &kRootClientClass, 4);
-            __builtin_memcpy(alloc + 20, &kRootParamsBytes, 4);
-            __builtin_memcpy(alloc + 32, &kClientHandle, 4);
-            strlcpy(reinterpret_cast<char *>(alloc + 40),
-                    "NVGspControl", 100);
-            if (init_.enqueueRpc(103, alloc, sizeof(alloc)))
-                postInitPhase_ = 9;
-            else
-                badReason = 15;
+            setProperty("NVGspControl-runtime-controls-validated", true);
+            UInt8 alloc[sizeof(nvgsp::AllocHeader615) + sizeof(nvgsp::RootParams615)]{};
+            if (nvgsp::buildRootClient615(alloc, sizeof(alloc)) &&
+                init_.enqueueRpc(103, alloc, sizeof(alloc))) postInitPhase_ = 9;
+            else badReason = 15;
         } else if (clientAllocResponse) {
             constexpr UInt32 kClientHandle = 0xc0d00001;
             UInt8 freeParams[16]{};
@@ -10574,32 +12148,21 @@ IOReturn NVGspControl::pollStatusLocked() {
         } else if (clientFreeResponse) {
             postInitPhase_ = 12;
         } else if (postInitPhase_ == 12) {
-            UInt8 control[28]{};
-            constexpr UInt32 command = 0x00000204;
-            constexpr UInt32 paramsBytes = sizeof(deviceIds);
-            __builtin_memcpy(control, &internalClient_, 4);
-            __builtin_memcpy(control + 4, &internalClient_, 4);
-            __builtin_memcpy(control + 8, &command, 4);
-            __builtin_memcpy(control + 16, &paramsBytes, 4);
-            if (init_.enqueueRpc(76, control, sizeof(control)))
-                postInitPhase_ = 13;
-            else
-                badReason = 17;
+            setProperty("NVGspControl-runtime-client-lifecycle-validated", true);
+            UInt8 control[nvgsp::kControl615HeaderBytes + sizeof(deviceIds)]{};
+            if (nvgsp::buildControl615(control, sizeof(control), internalClient_,
+                internalClient_, 0x204, sizeof(deviceIds)) &&
+                init_.enqueueRpc(76, control, sizeof(control))) postInitPhase_ = 13;
+            else badReason = 17;
         } else if (deviceIdsResponse) {
             setProperty("NVGspControl-device-ids", deviceIds, 32);
             postInitPhase_ = 14;
         } else if (postInitPhase_ == 14) {
-            UInt8 control[24 + sizeof(attachedIds)]{};
-            constexpr UInt32 command = 0x00000201;
-            constexpr UInt32 paramsBytes = sizeof(attachedIds);
-            __builtin_memcpy(control, &internalClient_, 4);
-            __builtin_memcpy(control + 4, &internalClient_, 4);
-            __builtin_memcpy(control + 8, &command, 4);
-            __builtin_memcpy(control + 16, &paramsBytes, 4);
-            if (init_.enqueueRpc(76, control, sizeof(control)))
-                postInitPhase_ = 15;
-            else
-                badReason = 18;
+            UInt8 control[nvgsp::kControl615HeaderBytes + sizeof(attachedIds)]{};
+            if (nvgsp::buildControl615(control, sizeof(control), internalClient_,
+                internalClient_, 0x201, sizeof(attachedIds)) &&
+                init_.enqueueRpc(76, control, sizeof(control))) postInitPhase_ = 15;
+            else badReason = 18;
         } else if (attachedIdsResponse) {
             UInt32 count = 0;
             while (count < 32 && attachedIds[count] != ~0U) ++count;
@@ -10608,71 +12171,37 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-attached-gpu-count", count, 32);
             postInitPhase_ = 16;
         } else if (postInitPhase_ == 16) {
-            constexpr UInt32 kClientHandle = 0xc0d00001;
-            constexpr UInt32 kRootClientClass = 0x41;
-            constexpr UInt32 kRootParamsBytes = 120;
-            UInt8 alloc[32 + kRootParamsBytes]{};
-            __builtin_memcpy(alloc, &kClientHandle, 4);
-            __builtin_memcpy(alloc + 8, &kClientHandle, 4);
-            __builtin_memcpy(alloc + 12, &kRootClientClass, 4);
-            __builtin_memcpy(alloc + 20, &kRootParamsBytes, 4);
-            __builtin_memcpy(alloc + 32, &kClientHandle, 4);
-            strlcpy(reinterpret_cast<char *>(alloc + 40),
-                    "NVGspControl", 100);
-            if (init_.enqueueRpc(103, alloc, sizeof(alloc)))
-                postInitPhase_ = 17;
-            else
-                badReason = 19;
+            UInt8 alloc[sizeof(nvgsp::AllocHeader615) + sizeof(nvgsp::RootParams615)]{};
+            if (nvgsp::buildRootClient615(alloc, sizeof(alloc)) &&
+                init_.enqueueRpc(103, alloc, sizeof(alloc))) postInitPhase_ = 17;
+            else badReason = 19;
         } else if (ownedClientResponse) {
-            constexpr UInt32 kClientHandle = 0xc0d00001;
-            constexpr UInt32 kDeviceHandle = 0xc0d00080;
-            constexpr UInt32 kDeviceClass = 0x80;
-            constexpr UInt32 kDeviceParamsBytes = 56;
-            UInt8 alloc[32 + kDeviceParamsBytes]{};
-            __builtin_memcpy(alloc, &kClientHandle, 4);
-            __builtin_memcpy(alloc + 4, &kClientHandle, 4);
-            __builtin_memcpy(alloc + 8, &kDeviceHandle, 4);
-            __builtin_memcpy(alloc + 12, &kDeviceClass, 4);
-            __builtin_memcpy(alloc + 20, &kDeviceParamsBytes, 4);
-            // deviceId=0 selects bit 0 from the validated device mask.
-            if (init_.enqueueRpc(103, alloc, sizeof(alloc)))
-                postInitPhase_ = 19;
-            else
-                badReason = 20;
+            UInt8 alloc[sizeof(nvgsp::AllocHeader615) + sizeof(nvgsp::DeviceParams615)]{};
+            auto *mask = OSDynamicCast(OSNumber, getProperty("NVGspControl-device-ids"));
+            if (mask && nvgsp::buildDevice615(alloc, sizeof(alloc), mask->unsigned32BitValue()) &&
+                init_.enqueueRpc(103, alloc, sizeof(alloc))) postInitPhase_ = 19;
+            else badReason = 20;
         } else if (deviceAllocResponse) {
-            constexpr UInt32 kClientHandle = 0xc0d00001;
-            constexpr UInt32 kDeviceHandle = 0xc0d00080;
-            constexpr UInt32 kSubdeviceHandle = 0xc0d02080;
-            constexpr UInt32 kSubdeviceClass = 0x2080;
-            constexpr UInt32 kSubdeviceParamsBytes = 4;
-            UInt8 alloc[32 + kSubdeviceParamsBytes]{};
-            __builtin_memcpy(alloc, &kClientHandle, 4);
-            __builtin_memcpy(alloc + 4, &kDeviceHandle, 4);
-            __builtin_memcpy(alloc + 8, &kSubdeviceHandle, 4);
-            __builtin_memcpy(alloc + 12, &kSubdeviceClass, 4);
-            __builtin_memcpy(alloc + 20, &kSubdeviceParamsBytes, 4);
-            if (init_.enqueueRpc(103, alloc, sizeof(alloc)))
-                postInitPhase_ = 20;
-            else
-                badReason = 21;
+            const UInt32 subdeviceId = 0;
+            UInt8 alloc[sizeof(nvgsp::AllocHeader615) + sizeof(subdeviceId)]{};
+            if (nvgsp::buildAlloc615(alloc, sizeof(alloc), nvgsp::kLifecycleDevice615,
+                nvgsp::kLifecycleSubdevice615, 0x2080, &subdeviceId, sizeof(subdeviceId)) &&
+                init_.enqueueRpc(103, alloc, sizeof(alloc))) postInitPhase_ = 20;
+            else badReason = 21;
         } else if (subdeviceAllocResponse) {
-            constexpr UInt32 kClientHandle = 0xc0d00001;
-            constexpr UInt32 kDeviceHandle = 0xc0d00080;
-            constexpr UInt32 kVaspaceHandle = 0xc0d090f1;
-            constexpr UInt32 kVaspaceClass = 0x90f1;
-            constexpr UInt32 kVaspaceParamsBytes = 48;
-            UInt8 alloc[32 + kVaspaceParamsBytes]{};
-            __builtin_memcpy(alloc, &kClientHandle, 4);
-            __builtin_memcpy(alloc + 4, &kDeviceHandle, 4);
-            __builtin_memcpy(alloc + 8, &kVaspaceHandle, 4);
-            __builtin_memcpy(alloc + 12, &kVaspaceClass, 4);
-            __builtin_memcpy(alloc + 20, &kVaspaceParamsBytes, 4);
-            // index=GPU_NEW and all remaining fields zero ask RM to select
-            // its native VA range and big-page size for this AD103 device.
-            if (init_.enqueueRpc(103, alloc, sizeof(alloc)))
-                postInitPhase_ = 23;
-            else
-                badReason = 22;
+            nvgsp::VaspaceParams615 params{}; // indexGPU_NEW=0, flagsNONE
+            UInt8 alloc[sizeof(nvgsp::AllocHeader615) + sizeof(params)]{};
+            if (nvgsp::buildAlloc615(alloc, sizeof(alloc), nvgsp::kLifecycleDevice615,
+                nvgsp::kLifecycleVaspace615, 0x90f1, &params, sizeof(params)) &&
+                init_.enqueueRpc(103, alloc, sizeof(alloc))) postInitPhase_ = 23;
+            else badReason = 22;
+        } else if (vaspaceAllocResponse && gmcInitReady_) {
+            setProperty("NVGspControl-runtime-device-allocation-validated", true);
+            setProperty("NVGspControl-runtime-vaspace-allocation-validated", true);
+            UInt8 alloc[sizeof(nvgsp::AllocHeader615) + sizeof(nvgsp::MemoryParams615)]{};
+            if (nvgsp::buildMemoryProbe615(alloc, sizeof(alloc)) &&
+                init_.enqueueRpc(103, alloc, sizeof(alloc))) postInitPhase_ = 26;
+            else badReason = 23;
         } else if (vaspaceAllocResponse) {
             constexpr UInt32 kClientHandle = 0xc0d00001;
             constexpr UInt32 kSubdeviceHandle = 0xc0d02080;
@@ -10698,6 +12227,10 @@ IOReturn NVGspControl::pollStatusLocked() {
                 postInitPhase_ = 26;
             else
                 badReason = 23;
+        } else if (localMemoryAllocResponse && gmcInitReady_) {
+            setProperty("NVGspControl-runtime-memory-allocation-validated", true);
+            setProperty("NVGspControl-runtime-channel-setup-pending", true);
+            postInitPhase_ = 27;
         } else if (localMemoryAllocResponse) {
             // 0.5.9: identical backing flow to 0.5.8 (probe 0x41, GPFIFO 0x42
             // 4 KiB, USERD 0x43) plus the missing status-queue gate entries for
@@ -13394,6 +14927,8 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-i2m-polls", grPolls_, 32);
             setProperty("NVGspControl-i2m-sem-released", semDone);
             setProperty("NVGspControl-i2m-data-ok", dataOk);
+            grSelfTestOk_ = semDone && dataOk;
+            setProperty("NVGspControl-gr-self-test-ok", grSelfTestOk_);
             // 0.43.0: GPU draws on the GOP scanout surface. Gate: PRAMIN
             // hash of VRAM[0,4K) must equal the pre-GSP BAR1+0 GOP hash
             // (proves VRAM 0 is the intact scanout surface). Map VRAM
@@ -13892,10 +15427,25 @@ IOReturn NVGspControl::pollStatusLocked() {
             // brings the old pinned-max behaviour back.
             const bool pinMax = nvramU32("nvgsp-boost") == 1;
             nvramBoostPinned_ = pinMax;
-            control[24] = pinMax ? 2 : 0;  // BOOST_TO_MAX : CLEAR
-            const UInt32 duration = pinMax ? 0xffffffff : 0;
-            __builtin_memcpy(control + 28, &duration, 4);
-            setProperty("NVGspControl-perf-boost-pinned", pinMax);
+            // 0.180.11: nvgsp-boost-pin=1 pins BOOST_SET_3X indefinitely (duration 0xffffffff).
+            // nvgsp-boost=1 keeps the old BOOST_TO_MAX pinned behaviour. Both read once at
+            // init; boostPinned_ is consumed by boostCallout() on every submission.
+            const bool boostPin = nvramU32("nvgsp-boost-pin") == 1;
+            boostPinned_ = boostPin;
+            if (boostPinned_) {
+                // 0.9.21: UInt8 truncation here wrote 0x9b instead of the
+                // 0x20800a9b command word (clang -Wconstant-conversion).
+                constexpr UInt32 kBoostSet3X = 0x20800a9b;
+                __builtin_memcpy(control + 8, &kBoostSet3X, 4);
+                control[24] = 3;           // BOOST_SET_3X
+                const UInt32 duration = 0xffffffffu;  // indefinite pin
+                __builtin_memcpy(control + 28, &duration, 4);
+            } else {
+                control[24] = pinMax ? 2 : 0;  // BOOST_TO_MAX : CLEAR
+                const UInt32 duration = pinMax ? 0xffffffff : 0;
+                __builtin_memcpy(control + 28, &duration, 4);
+            }
+            setProperty("NVGspControl-perf-boost-pinned", pinMax || boostPinned_);
             if (init_.enqueueRpc(76, control, sizeof(control)))
                 postInitPhase_ = 221;
             else
@@ -14502,7 +16052,8 @@ IOReturn NVGspControl::pollStatusLocked() {
     setProperty("NVGspControl-status-init-result", initResult, 32);
     setProperty("NVGspControl-status-init-private-result", initPrivateResult, 32);
     setProperty("NVGspControl-post-init-phase", postInitPhase_, 32);
-    setProperty("NVGspControl-post-init-complete", postInitPhase_ >= 4);
+    setProperty("NVGspControl-diagnostic-rpc-enabled", gmcInitReady_ && postInitPhase_ == 27);
+    setProperty("NVGspControl-post-init-complete", postInitPhase_ == 33);
     setProperty("NVGspControl-engine-enumeration-complete", postInitPhase_ >= 6);
     setProperty("NVGspControl-class-list-complete", postInitPhase_ >= 8);
     setProperty("NVGspControl-client-lifecycle-complete", postInitPhase_ >= 12);
@@ -14563,20 +16114,21 @@ IOReturn NVGspControl::pollStatusLocked() {
     if (deviceInfo) IOFree(deviceInfo, deviceInfoBytes);
     IOFree(staticInfo, kStaticInfoBytes);
     IOFree(records, kMaxRecords * sizeof(nvgsp::GspStatusRecordSummary));
-    return initDone_ && initResult_ == 0 && !badReason
+    return (gmcInitReady_ || (initDone_ && initResult_ == 0)) && !badReason
         ? kIOReturnSuccess : kIOReturnNotReady;
 }
 
 IOReturn NVGspControl::stagePackage(const void *bytes, size_t length) {
-    if (!pci_ || !bytes || length != kNVGspPackageBytes)
+    if (!pci_ || !bytes || length > kNVGspPackageBytes)
         return kIOReturnBadArgument;
     if (staged_) return kIOReturnExclusiveAccess;
 
-    nvgsp::PackageView package[5]{};
+    nvgsp::PackageView package[nvgsp::kPackageEntries]{};
     const bool packageOk = nvgsp::parsePackage(bytes, length, package);
     setProperty("NVGspControl-package-ok", packageOk);
     setProperty("NVGspControl-package-bytes", static_cast<uint64_t>(length), 64);
-    if (!packageOk) return kIOReturnBadMedia;
+    if (!packageOk || !package[nvgsp::kPackageUcodes - 1].data)
+        return kIOReturnBadMedia;
 
     IODeviceMemory *bar0 = pci_->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
     IOMemoryMap *map = bar0 ? bar0->map() : nullptr;
@@ -14686,6 +16238,20 @@ IOReturn NVGspControl::stagePackage(const void *bytes, size_t length) {
     pci_->findPCICapability(kIOPCIPCIExpressCapability, &pcieCapability);
     system.pcieLinkCap = pcieCapability ? pci_->configRead32(pcieCapability + 0x0c) : 0;
     system.gpuBehindBridge = 1;
+    // Preserve the real VM identity in the 615 system-info packet. Omitting
+    // this key is ambiguous because NVIDIA's enum value0 denotes Xen.
+    UInt32 hvA=0,hvB=0,hvC=0,hvD=0;
+    __asm__ volatile("cpuid" : "=a"(hvA), "=b"(hvB), "=c"(hvC), "=d"(hvD)
+                     : "a"(1), "c"(0));
+    system.isPassthru = (hvC >> 31) != 0;
+    if (system.isPassthru) {
+        __asm__ volatile("cpuid" : "=a"(hvA), "=b"(hvB), "=c"(hvC), "=d"(hvD)
+                         : "a"(0x40000000), "c"(0));
+        if (hvA >= 0x40000000)
+            system.hypervisorType = nvgsp::gmcHypervisorType(hvB,hvC,hvD);
+    }
+    setProperty("NVGspControl-system-hypervisor", system.hypervisorType, 32);
+    setProperty("NVGspControl-system-passthru", system.isPassthru != 0);
     system.flrSupported = 0;
     system.bar0Is64Bit = (pci_->configRead32(kIOPCIConfigBaseAddress0) & 6) == 4;
     system.isPrimary = 1;
@@ -14697,7 +16263,9 @@ IOReturn NVGspControl::stagePackage(const void *bytes, size_t length) {
     setProperty("NVGspControl-registry-entries", regOk ? regEntries : 0, 32);
     setProperty("NVGspControl-registry-bytes", regOk ? regBytes : 0, 32);
     const bool initOk = booterOk && system.bar0 && system.bar1 && system.bar2 &&
-        init_.stage(system, nullptr, regOk ? reg : nullptr, regOk ? regBytes : 0);
+        init_.stage(system, nullptr, regOk ? reg : nullptr, regOk ? regBytes : 0,
+                    package[nvgsp::kPackageUcodes - 1].data,
+                    package[nvgsp::kPackageUcodes - 1].size);
     if (reg) IOFree(reg, kRegistryCap);
     systemInfo_ = system;
     systemInfoValid_ = initOk;
@@ -14716,6 +16284,11 @@ IOReturn NVGspControl::stagePackage(const void *bytes, size_t length) {
     setProperty("NVGspControl-firmware-stage-ok", gspOk);
     setProperty("NVGspControl-booter-stage-ok", booterOk);
     setProperty("NVGspControl-init-stage-ok", initOk);
+    setProperty("NVGspControl-gmc-init-queued", initOk);
+    setProperty("NVGspControl-libos-log-count", nvgsp::kGspLogCount, 32);
+    setProperty("NVGspControl-rm-state-monitor-bus", init_.stateMonitorBus(), 64);
+    setProperty("NVGspControl-ucodes-bytes", package[nvgsp::kPackageUcodes - 1].size, 64);
+    setProperty("NVGspControl-ucodes-radix", init_.externalUcodesRootBus(), 64);
     setProperty("NVGspControl-metadata-bus", gsp_.metadataBusAddress(), 64);
     setProperty("NVGspControl-booter-bus", booter_.busAddress(), 64);
     setProperty("NVGspControl-libos-args-bus", init_.libosArgsBus(), 64);
@@ -14886,10 +16459,19 @@ static UInt32 srCtrl(NVGspControl *self, UInt32 client, UInt32 object, UInt32 cm
     return st;
 }
 
-IOReturn NVGspControl::srSuspend() {
+IOReturn NVGspControl::srSuspend(bool force) {
+    if(native615Attempted_)return kIOReturnBusy;
     srStep_ = 1;
+    setProperty("NVGspControl-sr-force-unload", force);
     setProperty("NVGspControl-sr-step", srStep_, 32);
-    if (!srStageBuffers()) return kIOReturnNoMemory;
+    if (!srStageBuffers()) {
+        setProperty("NVGspControl-sr-stage-failed", true);
+        // A reset may still tear the old WPR2 down with metadata from the
+        // previous attempt; only a missing meta stops it.
+        if (!force || !srMeta_.busAddress()) return kIOReturnNoMemory;
+    } else {
+        setProperty("NVGspControl-sr-stage-failed", false);
+    }
     const nvgsp::WprMeta *meta = gsp_.metadata();
     // 1. stop channel scheduling
     {
@@ -14934,7 +16516,10 @@ IOReturn NVGspControl::srSuspend() {
         IOFree(am, bytes);
         setProperty("NVGspControl-sr-memlist-kr", static_cast<UInt32>(r), 32);
         setProperty("NVGspControl-sr-memlist-result", result, 32);
-        if (r != kIOReturnSuccess || result != 0) return kIOReturnIOError;
+        if (r != kIOReturnSuccess || result != 0) {
+            setProperty("NVGspControl-sr-memlist-forced", force);
+            if (!force) return kIOReturnIOError;
+        }
         UInt8 p[24]{};
         const UInt32 hc = internalClient_, hs = kFbsrMemlist;
         const uint64_t srAddr = srMeta_.busAddress();
@@ -14950,7 +16535,10 @@ IOReturn NVGspControl::srSuspend() {
         UInt8 reply[256];
         UInt32 rb = sizeof(reply), fr = 0;
         userRpc(10, f, sizeof(f), reply, &rb, &fr);
-        if (st != 0) return kIOReturnIOError;
+        if (st != 0) {
+            setProperty("NVGspControl-sr-fbsr-forced", force);
+            if (!force) return kIOReturnIOError;
+        }
     }
     srStep_ = 4;
     IOSleep(200);
@@ -14968,7 +16556,10 @@ IOReturn NVGspControl::srSuspend() {
             IOSleep(1);
         }
         setProperty("NVGspControl-sr-gsp-mbox0", mbox, 32);
-        if (mbox != 0x80000000) return kIOReturnTimeout;
+        if (mbox != 0x80000000) {
+            setProperty("NVGspControl-sr-unload-forced", force);
+            if (!force) return kIOReturnTimeout;
+        }
     }
     lk(__LINE__);
     sleeping_ = true;   // GSP-RM is gone: fence every RPC path
@@ -14979,6 +16570,13 @@ IOReturn NVGspControl::srSuspend() {
     srStep_ = u == kIOReturnSuccess ? 6 : 0x80 | srStep_;
     setProperty("NVGspControl-sr-step", srStep_, 32);
     srSuspended_ = u == kIOReturnSuccess;
+    if (u != kIOReturnSuccess) {
+        // 0.180.12: the GSP is not gone after a failed unload. Leaving
+        // sleeping_ set fenced every later RPC/fence call until reboot.
+        lk(__LINE__);
+        sleeping_ = false;
+        ulk();
+    }
     (void)meta;
     return u;
 }
@@ -14991,6 +16589,10 @@ IOReturn NVGspControl::executeUnload() {
         return kIOReturnNoResources;
     }
     Bar0Io io{map};
+    UInt32 romShadow = 0;
+    const bool romShadowOk = enableRomShadow(io, &romShadow);
+    setProperty("NVGspControl-sr-rom-shadow", romShadow | 1U, 32);
+    setProperty("NVGspControl-sr-rom-shadow-ok", romShadowOk);
     UInt8 *rom = static_cast<UInt8 *>(IOMalloc(kPromBytes));
     if (!rom) { map->release(); return kIOReturnNoMemory; }
     bool romRead = true;
@@ -15006,7 +16608,7 @@ IOReturn NVGspControl::executeUnload() {
     const nvgsp::WprMeta *meta = gsp_.metadata();
     // GSP falcon reset, then FWSEC-SB (restore pre-OS apps; non-fatal).
     const bool gspReset = vbiosOk && meta &&
-        resetPulse(io, 0x001103c0, 0x001100f4) &&
+        resetPulse(io, 0x001103c0, 0x001100f4, 20000) &&
         io.write(0x00111668, 0) &&
         nvgsp::falconPoll(io, 0x00111668, 1, 1, 200000, 10) &&
         io.write(0x00110084, boot0);
@@ -15023,28 +16625,61 @@ IOReturn NVGspControl::executeUnload() {
             sbOk = (res.frtsScratch & 0xffff) == 0;
         }
     }
-    // SEC2 reset + Booter Unload with the SR metadata.
-    uint32_t bcr = 0;
-    const bool sec2 = gspReset &&
-        resetPulse(io, 0x008403c0, 0x008400f4) &&
-        io.write(0x00841668, 0) &&
-        nvgsp::sec2Poll(io, 0x00841668, 1, 1, 200000, 10) &&
-        io.read(0x00841668, &bcr) &&
-        io.write(0x00840084, boot0);
+    // SEC2 reset + Booter Unload with the SR metadata. A hung GSP can leave
+    // SEC2/the booter in a state where the first attempt fails; reset GSP's
+    // falcon again and retry once without re-running FWSEC-SB.
     nvgsp::BooterView view{
         nullptr, booterUnload_.imageSize(), nullptr, 0, 0,
         booterUnload_.patchLocation(), 0, booterUnload_.engineId(), booterUnload_.ucodeId(),
         booterUnload_.layout()};
     nvgsp::BooterExecutionResult res{};
-    const bool unloadOk = sec2 && nvgsp::executeBooterLoad(
-        io, view, booterUnload_.busAddress(), booterUnload_.imageSize(),
-        srMeta_.busAddress(), &res);
+    UInt32 booterStage = 0, unloadAttempts = 0;
+    bool unloadOk = false, sec2Ok = false;
+    bool gspResetAttempt = gspReset;
+    for (UInt32 attempt = 1; attempt <= 2 && !unloadOk; ++attempt) {
+        ++unloadAttempts;
+        if (attempt > 1) {
+            IODelay(1000);
+            gspResetAttempt = vbiosOk && meta &&
+                resetPulse(io, 0x001103c0, 0x001100f4, 20000) &&
+                io.write(0x00111668, 0) &&
+                nvgsp::falconPoll(io, 0x00111668, 1, 1, 200000, 10) &&
+                io.write(0x00110084, boot0);
+            setProperty("NVGspControl-sr-unload-gsp-reset-retry", gspResetAttempt);
+        }
+        uint32_t bcr = 0, sec2Idle = ~0U;
+        const bool sec2Pulse = gspResetAttempt &&
+            resetPulse(io, 0x008403c0, 0x008400f4, 200000);
+        const bool sec2IdleWrite = sec2Pulse && io.write(0x00841668, 0);
+        const bool sec2PollOk = sec2IdleWrite &&
+            nvgsp::sec2Poll(io, 0x00841668, 1, 1, 200000, 10);
+        const bool sec2ReadBcr = sec2PollOk && io.read(0x00841668, &bcr);
+        const bool sec2Boot0 = sec2ReadBcr && io.write(0x00840084, boot0);
+        io.read(0x00841668, &sec2Idle);
+        sec2Ok = sec2Boot0;
+        setProperty("NVGspControl-sr-unload-sec2", sec2Ok);
+        setProperty("NVGspControl-sr-unload-sec2-pulse", sec2Pulse);
+        setProperty("NVGspControl-sr-unload-sec2-idle", sec2IdleWrite);
+        setProperty("NVGspControl-sr-unload-sec2-poll", sec2PollOk);
+        setProperty("NVGspControl-sr-unload-sec2-bcr", bcr, 32);
+        setProperty("NVGspControl-sr-unload-sec2-read", sec2ReadBcr);
+        setProperty("NVGspControl-sr-unload-sec2-boot", sec2Boot0);
+        setProperty("NVGspControl-sr-unload-sec2-idle-val", sec2Idle, 32);
+        booterStage = 0;
+        unloadOk = sec2Ok && nvgsp::executeBooterLoad(
+            io, view, booterUnload_.busAddress(), booterUnload_.imageSize(),
+            srMeta_.busAddress(), &res, &booterStage);
+        setProperty("NVGspControl-sr-unload-booter-stage", booterStage, 32);
+        setProperty("NVGspControl-sr-unload-booter-mbox0", res.mailbox0, 32);
+    }
     UInt32 wpr2Hi = ~0U;
     io.read(0x001fa828, &wpr2Hi);
     IOFree(rom, kPromBytes);
     map->release();
     setProperty("NVGspControl-sr-sb-ok", sbOk);
     setProperty("NVGspControl-sr-sb-scratch", sbScratch, 32);
+    setProperty("NVGspControl-sr-unload-gsp-reset", gspReset);
+    setProperty("NVGspControl-sr-unload-attempts", unloadAttempts, 32);
     setProperty("NVGspControl-sr-booter-unload-ok", unloadOk);
     setProperty("NVGspControl-sr-booter-unload-mbox0", res.mailbox0, 32);
     setProperty("NVGspControl-sr-wpr2-hi-after", wpr2Hi, 32);
@@ -15074,6 +16709,9 @@ IOReturn NVGspControl::srResume() {
     nvgsp::BooterExecutionResult res{};
     lk(__LINE__);
     initDone_ = false;
+    gmcInitReady_ = false;
+    gmcHsResumeDeadline_ = 0;
+    gmcConfig_ = nvgsp::GmcStaticConfig{};
     ulk();
     const bool loadOk = sec2 && nvgsp::executeBooterLoad(
         io, view, booter_.busAddress(), booter_.imageSize(), srMeta_.busAddress(), &res);
@@ -15137,12 +16775,494 @@ IOReturn NVGspControl::srResume() {
 // proven cold path: reset kext state, re-stage, full boot (FWSEC FRTS,
 // booter load), chain to phase 33, light modeset. Asynchronous: poll
 // NVGspControl-gr-persistent / -gpu-reset-count.
+// 0.178.39: PCIe function-level reset. Only used when NVRAM nvgsp-flr=1 and
+// the Device Capabilities register advertises FLR; the soft GSP path cannot
+// recover a GR hang whose SEC2 falcon returns PriError.
+bool NVGspControl::pciFlr() {
+    if (!pci_ || !flrCapable_ || !pcieCapOffset_) return false;
+    // 0.179.1: a function-level reset can clear the BARs as well as the
+    // command register. The Linux reference calls pci_restore_state() after
+    // pcie_flr(); our 0.179.0 restored only memory decode/bus master, and the
+    // post-FLR BAR0 reads stayed 0xffffffff. Save the six BAR cells now and
+    // put them back after the reset.
+    UInt32 bars[6] = {};
+    for (UInt32 i = 0; i < 6; ++i)
+        bars[i] = pci_->configRead32(kIOPCIConfigBaseAddress0 + i * 4);
+    const UInt32 bar0Before = bars[0];
+    const UInt16 devCtlBefore = pci_->configRead16(pcieCapOffset_ + 8);
+    UInt8 pmCapOffset = 0;
+    const bool pmCapable =
+        pci_->findPCICapability(kIOPCIPowerManagementCapability, &pmCapOffset);
+    const UInt16 pmcsrBefore = pmCapable ? pci_->configRead16(pmCapOffset + 4) : 0;
+    // 0.180.5: FLR can clear the MSI capability's address/data. Save them so
+    // the post-reset arm can deliver vblank/fence MSIs again.
+    UInt8 msiCap = 0;
+    const bool msiCapable = pci_->findPCICapability(0x05, &msiCap);
+    const UInt16 msiCtlBefore = msiCapable ? pci_->configRead16(msiCap + 2) : 0;
+    const UInt32 msiLoBefore = msiCapable ? pci_->configRead32(msiCap + 4) : 0;
+    const UInt32 msiHiBefore = msiCapable ? pci_->configRead32(msiCap + 8) : 0;
+    const UInt16 msiDataBefore = msiCapable ? pci_->configRead16(msiCap + 12) : 0;
+    setProperty("NVGspControl-pcie-flr-msi-ctl-before", msiCtlBefore, 16);
+    setProperty("NVGspControl-pcie-flr-msi-addr-lo-before", msiLoBefore, 32);
+    setProperty("NVGspControl-pcie-flr-msi-addr-hi-before", msiHiBefore, 32);
+    setProperty("NVGspControl-pcie-flr-msi-data-before", msiDataBefore, 16);
+    setProperty("NVGspControl-pcie-flr-bar0-before", bar0Before, 32);
+    setProperty("NVGspControl-pcie-flr-bar1-before", bars[1], 32);
+    setProperty("NVGspControl-pcie-flr-pmcsr-before", pmcsrBefore, 32);
+    const UInt16 before = devCtlBefore;
+    pci_->configWrite16(pcieCapOffset_ + 8, before | (1U << 15));
+    bool done = false;
+    for (UInt32 ms = 0; ms < 2000; ++ms) {
+        if (!(pci_->configRead16(pcieCapOffset_ + 8) & (1U << 15))) { done = true; break; }
+        IOSleep(1);
+    }
+    // 0.178.40: FLR leaves the function with memory decode off/D3. The
+    // post-FLR executeBoot could not read the VBIOS (exec-vbios-ok=No) until
+    // command memory space and D0 were restored.
+    IOSleep(200);
+    // Restore every saved BAR cell. A 64-bit BAR's low and high halves are
+    // written in order; skipping 0/0xffffffff avoids programming an
+    // unassigned aperture. Read each back so a silent write is visible.
+    bool barRestored = true;
+    for (UInt32 i = 0; i < 6; ++i) {
+        const UInt32 saved = bars[i];
+        if (!saved || saved == 0xffffffffU) continue;
+        const UInt32 live = pci_->configRead32(kIOPCIConfigBaseAddress0 + i * 4);
+        if (live == saved) continue;
+        pci_->configWrite32(kIOPCIConfigBaseAddress0 + i * 4, saved);
+        if (pci_->configRead32(kIOPCIConfigBaseAddress0 + i * 4) != saved)
+            barRestored = false;
+    }
+    // Restore the PCIe Device Control value saved before the reset, with the
+    // FLR trigger bit clear.
+    pci_->configWrite16(pcieCapOffset_ + 8, devCtlBefore & ~(1U << 15));
+    // FLR can leave the function in D3hot even though the command register
+    // says memory decode on. Linux's pci_restore_state() restores PMCSR too;
+    // put the function back in D0 before touching BAR0.
+    if (pmCapable) {
+        const UInt16 pmcsrLive = pci_->configRead16(pmCapOffset + 4);
+        if (pmcsrLive != 0xffff)
+            pci_->configWrite16(pmCapOffset + 4, pmcsrLive & ~3U);
+        IOSleep(10);
+        setProperty("NVGspControl-pcie-flr-pmcsr-after",
+                    pci_->configRead16(pmCapOffset + 4), 32);
+    }
+    if (msiCapable) {
+        const bool msi64 = (msiCtlBefore & 0x80) != 0;
+        pci_->configWrite32(msiCap + 4, msiLoBefore);
+        if (msi64) {
+            pci_->configWrite32(msiCap + 8, msiHiBefore);
+            pci_->configWrite16(msiCap + 12, msiDataBefore);
+        } else {
+            pci_->configWrite16(msiCap + 8, msiDataBefore);
+        }
+        // Leave MSI disabled; armInterrupts re-enables it after registering
+        // its event source, so no interrupt can fire at a stale vector.
+        pci_->configWrite16(msiCap + 2, msiCtlBefore & ~1U);
+        setProperty("NVGspControl-pcie-flr-msi-ctl-after",
+                    pci_->configRead16(msiCap + 2), 16);
+        setProperty("NVGspControl-pcie-flr-msi-addr-lo-after",
+                    pci_->configRead32(msiCap + 4), 32);
+        setProperty("NVGspControl-pcie-flr-msi-data-after",
+                    msi64 ? pci_->configRead16(msiCap + 12)
+                          : pci_->configRead16(msiCap + 8), 16);
+    }
+    const UInt16 cmdBefore = pci_->configRead16(kIOPCIConfigCommand);
+    if (cmdBefore != 0xffff)
+        pci_->configWrite16(kIOPCIConfigCommand, cmdBefore | 0x2 | 0x4);
+    // PCIe FLR does not change the D-state; only memory decode/bus master
+    // are lost. Avoid a power-manager transition here (deadlock risk).
+    UInt16 vendor = 0, device = 0;
+    for (UInt32 i = 0; i < 30; ++i) {
+        vendor = pci_->configRead16(kIOPCIConfigVendorID);
+        device = pci_->configRead16(kIOPCIConfigDeviceID);
+        if (vendor == 0x10de && nvGPUProfileSupported(device)) break;
+        IOSleep(100);
+    }
+    const UInt16 cmdAfter = pci_->configRead16(kIOPCIConfigCommand);
+    if (cmdAfter != 0xffff)
+        pci_->configWrite16(kIOPCIConfigCommand, cmdAfter | 0x2 | 0x4);
+    pci_->setBusMasterEnable(true);
+    const UInt32 bar0After = pci_->configRead32(kIOPCIConfigBaseAddress0);
+    const bool barOk = bar0Before && bar0After == bar0Before;
+    setProperty("NVGspControl-pcie-flr-vendor", vendor, 32);
+    setProperty("NVGspControl-pcie-flr-device", device, 32);
+    setProperty("NVGspControl-pcie-flr-command", pci_->configRead16(kIOPCIConfigCommand), 32);
+    setProperty("NVGspControl-pcie-flr-bar0-after", bar0After, 32);
+    setProperty("NVGspControl-pcie-flr-bar1-after",
+                pci_->configRead32(kIOPCIConfigBaseAddress0 + 4), 32);
+    setProperty("NVGspControl-pcie-flr-bar-restored", barRestored);
+    setProperty("NVGspControl-pcie-flr-bar0-ok", barOk);
+    setProperty("NVGspControl-pcie-flr-done", done);
+    setProperty("NVGspControl-pcie-flr-devctl", pci_->configRead16(pcieCapOffset_ + 8), 32);
+    // If BAR0 cannot be put back, report the FLR as failed so the opt-in
+    // nvgsp-flr=2 path can try the parent-bridge secondary bus reset.
+    return done && vendor == 0x10de && nvGPUProfileSupported(device) && barOk;
+}
+
+// 0.178.41: last-resort hardware reset: assert the parent PCI-to-PCI
+// bridge's Secondary Bus Reset for ~2 ms, then restore memory decode/bus
+// master. Used only when nvgsp-flr=2 and the PF FLR did not bring the
+// function back.
+bool NVGspControl::pciBusReset() {
+    if (!pci_) return false;
+    // 0.180.2: the GPU's provider is the IOPCIBridge service, not the
+    // upstream IOPCIDevice. Walk the provider chain to the PCI-to-PCI bridge
+    // (class 0x060400); using the provider itself always failed with
+    // pcie-bus-reset-bridge=No.
+    IOPCIDevice *bridge = nullptr;
+    IOService *p = pci_->getProvider();
+    for (unsigned depth = 0; p && depth < 5; ++depth, p = p->getProvider()) {
+        IOPCIDevice *d = OSDynamicCast(IOPCIDevice, p);
+        if (!d || d == pci_) continue;
+        const UInt32 classCode = d->configRead32(0x08) >> 8;
+        if ((classCode & 0xffffffU) == 0x060400U) { bridge = d; break; }
+        if (!bridge) bridge = d;   // fallback: nearest upstream PCI device
+    }
+    if (!bridge) {
+        setProperty("NVGspControl-pcie-bus-reset-bridge", false);
+        return false;
+    }
+    setProperty("NVGspControl-pcie-bus-reset-bridge-class",
+                bridge->configRead32(0x08) >> 8, 32);
+    const UInt16 bctl = bridge->configRead16(0x3E);   // Bridge Control
+    if (bctl == 0xffff) {
+        setProperty("NVGspControl-pcie-bus-reset-bridge", false);
+        return false;
+    }
+    // 0.179.1: the same function state FLR needs (BARs, PMCSR D0, device
+    // control) is also lost by a secondary bus reset.
+    UInt32 bars[6] = {};
+    for (UInt32 i = 0; i < 6; ++i)
+        bars[i] = pci_->configRead32(kIOPCIConfigBaseAddress0 + i * 4);
+    const UInt32 bar0Before = bars[0];
+    UInt8 pmCapOffset = 0;
+    const bool pmCapable =
+        pci_->findPCICapability(kIOPCIPowerManagementCapability, &pmCapOffset);
+    const UInt16 pmcsrBefore = pmCapable ? pci_->configRead16(pmCapOffset + 4) : 0;
+    const UInt16 devCtlBefore = pcieCapOffset_
+        ? pci_->configRead16(pcieCapOffset_ + 8) : 0;
+    // 0.180.5: a secondary bus reset clears the whole function config,
+    // including the MSI address/data. Save them so vblank/fence MSIs survive
+    // the reset that recovers the GPU.
+    UInt8 msiCap = 0;
+    const bool msiCapable = pci_->findPCICapability(0x05, &msiCap);
+    const UInt16 msiCtlBefore = msiCapable ? pci_->configRead16(msiCap + 2) : 0;
+    const UInt32 msiLoBefore = msiCapable ? pci_->configRead32(msiCap + 4) : 0;
+    const UInt32 msiHiBefore = msiCapable ? pci_->configRead32(msiCap + 8) : 0;
+    const UInt16 msiDataBefore = msiCapable ? pci_->configRead16(msiCap + 12) : 0;
+    setProperty("NVGspControl-pcie-bus-reset-msi-ctl-before", msiCtlBefore, 16);
+    setProperty("NVGspControl-pcie-bus-reset-msi-addr-lo-before", msiLoBefore, 32);
+    setProperty("NVGspControl-pcie-bus-reset-msi-addr-hi-before", msiHiBefore, 32);
+    setProperty("NVGspControl-pcie-bus-reset-msi-data-before", msiDataBefore, 16);
+    setProperty("NVGspControl-pcie-bus-reset-bridge", true);
+    setProperty("NVGspControl-pcie-bus-reset-ctl", bctl, 32);
+    setProperty("NVGspControl-pcie-bus-reset-bar0-before", bar0Before, 32);
+    setProperty("NVGspControl-pcie-bus-reset-pmcsr-before", pmcsrBefore, 32);
+    bridge->configWrite16(0x3E, bctl | (1U << 6));    // Secondary Bus Reset
+    IOSleep(2);
+    bridge->configWrite16(0x3E, bctl & ~(1U << 6));
+    IOSleep(500);
+    bool barRestored = true;
+    for (UInt32 i = 0; i < 6; ++i) {
+        const UInt32 saved = bars[i];
+        if (!saved || saved == 0xffffffffU) continue;
+        if (pci_->configRead32(kIOPCIConfigBaseAddress0 + i * 4) == saved) continue;
+        pci_->configWrite32(kIOPCIConfigBaseAddress0 + i * 4, saved);
+        if (pci_->configRead32(kIOPCIConfigBaseAddress0 + i * 4) != saved)
+            barRestored = false;
+    }
+    if (pmCapable && pci_->configRead16(pmCapOffset + 4) != 0xffff)
+        pci_->configWrite16(pmCapOffset + 4,
+                            pci_->configRead16(pmCapOffset + 4) & ~3U);
+    if (pcieCapOffset_)
+        pci_->configWrite16(pcieCapOffset_ + 8, devCtlBefore & ~(1U << 15));
+    if (msiCapable) {
+        const bool msi64 = (msiCtlBefore & 0x80) != 0;
+        pci_->configWrite32(msiCap + 4, msiLoBefore);
+        if (msi64) {
+            pci_->configWrite32(msiCap + 8, msiHiBefore);
+            pci_->configWrite16(msiCap + 12, msiDataBefore);
+        } else {
+            pci_->configWrite16(msiCap + 8, msiDataBefore);
+        }
+        pci_->configWrite16(msiCap + 2, msiCtlBefore & ~1U);
+        setProperty("NVGspControl-pcie-bus-reset-msi-ctl-after",
+                    pci_->configRead16(msiCap + 2), 16);
+        setProperty("NVGspControl-pcie-bus-reset-msi-addr-lo-after",
+                    pci_->configRead32(msiCap + 4), 32);
+        setProperty("NVGspControl-pcie-bus-reset-msi-data-after",
+                    msi64 ? pci_->configRead16(msiCap + 12)
+                          : pci_->configRead16(msiCap + 8), 16);
+    }
+    const UInt16 cmd = pci_->configRead16(kIOPCIConfigCommand);
+    if (cmd != 0xffff)
+        pci_->configWrite16(kIOPCIConfigCommand, cmd | 0x2 | 0x4);
+    pci_->setBusMasterEnable(true);
+    const UInt16 vendor = pci_->configRead16(kIOPCIConfigVendorID);
+    const UInt16 device = pci_->configRead16(kIOPCIConfigDeviceID);
+    const UInt32 bar0After = pci_->configRead32(kIOPCIConfigBaseAddress0);
+    const bool barOk = bar0Before && bar0After == bar0Before;
+    setProperty("NVGspControl-pcie-bus-reset-vendor", vendor, 32);
+    setProperty("NVGspControl-pcie-bus-reset-device", device, 32);
+    setProperty("NVGspControl-pcie-bus-reset-bar0-after", bar0After, 32);
+    setProperty("NVGspControl-pcie-bus-reset-bar-restored", barRestored);
+    setProperty("NVGspControl-pcie-bus-reset-bar0-ok", barOk);
+    const bool ok = vendor == 0x10de && nvGPUProfileSupported(device) && barOk;
+    setProperty("NVGspControl-pcie-bus-reset-ok", ok);
+    return ok;
+}
+
+// 0.179.0: optional AD10x tensor-core unlock, based on the public
+// gpu-unlock V67/PLM technique. It runs before the normal GSP boot:
+//   FWSEC/FRTS -> stock signed Booter driven with the V67 payload ->
+//   PLM readback -> host SS0/SS1 stores -> PCIe FLR -> normal cold boot.
+// The stock Booter image is unchanged; the payload is passed through the WPR
+// metadata signature pointer, which is restored before anything else runs.
+bool NVGspControl::executeUnlock() {
+    unlockFatal_ = false;
+    setProperty("NVGspControl-unlock-attempt", true);
+    if (!pci_ || !staged_ || !gsp_.ready() || !booter_.ready()) {
+        setProperty("NVGspControl-unlock-error", "not-staged");
+        return false;
+    }
+    if (!flrCapable_ || !pcieCapOffset_) {
+        setProperty("NVGspControl-unlock-error", "no-flr");
+        return false;
+    }
+    const nvgsp::WprMeta *meta = gsp_.metadata();
+    if (!meta || !meta->frtsOffset || !meta->frtsSize) {
+        setProperty("NVGspControl-unlock-error", "no-meta");
+        return false;
+    }
+
+    IODeviceMemory *bar0 =
+        pci_->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+    IOMemoryMap *map = bar0 ? bar0->map() : nullptr;
+    UInt8 *rom = nullptr;
+    auto cleanup = [&]() {
+        if (rom) { IOFree(rom, kPromBytes); rom = nullptr; }
+        if (map) { map->release(); map = nullptr; }
+    };
+    if (!map || map->getLength() < kPromBase + kPromBytes) {
+        cleanup();
+        setProperty("NVGspControl-unlock-error", "no-bar0");
+        return false;
+    }
+    Bar0Io io{map};
+    UInt32 romShadow = 0;
+    if (!enableRomShadow(io, &romShadow)) {
+        cleanup();
+        setProperty("NVGspControl-unlock-error", "no-rom-shadow");
+        return false;
+    }
+    setProperty("NVGspControl-unlock-rom-shadow", romShadow | 1U, 32);
+
+    rom = static_cast<UInt8 *>(IOMalloc(kPromBytes));
+    if (!rom) {
+        cleanup();
+        setProperty("NVGspControl-unlock-error", "no-rom-memory");
+        return false;
+    }
+    bool romRead = true;
+    for (size_t i = 0; i < kPromBytes; i += 4) {
+        UInt32 word = 0;
+        if (!io.read(kPromBase + static_cast<uint32_t>(i), &word)) {
+            romRead = false;
+            break;
+        }
+        __builtin_memcpy(rom + i, &word, 4);
+    }
+    nvgsp::VbiosFwsecView vbios{};
+    UInt32 boot0 = 0, gspFuse = 0;
+    const bool vbiosOk = romRead && nvgsp::parseVbiosFwsec(rom, kPromBytes, &vbios);
+    const bool boot0Ok = io.read(kBoot0, &boot0);
+    const bool fuseOk = io.read(kGspUcode9Fuse, &gspFuse);
+    setProperty("NVGspControl-unlock-vbios-ok", vbiosOk);
+    if (!vbiosOk || !boot0Ok || !fuseOk) {
+        cleanup();
+        setProperty("NVGspControl-unlock-error", "vbios");
+        return false;
+    }
+
+    nvgsp::FwsecStaging fwsec;
+    const bool fwsecStage =
+        fwsec.stage(vbios.fwsec, gspFuse & 0xff, meta->frtsOffset);
+    setProperty("NVGspControl-unlock-fwsec-stage", fwsecStage);
+    if (!fwsecStage) {
+        cleanup();
+        setProperty("NVGspControl-unlock-error", "fwsec-stage");
+        return false;
+    }
+    const bool gspFalconReset = resetPulse(io, 0x001103c0, 0x001100f4) &&
+        io.write(0x00111668, 0) &&
+        nvgsp::falconPoll(io, 0x00111668, 1, 1, 200000, 10) &&
+        io.write(0x00110084, boot0);
+    nvgsp::FwsecExecutionResult fwsecResult{};
+    const bool fwsecOk = gspFalconReset && nvgsp::executeFwsecFrts(
+        io, vbios.fwsec, fwsec.busAddress(), fwsec.imageSize(),
+        meta->frtsOffset, &fwsecResult);
+    setProperty("NVGspControl-unlock-fwsec-ok", fwsecOk);
+    setProperty("NVGspControl-unlock-fwsec-dma", fwsecResult.dmaTransfers, 32);
+    if (!fwsecOk) {
+        cleanup();
+        setProperty("NVGspControl-unlock-error", "fwsec");
+        return false;
+    }
+
+    // The Booter reads the signature image from host memory; keep it
+    // contiguous and page aligned and expose exactly the payload bytes.
+    nvgsp::DmaBuffer payload;
+    if (!payload.allocate(0x10000, true)) {
+        cleanup();
+        setProperty("NVGspControl-unlock-error", "payload-alloc");
+        return false;
+    }
+    size_t writeCount = 0;
+    const nvgsp::unlock::RegWrite *writes =
+        nvgsp::unlock::ad10xPrivilegedWrites(&writeCount);
+    uint8_t *payloadBytes = static_cast<uint8_t *>(payload.bytes());
+    if (!payloadBytes ||
+        !nvgsp::unlock::buildAd102V67Payload(payloadBytes, payload.size(),
+                                             writes, writeCount) ||
+        !payload.syncToDevice() ||
+        !gsp_.overrideSignature(payload.busAddress(),
+                                nvgsp::unlock::kPayloadBytes)) {
+        cleanup();
+        setProperty("NVGspControl-unlock-error", "payload-build");
+        return false;
+    }
+    setProperty("NVGspControl-unlock-payload", payload.busAddress(), 64);
+
+    const bool sec2Enable = resetPulse(io, 0x008403c0, 0x008400f4) &&
+        io.write(0x00841668, 0) &&
+        nvgsp::sec2Poll(io, 0x00841668, 1, 1, 200000, 10);
+    const bool sec2Reset = sec2Enable && io.write(0x00840084, boot0);
+    setProperty("NVGspControl-unlock-sec2-reset", sec2Reset);
+    if (!sec2Reset) {
+        gsp_.rewriteMetadata();
+        cleanup();
+        setProperty("NVGspControl-unlock-error", "sec2");
+        return false;
+    }
+    nvgsp::BooterView booterView{
+        nullptr, booter_.imageSize(), nullptr, 0, 0,
+        booter_.patchLocation(), 0, booter_.engineId(), booter_.ucodeId(),
+        booter_.layout()
+    };
+    nvgsp::BooterExecutionResult booterResult{};
+    // From here the V67 chain may have changed GPU state. A failure must not
+    // fall through to FWSEC with an unknown WPR2; executeBoot aborts instead.
+    unlockFatal_ = true;
+    const bool booterOk = nvgsp::executeBooterLoad(
+        io, booterView, booter_.busAddress(), booter_.imageSize(),
+        gsp_.metadataBusAddress(), &booterResult, nullptr,
+        nvgsp::unlock::kAd10xBooterMarker);
+    setProperty("NVGspControl-unlock-booter-ok", booterOk);
+    setProperty("NVGspControl-unlock-booter-mailbox0", booterResult.mailbox0, 32);
+    setProperty("NVGspControl-unlock-booter-mailbox1", booterResult.mailbox1, 32);
+    UInt32 resetPlm = 0;
+    const bool resetPlmRead = io.read(0x008403c4, &resetPlm);
+    setProperty("NVGspControl-unlock-reset-plm", resetPlm, 32);
+    // The V67 clean exit leaves RESET_PLM low byte 0xff, the same completion
+    // predicate the public reference uses before it trusts the PLM stores.
+    const bool cleanupOk = booterOk && resetPlmRead && (resetPlm & 0xffU) == 0xffU;
+    setProperty("NVGspControl-unlock-cleanup-ok", cleanupOk);
+    // Never leave the payload published for a later stock boot.
+    gsp_.rewriteMetadata();
+    if (!cleanupOk) {
+        cleanup();
+        setProperty("NVGspControl-unlock-error", "booter");
+        return false;
+    }
+    IODelay(1000);
+
+    UInt32 wprCfg = 0, wpr = 0, feat = 0, fbpa = 0;
+    const bool plmRead = io.read(nvgsp::unlock::kWprCfgPlm, &wprCfg) &&
+        io.read(nvgsp::unlock::kWprPlm, &wpr) &&
+        io.read(nvgsp::unlock::kFeatPlm, &feat) &&
+        io.read(nvgsp::unlock::kFbpaPlm, &fbpa);
+    const bool plmOk = plmRead && wprCfg == 0xfffff0ffU &&
+        wpr == 0xffffffffU && feat == 0xffffffffU;
+    setProperty("NVGspControl-unlock-plm-wpr-cfg", wprCfg, 32);
+    setProperty("NVGspControl-unlock-plm-wpr", wpr, 32);
+    setProperty("NVGspControl-unlock-plm-feat", feat, 32);
+    setProperty("NVGspControl-unlock-plm-fbpa", fbpa, 32);
+    setProperty("NVGspControl-unlock-plm-ok", plmOk);
+    if (!plmOk) {
+        cleanup();
+        setProperty("NVGspControl-unlock-error", "plm");
+        return false;
+    }
+
+    UInt32 ss0 = 0, ss1 = 0;
+    const bool ss0Write =
+        io.write(nvgsp::unlock::kFeatSs0, nvgsp::unlock::kSs0Unlock) &&
+        io.read(nvgsp::unlock::kFeatSs0, &ss0);
+    const bool ss1Write =
+        io.write(nvgsp::unlock::kFeatSs1, nvgsp::unlock::kSs1Unlock) &&
+        io.read(nvgsp::unlock::kFeatSs1, &ss1);
+    const bool selectorsOk = ss0Write && ss1Write &&
+        ss0 == nvgsp::unlock::kSs0Unlock && ss1 == nvgsp::unlock::kSs1Unlock;
+    setProperty("NVGspControl-unlock-ss0", ss0, 32);
+    setProperty("NVGspControl-unlock-ss1", ss1, 32);
+    setProperty("NVGspControl-unlock-selectors-ok", selectorsOk);
+    if (!selectorsOk) {
+        cleanup();
+        setProperty("NVGspControl-unlock-error", "selectors");
+        return false;
+    }
+
+    cleanup();   // BAR0/ROM are not needed across the reset
+    const bool flr = pciFlr();
+    setProperty("NVGspControl-unlock-flr", flr);
+    if (!flr) {
+        setProperty("NVGspControl-unlock-error", "flr");
+        return false;
+    }
+
+    // FLR resets GSP/GFW and WPR2 for the normal cold boot. The FEAT
+    // selectors are not part of that reset; verify they survived before
+    // claiming the unlock.
+    IODeviceMemory *bar0After =
+        pci_->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+    IOMemoryMap *mapAfter = bar0After ? bar0After->map() : nullptr;
+    UInt32 ss0After = 0, ss1After = 0;
+    bool afterRead = mapAfter &&
+        mapAfter->getLength() >= nvgsp::unlock::kFeatSs1 + 4;
+    if (afterRead) {
+        Bar0Io ioAfter{mapAfter};
+        afterRead = ioAfter.read(nvgsp::unlock::kFeatSs0, &ss0After) &&
+            ioAfter.read(nvgsp::unlock::kFeatSs1, &ss1After);
+    }
+    if (mapAfter) mapAfter->release();
+    const bool persisted = afterRead &&
+        ss0After == nvgsp::unlock::kSs0Unlock &&
+        ss1After == nvgsp::unlock::kSs1Unlock;
+    setProperty("NVGspControl-unlock-ss0-after-flr", ss0After, 32);
+    setProperty("NVGspControl-unlock-ss1-after-flr", ss1After, 32);
+    setProperty("NVGspControl-unlock-persisted", persisted);
+    if (!persisted) {
+        setProperty("NVGspControl-unlock-error", "not-persisted");
+        return false;
+    }
+    unlockFatal_ = false;
+    setProperty("NVGspControl-unlock-ok", true);
+    return true;
+}
+
 IOReturn NVGspControl::gpuReset() {
-    if (!lock_ || !pci_ || !resumeCall_ || resumeActive_) return kIOReturnBusy;
+    if (!lock_ || !pci_ || !resumeCall_ || resumeActive_ || resetBusy_) return kIOReturnBusy;
+    // Diagnostic GR backing is not in the production FBSR object list.
+    // Keep it pinned and require the authorized cold VM stop for this epoch.
     lk(__LINE__);
+    if(native615Attempted_ || diagnosticVramSlots_ || resumeActive_ || resetBusy_) {ulk();return kIOReturnBusy;}
+    // 0.180.12: claim the reset window before dropping into the lock-taking
+    // path. Concurrent selector-19 calls (or the automatic reset callout)
+    // must not both tear down channels and advance gpuResets_.
+    resetBusy_ = true;                                   // 0.164.0: before the generation moves
     noteGpuEventLocked("reset start");                   // 0.170.0
     ulk();
-    resetBusy_ = true;                                   // 0.164.0: before the generation moves
     // 0.175.0: user-space waits on this property. Leaving the last resume's
     // false value published makes NotReady fail immediately during reset.
     setProperty("NVGspControl-reset-busy", true);
@@ -15162,13 +17282,34 @@ IOReturn NVGspControl::gpuReset() {
     ulk();
     setProperty("NVGspControl-reset-vram-saved", resetVramSaved_);
     setProperty("NVGspControl-reset-vram-bytes", vramSavedBytes_, 64);
-    const IOReturn s = srSuspend();
-    setProperty("NVGspControl-gpu-reset-unload", static_cast<UInt32>(s), 32);
-    // 0.168.0: an unload that fails (0xe00002ca on the third reset, 1 Oct
-    // 04:57) used to end the recovery with the GPU half down and
-    // WindowServer waiting until the watchdog panicked. The cold path below
-    // re-stages and boots GSP from scratch, as after S3; try it anyway.
-    if (s != kIOReturnSuccess) {
+    const UInt8 flrMode = flrModeByNvram();
+    const bool flrOpt = flrMode == '1' || flrMode == '2';
+    const bool busOpt = flrMode == '2';
+    setProperty("NVGspControl-pcie-flr-mode", flrMode, 32);
+    setProperty("NVGspControl-pcie-flr-enabled", flrOpt);
+    IOReturn s = kIOReturnSuccess;
+    if (!flrOpt) {
+        s = srSuspend(true);   // 0.178.36: force WPR2 teardown
+        setProperty("NVGspControl-gpu-reset-unload", static_cast<UInt32>(s), 32);
+    } else {
+        // 0.180.1: a hardware reset resets GSP/SEC2 itself. The forced
+        // unload left SEC2 at 0xbadf5620, and the post-FLR cold boot could
+        // not reset the GSP falcon. Skip it for FLR/bus-reset modes.
+        setProperty("NVGspControl-gpu-reset-unload-skipped", true);
+        setProperty("NVGspControl-gpu-reset-unload", static_cast<UInt32>(0), 32);
+    }
+    if (flrOpt) {
+        // 0.180.1: mode 2 is a primary parent-bridge secondary bus reset;
+        // mode 1 is a primary PCIe FLR. No soft unload first.
+        const bool resetOk = busOpt ? pciBusReset() : pciFlr();
+        if (busOpt)
+            setProperty("NVGspControl-gpu-reset-bus-reset", resetOk);
+        else
+            setProperty("NVGspControl-gpu-reset-flr", resetOk);
+        if (resetOk)
+            setProperty("NVGspControl-gpu-reset-flr-ready", true);
+    }
+    if (!flrOpt && s != kIOReturnSuccess) {
         ++unloadFailures_;
         setProperty("NVGspControl-gpu-reset-unload-failures", unloadFailures_, 32);
     }
@@ -15182,7 +17323,11 @@ IOReturn NVGspControl::gpuReset() {
     ulk();
     resetForResume();
     resetDriven_ = true;
-    thread_call_enter(resumeCall_);
+    if (!thread_call_enter(resumeCall_)) {
+        resetBusy_ = false;
+        setProperty("NVGspControl-gpu-reset-resume-queue-failed", true);
+        return kIOReturnNoResources;
+    }
     return kIOReturnSuccess;
 }
 
@@ -15887,3 +18032,5 @@ void NVGspControl::clientChannelsTeardown() {
     }
     setProperty("NVGspControl-cchan-reset-freed", freed, 32);
 }
+
+#include "NVGspNative615.inc"

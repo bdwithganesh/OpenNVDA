@@ -2,6 +2,7 @@
 """Check actual lifecycle waits: mode 2 keeps GR runnable, reset cancels waits."""
 from pathlib import Path
 import subprocess
+import os
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +54,6 @@ for name in ("waitChannelMutationLocked", "waitChannelLifecycleLocked"):
 with tempfile.TemporaryDirectory(prefix="nvgsp-lifecycle-") as tmp:
     cpp, exe = Path(tmp) / "check.cpp", Path(tmp) / "check"
     cpp.write_text(MOCK + methods)
-    subprocess.run(["clang++", "-std=c++17", "-fsanitize=undefined",
+    subprocess.run([os.environ.get('CXX', 'clang++'), "-std=c++17", "-fsanitize=undefined",
                     str(cpp), "-o", str(exe)], check=True)
     subprocess.run([str(exe)], timeout=10, check=True)

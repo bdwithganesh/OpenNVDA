@@ -42,6 +42,7 @@
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/graphics/IOFramebuffer.h>
+#include <IOKit/IOUserClient.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
@@ -58,7 +59,45 @@
 // IOFBSetDisplayModeAndDepth during CGXMappedDisplayStart); refusing it
 // leaves the main display offline and WindowServer exits (Apple logo
 // stuck). Accept 0 as an alias of the single native mode.
+// 0.10.0: thread_call_cancel_wait is not exported to Auxiliary-KC kexts
+// (kmutil: "could not find a kext which exports this symbol"). Cancel and
+// give a running callout time to return (EDID fetch and vblank watch are
+// both short).
+static inline void nvCancelWait(thread_call_t call) {
+    if (!call) return;
+    if (!thread_call_cancel(call)) IOSleep(100);
+}
 static inline bool nvModeOK(IODisplayModeID m) { return m == kNVDisplayMode || m == 0; }
+
+// 1.1.0: IOFramebuffer connect type 2. IOFramebuffer's base newUserClient only
+// accepts kIOFBServerConnectType (0) and kIOFBSharedConnectType (1); Apple's
+// GPU framebuffer drivers also serve the IOAccelerator2D client on type 2.
+// Without it WindowServer's IOAccelerator2D.plugin Start() fails with
+// kIOReturnUnsupported ("start failed ((iokit/common) unsupported function)")
+// and CA then aborts in CA::OGL::Context::push_surface (surf != nullptr) on a
+// null flatten surface. This client logs every call so the exact ABI can be
+// pinned down from a live WindowServer, and answers success meanwhile.
+class NVDisplay2DClient : public IOUserClient {
+    OSDeclareDefaultStructors(NVDisplay2DClient)
+public:
+    IOReturn externalMethod(unsigned int sel, IOExternalMethodArguments *a,
+                            IOExternalMethodDispatch *, OSObject *, void *) override;
+};
+OSDefineMetaClassAndStructors(NVDisplay2DClient, IOUserClient)
+
+IOReturn NVDisplay2DClient::externalMethod(unsigned int sel, IOExternalMethodArguments *a,
+                                           IOExternalMethodDispatch *, OSObject *, void *) {
+    if (!a) return kIOReturnBadArgument;
+    IOLog("NVDisplay: 2D client method %u scalarsIn=%u scalarsOut=%u structIn=%u structOut=%u\n",
+          sel, a->scalarInputCount, a->scalarOutputCount,
+          (unsigned)a->structureInputSize, (unsigned)a->structureOutputSize);
+    for (unsigned i = 0; a->scalarInput && i < a->scalarInputCount && i < 8; ++i)
+        IOLog("NVDisplay: 2D method %u in[%u]=0x%llx\n", sel, i,
+              (unsigned long long)a->scalarInput[i]);
+    for (unsigned i = 0; a->scalarOutput && i < a->scalarOutputCount; ++i)
+        a->scalarOutput[i] = 0;
+    return kIOReturnSuccess;
+}
 
 class NVDisplay : public IOFramebuffer {
     OSDeclareDefaultStructors(NVDisplay)
@@ -69,6 +108,8 @@ public:
     void free(void) override;
 
     IOReturn enableController(void) override;
+    IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
+                           IOUserClient **handler) override;
     bool isConsoleDevice(void) override;
     IODeviceMemory *getApertureRange(IOPixelAperture aperture) override;
     // 0.9.5: the scan-out memory as the framebuffer's VRAM range, what
@@ -127,23 +168,36 @@ private:
     static void edidCallout(thread_call_param_t self, thread_call_param_t);
     static void vblWatchCallout(thread_call_param_t self, thread_call_param_t);
     bool fetchEdid();
-    // 0.3.0: parsed EDID timing table (IOMalloc'd, published once via CAS).
+    // 0.3.0: parsed EDID timing table (IOMalloc'd, published once).
+    // 0.180.12: fEdidLock protects fEdid and fEdidInfo. Hotplug used to free
+    // the timing table while getDisplayModes()/modeTiming() could still read
+    // it; readers now hold the lock and timing values are copied out.
     void parseEdid(OSData *edid);
-    const nvedid::Timing *nativeTiming();
+    const nvedid::Timing *nativeTimingLocked();
     // 0.9.0 (D4): mode 1 is the firmware mode; 0x100 + i is EDID timing i
     // when head 0 can drive it (progressive, fits the desktop surface, and
     // under the 4-lane HBR2 limit at 30 bpp).
-    const nvedid::Timing *modeTiming(IODisplayModeID mode);
-    bool extraModeOK(uint32_t index);
+    const nvedid::Timing *modeTimingLocked(IODisplayModeID mode);
+    bool extraModeOKLocked(uint32_t index);
+    bool timingForMode(IODisplayModeID mode, nvedid::Timing *out);
     UInt32 fBootW = 0, fBootH = 0;
     // 0.9.1: NVRAM "nvdisp-default-mode" = "WxH" (first progressive EDID
     // timing of that size) moves kDisplayModeDefaultFlag off the firmware
     // mode, so WindowServer switches at login. Unset = firmware mode.
     IODisplayModeID fDefaultMode = 0;
-    void pickDefaultMode();
+    // Highest mode count handed to IOFramebuffer. getDisplayModes has no
+    // capacity argument, so never write more entries than the last count
+    // call advertised (a hotplug can grow the EDID table between the two).
+    IOItemCount fModeCount = 1;
+    void pickDefaultModeLocked();
     nvedid::Info *fEdidInfo = nullptr;
     bool fRefreshOverride = false;
+    // 0.10.0: NVGspControl >= 0.180.141 native615 framebuffer (contiguous
+    // sysmem copied to the VRAM scan-out surface); one fixed mode
+    bool fNative615 = false;
+    bool nativeFramebuffer615();
     OSData *fEdid = nullptr;
+    IOLock *fEdidLock = nullptr;
     // 0.4.0: hardware cursor through NVGspControl (C67A PIO + core
     // CONTROL_CURSOR). Opt-in via NVRAM "nvdisp-hwcursor" until proven, since a
     // silently broken HW cursor would leave the user with no pointer.
@@ -190,11 +244,20 @@ private:
     // whatever was set rather than a constant).
     IODisplayModeID fCurMode = kNVDisplayMode;
     IOIndex fCurDepth = 0;
-    // VBL client (one; IOFramebuffer registers a single VBL handler).
-    IOFBInterruptProc fVblProc = nullptr;
-    OSObject *fVblTarget = nullptr;
-    void *fVblRef = nullptr;
-    volatile bool fVblEnabled = false;
+    // 1.4.0: VBL clients. IOFramebuffer registers one for itself and
+    // IOAccelDisplayPipe::displayModeDidChange another (signalVBLInterrupt,
+    // KDK 26.7.2). 1.3.0 kept one and answered the pipe kIOReturnBusy, so the
+    // pipe never got a vblank and WindowServer composited at ~2 frames/s.
+    struct VblClient {
+        IOFBInterruptProc proc;
+        OSObject *target;
+        void *ref;
+        volatile bool enabled;
+    };
+    static constexpr int kVblClients = 4;
+    VblClient fVbl[kVblClients] = {};
+    VblClient *vblClient(void *interruptRef);
+    bool deliverVbl();
     IOService *fGsp = nullptr;
     bool fVblAttached = false;
     volatile UInt32 fVblCount = 0;
@@ -203,6 +266,10 @@ private:
     // GSP vblanks stall, e.g. dead GSP after S3 while the re-boot runs).
     thread_call_t fVblWatchCall = nullptr;
     UInt32 fVblWatchLast = 0, fVblWatchStall = 0, fVblSynthetic = 0;
+    // 1.4.1: the tick runs on absolute deadlines at the mode's refresh
+    uint64_t fVblPeriodAbs = 0, fVblNextAbs = 0;
+    UInt32 fVblTicks = 0;
+    void updateVblPeriod();
     static constexpr UInt32 kGammaCount = 1024, kGammaWidth = 10;
     UInt16 fGamma[3][kGammaCount] = {};     // last table, 16-bit per entry
     UInt32 fGammaSets = 0;
@@ -244,9 +311,39 @@ IOService *NVDisplay::probe(IOService *provider, SInt32 *score) {
     return IOFramebuffer::probe(provider, score);
 }
 
+// 0.10.0: the native615 runtime owns the display (no EFI GOP console on the
+// RTX under Hyper-V DDA): take the framebuffer NVGspControl publishes.
+bool NVDisplay::nativeFramebuffer615() {
+    OSDictionary *match = serviceMatching("NVGspControl");
+    IOService *gsp = match ? waitForMatchingService(match, 5000ULL * 1000 * 1000) : nullptr;
+    OSSafeReleaseNULL(match);
+    auto num = [&](const char *key) -> UInt64 {
+        OSObject *o = gsp ? gsp->copyProperty(key) : nullptr;
+        OSNumber *n = OSDynamicCast(OSNumber, o);
+        const UInt64 v = n ? n->unsigned64BitValue() : 0;
+        OSSafeReleaseNULL(o);
+        return v;
+    };
+    const UInt64 phys = num("NVGspControl-display615-fb-phys"), bytes = num("NVGspControl-display615-fb-bytes");
+    const UInt64 w = num("NVGspControl-display615-fb-width"), h = num("NVGspControl-display615-fb-height");
+    const UInt64 rb = num("NVGspControl-display615-fb-rowbytes");
+    OSSafeReleaseNULL(gsp);
+    if (!phys || !w || !h || rb < w * 4 || rb * h > bytes || w > 8192 || h > 8192) return false;
+    fAperture = IODeviceMemory::withRange(static_cast<IOPhysicalAddress>(phys), static_cast<IOByteCount>(rb * h));
+    if (!fAperture) return false;
+    fWidth = fBootW = static_cast<UInt32>(w);
+    fHeight = fBootH = static_cast<UInt32>(h);
+    fRowBytes = static_cast<UInt32>(rb);
+    fNative615 = true;
+    IOLog("NVDisplay: native615 framebuffer %llux%llu rowBytes %llu at 0x%llx\n", w, h, rb, phys);
+    return true;
+}
+
 bool NVDisplay::start(IOService *provider) {
     fPCI = OSDynamicCast(IOPCIDevice, provider);
     if (!fPCI) return false;
+    if (nativeFramebuffer615()) goto haveAperture;
+    {
     PE_Video info;
     bzero(&info, sizeof(info));
     IOPlatformExpert *platform = getPlatform();
@@ -257,11 +354,21 @@ bool NVDisplay::start(IOService *provider) {
     fRowBytes = static_cast<UInt32>(info.v_rowBytes);
     fBootW = fWidth;
     fBootH = fHeight;
-    if (!fWidth || !fHeight || !fRowBytes || info.v_depth != 32) {
-        IOLog("NVDisplay: unusable console %ux%u depth %lu\n", fWidth, fHeight,
-              static_cast<unsigned long>(info.v_depth));
+    // 0.180.12: a 32-bpp console needs at least width*4 bytes per row, and
+    // the visible size must not wrap. The old checks accepted a short
+    // rowBytes and any height, then mapped an aperture larger than BAR1.
+    if (!fWidth || !fHeight || !fRowBytes || info.v_depth != 32 ||
+        UInt64(fWidth) * 4 > fRowBytes || UInt64(fWidth) * 4 > 0xffffffffULL) {
+        IOLog("NVDisplay: unusable console %ux%u depth %lu rowBytes %u\n", fWidth, fHeight,
+              static_cast<unsigned long>(info.v_depth), fRowBytes);
         return false;
     }
+    const UInt64 visible64 = UInt64(fHeight) * fRowBytes;
+    if (!visible64 || visible64 / fHeight != fRowBytes) {
+        IOLog("NVDisplay: console size overflows\n");
+        return false;
+    }
+    const IOByteCount visible = static_cast<IOByteCount>(visible64);
     // 0.8.x: NVGspControl >= 0.131.0 may have resized BAR1 and moved it above
     // DRAM (kext ReBAR; it runs first: Boot KC, we are in the Aux KC). It also
     // re-points the kernel console, so the console base is either inside the
@@ -284,18 +391,24 @@ bool NVDisplay::start(IOService *provider) {
     const IOPhysicalAddress bar1Start = bar1->getPhysicalAddress();
     const IOPhysicalAddress base =
         static_cast<IOPhysicalAddress>(info.v_baseAddr & ~static_cast<IOPhysicalAddress>(3));
-    const IOByteCount visible = static_cast<IOByteCount>(fHeight) * fRowBytes;
     const bool moved = gspPhys && gspBytes && gspPhys != bar1Start;
-    if (moved && base >= gspPhys && base + visible <= gspPhys + gspBytes) {
+    if (moved && base >= gspPhys && base - gspPhys <= gspBytes &&
+        visible <= gspBytes - (base - gspPhys)) {
         IODeviceMemory *nb = IODeviceMemory::withRange(gspPhys, gspBytes);
         fAperture = nb ? IODeviceMemory::withSubRange(nb, base - gspPhys, visible) : nullptr;
         OSSafeReleaseNULL(nb);
         IOLog("NVDisplay: BAR1 moved by NVGspControl to 0x%llx, console at +0x%llx\n",
               static_cast<unsigned long long>(gspPhys), static_cast<unsigned long long>(base - gspPhys));
-    } else if (base >= bar1Start && base + visible <= bar1Start + bar1->getLength()) {
+    } else if (base >= bar1Start && base - bar1Start <= bar1->getLength() &&
+               visible <= bar1->getLength() - (base - bar1Start)) {
         if (moved) {
             // BAR1 moved but the console was not re-pointed: follow it here
             const IOPhysicalAddress off = base - bar1Start;
+            if (off > gspBytes || visible > gspBytes - off ||
+                gspPhys + off < gspPhys) {
+                IOLog("NVDisplay: moved BAR1 does not contain console\n");
+                return false;
+            }
             IODeviceMemory *nb = IODeviceMemory::withRange(gspPhys, gspBytes);
             fAperture = nb ? IODeviceMemory::withSubRange(nb, off, visible) : nullptr;
             OSSafeReleaseNULL(nb);
@@ -309,17 +422,56 @@ bool NVDisplay::start(IOService *provider) {
         return false;
     }
     if (!fAperture) return false;
+    }
+haveAperture:
     UInt32 hz = 0;
     if (PE_parse_boot_argn("nvdisp-hz", &hz, sizeof(hz)) && hz >= 24 && hz <= 240) {
         fRefresh = hz;             // explicit override beats the EDID rate
         fRefreshOverride = true;
     }
-    IOLog("NVDisplay: %ux%u rowBytes %u console 0x%llx %u Hz\n", fWidth, fHeight, fRowBytes,
-          static_cast<unsigned long long>(base), fRefresh);
+    IOLog("NVDisplay: %ux%u rowBytes %u %s %u Hz\n", fWidth, fHeight, fRowBytes,
+          fNative615 ? "native615" : "console", fRefresh);
     setProperty("IOFBGammaWidth", kGammaWidth, 32);          // 0.9.4, read by IOFramebuffer::open
     setProperty("IOFBGammaCount", kGammaCount, 32);
     setProperty("IOFBGammaHeaderSize", 0ULL, 32);
+    // 0.9.7 candidate: set before IOFramebuffer::start registers the service;
+    // the OpenGL framework reads this from the framebuffer.
+    if (OSString *gl = OSString::withCString("AppleMetalOpenGLRenderer")) {
+        setProperty("IOGLBundleName", gl);
+        gl->release();
+    }
+    fEdidLock = IOLockAlloc();
+    if (!fEdidLock) {
+        IOLog("NVDisplay: no lock for the EDID cache\n");
+        OSSafeReleaseNULL(fAperture);
+        return false;
+    }
+    // 1.3.0: WindowServer starts about a second after boot and binds each GPU
+    // once, with whatever accelerator exists at that moment. Ours only appears
+    // after the GSP runtime is up (~40 s), so every boot registered this
+    // display with accel 0 and WindowServer composited 4K in software (load
+    // average 23, and the software path had to be taught to present through
+    // the aperture). Hold the framebuffer back until an IOAccelerator is
+    // registered: WindowServer then finds GPU and accelerator together and
+    // composites with Metal and the display pipe. Bounded at 120 s so a GPU
+    // that never comes up still leaves a screen (the old behaviour).
+    {
+        bool haveAccel = false;
+        for (unsigned i = 0; i < 480 && !haveAccel; ++i) {
+            OSDictionary *m = IOService::serviceMatching("IOAccelerator");
+            IOService *a = m ? IOService::copyMatchingService(m) : nullptr;
+            OSSafeReleaseNULL(m);
+            haveAccel = a != nullptr;
+            OSSafeReleaseNULL(a);
+            if (!haveAccel) IOSleep(250);
+        }
+        setProperty("NVDisplay-accelerator-before-publish", haveAccel);
+        IOLog("NVDisplay: accelerator %s before publishing the display\n",
+              haveAccel ? "present" : "absent after 120 s");
+    }
     if (!IOFramebuffer::start(provider)) {
+        IOLockFree(fEdidLock);
+        fEdidLock = nullptr;
         OSSafeReleaseNULL(fAperture);
         return false;
     }
@@ -339,10 +491,15 @@ bool NVDisplay::start(IOService *provider) {
             OSData *copy = OSData::withData(cached);
             if (copy) {
                 parseEdid(copy);
-                fEdid = copy;
-                fEdidCached = true;
-                setProperty("NVDisplay-edid-bytes", copy->getLength(), 32);
-                setProperty("NVDisplay-edid-cached", true);
+                IOLockLock(fEdidLock);
+                if (!fEdid) fEdid = copy;
+                else { copy->release(); copy = nullptr; }
+                IOLockUnlock(fEdidLock);
+                if (copy) {
+                    fEdidCached = true;
+                    setProperty("NVDisplay-edid-bytes", copy->getLength(), 32);
+                    setProperty("NVDisplay-edid-cached", true);
+                }
             }
         }
         OSSafeReleaseNULL(options);
@@ -368,28 +525,38 @@ bool NVDisplay::start(IOService *provider) {
 }
 
 void NVDisplay::stop(IOService *provider) {
-    if (fEdidCall) thread_call_cancel(fEdidCall);
-    if (fVblWatchCall) thread_call_cancel(fVblWatchCall);
+    // 0.180.12: unregister before cancelling the callout so NVGspControl
+    // cannot enter onHotplug after the EDID lock is gone.
+    gspCall("nvgsp-hotplug-register", nullptr, nullptr, nullptr);
+    if (fEdidCall) nvCancelWait(fEdidCall);
+    if (fVblWatchCall) nvCancelWait(fVblWatchCall);
     detachVblank();
     IOFramebuffer::stop(provider);
 }
 
 void NVDisplay::free(void) {
     if (fEdidCall) {
-        thread_call_cancel(fEdidCall);
+        nvCancelWait(fEdidCall);
         thread_call_free(fEdidCall);
         fEdidCall = nullptr;
     }
     if (fVblWatchCall) {
-        thread_call_cancel(fVblWatchCall);
+        nvCancelWait(fVblWatchCall);
         thread_call_free(fVblWatchCall);
         fVblWatchCall = nullptr;
     }
-    OSSafeReleaseNULL(fEdid);
     if (fCursorBuf) { IOFree(fCursorBuf, 64 * 64 * 4 * 2); fCursorBuf = nullptr; }
-    if (fEdidInfo) {
-        IOFree(fEdidInfo, sizeof(*fEdidInfo));
+    if (fEdidLock) {
+        IOLockLock(fEdidLock);
+        OSData *old = fEdid;
+        nvedid::Info *oldInfo = fEdidInfo;
+        fEdid = nullptr;
         fEdidInfo = nullptr;
+        IOLockUnlock(fEdidLock);
+        OSSafeReleaseNULL(old);
+        if (oldInfo) IOFree(oldInfo, sizeof(*oldInfo));
+        IOLockFree(fEdidLock);
+        fEdidLock = nullptr;
     }
     detachVblank();
     OSSafeReleaseNULL(fAperture);
@@ -416,7 +583,11 @@ void NVDisplay::evictIondrv() {
 }
 
 bool NVDisplay::fetchEdid() {
-    if (fEdid) return true;
+    if (!fEdidLock) return false;
+    IOLockLock(fEdidLock);
+    const bool already = fEdid != nullptr;
+    IOLockUnlock(fEdidLock);
+    if (already) return true;
     OSDictionary *match = serviceMatching("NVGspControl");
     IOService *gsp = match ? copyMatchingService(match) : nullptr;
     OSSafeReleaseNULL(match);
@@ -429,14 +600,19 @@ bool NVDisplay::fetchEdid() {
         edid->retain();
         // fetchEdid runs from start, the EDID thread_call and IOFramebuffer
         // callbacks; publish once.
-        if (OSCompareAndSwapPtr(nullptr, edid, reinterpret_cast<void * volatile *>(&fEdid)))
-            setProperty("NVDisplay-edid-bytes", edid->getLength(), 32);
-        else
-            edid->release();
+        IOLockLock(fEdidLock);
+        bool published = false;
+        if (!fEdid) { fEdid = edid; published = true; }
+        else edid->release();
+        IOLockUnlock(fEdidLock);
+        if (published) setProperty("NVDisplay-edid-bytes", edid->getLength(), 32);
     }
     OSSafeReleaseNULL(eo);
     OSSafeReleaseNULL(gsp);
-    return fEdid != nullptr;
+    IOLockLock(fEdidLock);
+    const bool have = fEdid != nullptr;
+    IOLockUnlock(fEdidLock);
+    return have;
 }
 
 static void dictSetNumber(OSDictionary *dict, const char *key, UInt64 value) {
@@ -447,17 +623,29 @@ static void dictSetNumber(OSDictionary *dict, const char *key, UInt64 value) {
 }
 
 void NVDisplay::parseEdid(OSData *edid) {
-    if (fEdidInfo || !edid) return;
+    if (!edid || !fEdidLock) return;
+    IOLockLock(fEdidLock);
+    const bool have = fEdidInfo != nullptr;
+    IOLockUnlock(fEdidLock);
+    if (have) return;
     nvedid::Info *info = static_cast<nvedid::Info *>(IOMalloc(sizeof(nvedid::Info)));
     if (!info) return;
     const bool ok = nvedid::parse(static_cast<const uint8_t *>(edid->getBytesNoCopy()),
                                   static_cast<uint32_t>(edid->getLength()), *info);
     setProperty("NVDisplay-edid-parsed", ok);
-    if (!ok || !OSCompareAndSwapPtr(nullptr, info,
-                                    reinterpret_cast<void * volatile *>(&fEdidInfo))) {
+    if (!ok) {
         IOFree(info, sizeof(nvedid::Info));
         return;
     }
+    // Publish and build the debug view under the same lock: a hotplug may not
+    // free the table while these readers still use it.
+    IOLockLock(fEdidLock);
+    if (fEdidInfo) {
+        IOLockUnlock(fEdidLock);
+        IOFree(info, sizeof(nvedid::Info));
+        return;
+    }
+    fEdidInfo = info;
     // Debug view of the timing table.
     OSArray *modes = OSArray::withCapacity(info->count);
     for (UInt32 i = 0; modes && i < info->count; ++i) {
@@ -507,7 +695,7 @@ void NVDisplay::parseEdid(OSData *edid) {
         setProperty("NVDisplay-edid-info", sum);
         sum->release();
     }
-    const nvedid::Timing *native = nativeTiming();
+    const nvedid::Timing *native = nativeTimingLocked();
     if (native)
         IOLog("NVDisplay: EDID \"%s\" native %ux%u pclk %u kHz total %ux%u %u mHz\n",
               info->name, native->hActive, native->vActive, native->pixelClockKHz,
@@ -517,13 +705,15 @@ void NVDisplay::parseEdid(OSData *edid) {
         IOLog("NVDisplay: EDID \"%s\" has no detailed timing for %ux%u\n", info->name,
               fWidth, fHeight);
     setProperty("NVDisplay-edid-native-timing", native != nullptr);
-    pickDefaultMode();
+    pickDefaultModeLocked();
+    IOLockUnlock(fEdidLock);
 }
 
 // The EDID detailed timing for the firmware mode's active size (preferred
 // DTD first). Matched on active size only: we cannot yet read the head's
 // programmed timing back, and the GOP drives the panel's preferred timing.
-const nvedid::Timing *NVDisplay::nativeTiming() {
+// Caller holds fEdidLock.
+const nvedid::Timing *NVDisplay::nativeTimingLocked() {
     nvedid::Info *info = fEdidInfo;
     if (!info) return nullptr;
     const int32_t idx = nvedid::findDetailed(*info, fBootW, fBootH);
@@ -531,38 +721,68 @@ const nvedid::Timing *NVDisplay::nativeTiming() {
 }
 
 static constexpr IODisplayModeID kNVExtraModeBase = 0x100;
+// 0.180.13: the scan-out allocator in NVGspControl can take 8K surfaces.
+// 30 bpp on 4-lane HBR3 tops out near 864 MHz; DSC modes above that are not
+// advertised until the DSC path is validated.
+static constexpr UInt32 kNVMaxModeWidth = 8192, kNVMaxModeHeight = 4320;
+static constexpr UInt32 kNVMaxModePclkHz = 864000;
 
-bool NVDisplay::extraModeOK(uint32_t index) {
+// Caller holds fEdidLock.
+bool NVDisplay::extraModeOKLocked(uint32_t index) {
     nvedid::Info *info = fEdidInfo;
     if (!info || index >= info->count) return false;
     const nvedid::Timing &t = info->timings[index];
     if (!(t.flags & nvedid::kFlagDetailed) || (t.flags & nvedid::kFlagInterlaced)) return false;
-    if (t.hActive > fBootW || t.vActive > fBootH || t.hActive <= 60) return false;
-    // 30 bpp on HBR2 x4 caps the clock at 576 MHz; the VPLL post divider
-    // (P <= 15, VCO >= 1.4 GHz) floors it at ~93.4 MHz.
-    if (t.pixelClockKHz < 93400 || t.pixelClockKHz >= 576000) return false;
-    const nvedid::Timing *native = nativeTiming();
+    if (t.hActive > kNVMaxModeWidth || t.vActive > kNVMaxModeHeight || t.hActive <= 60)
+        return false;
+    // The VPLL post divider (P <= 15, VCO >= 1.4 GHz) floors the clock at
+    // ~93.4 MHz; HBR3 4-lane 30 bpp is the ceiling until DSC is enabled.
+    if (t.pixelClockKHz < 93400 || t.pixelClockKHz >= kNVMaxModePclkHz) return false;
+    const nvedid::Timing *native = nativeTimingLocked();
     return &t != native;
 }
 
-const nvedid::Timing *NVDisplay::modeTiming(IODisplayModeID mode) {
-    if (nvModeOK(mode)) return nativeTiming();
+// Caller holds fEdidLock.
+const nvedid::Timing *NVDisplay::modeTimingLocked(IODisplayModeID mode) {
+    if (nvModeOK(mode)) return nativeTimingLocked();
     if (mode < kNVExtraModeBase) return nullptr;
     const uint32_t i = static_cast<uint32_t>(mode - kNVExtraModeBase);
-    return extraModeOK(i) ? &fEdidInfo->timings[i] : nullptr;
+    return extraModeOKLocked(i) ? &fEdidInfo->timings[i] : nullptr;
+}
+
+// Copy the timing out while the table cannot be replaced. The old code
+// returned a pointer into fEdidInfo and callers used it after the lock-free
+// window, which a concurrent hotplug could free.
+bool NVDisplay::timingForMode(IODisplayModeID mode, nvedid::Timing *out) {
+    if (!out || !fEdidLock) return false;
+    IOLockLock(fEdidLock);
+    const nvedid::Timing *t = modeTimingLocked(mode);
+    if (t) *out = *t;
+    IOLockUnlock(fEdidLock);
+    return t != nullptr;
 }
 
 void NVDisplay::saveEdidToNvram(OSData *edid) {
-    if (!edid) return;
+    // 0.180.12: take a reference while fEdidLock is held; onHotplug may clear
+    // fEdid between fetchEdid and the property write.
+    OSData *keep = nullptr;
+    if (fEdidLock) {
+        IOLockLock(fEdidLock);
+        keep = edid ? edid : fEdid;
+        if (keep) keep->retain();
+        IOLockUnlock(fEdidLock);
+    }
+    if (!keep) return;
     IORegistryEntry *options = IORegistryEntry::fromPath("/options", gIODTPlane);
     if (options) {
         OSData *cur = OSDynamicCast(OSData, options->getProperty("nvdisp-edid"));
-        if (!cur || !cur->isEqualTo(edid)) {
-            const bool ok = options->setProperty("nvdisp-edid", edid);
+        if (!cur || !cur->isEqualTo(keep)) {
+            const bool ok = options->setProperty("nvdisp-edid", keep);
             setProperty("NVDisplay-edid-saved", ok);
         }
         options->release();
     }
+    keep->release();
 }
 
 void NVDisplay::edidCallout(thread_call_param_t param, thread_call_param_t) {
@@ -580,17 +800,22 @@ void NVDisplay::edidCallout(thread_call_param_t param, thread_call_param_t) {
         OSSafeReleaseNULL(match);
         OSObject *lo = gsp ? gsp->copyProperty("NVGspControl-edid") : nullptr;
         OSData *live = OSDynamicCast(OSData, lo);
-        const bool same = live && live->getLength() >= 128 && self->fEdid && self->fEdid->isEqualTo(live);
+        IOLockLock(self->fEdidLock);
+        const bool same = live && live->getLength() >= 128 && self->fEdid &&
+                          self->fEdid->isEqualTo(live);
+        IOLockUnlock(self->fEdidLock);
         const bool haveLive = live && live->getLength() >= 128;
         OSSafeReleaseNULL(lo);   // only same/haveLive are used below
         if (haveLive) {
             self->setProperty("NVDisplay-edid-cache-hit", same);
             self->fEdidCached = false;
             if (!same) {
+                IOLockLock(self->fEdidLock);
                 OSData *old = self->fEdid;
                 nvedid::Info *oldInfo = self->fEdidInfo;
                 self->fEdid = nullptr;
                 self->fEdidInfo = nullptr;
+                IOLockUnlock(self->fEdidLock);
                 OSSafeReleaseNULL(old);
                 if (oldInfo) IOFree(oldInfo, sizeof(nvedid::Info));
                 self->fEdidFired = false;
@@ -627,7 +852,7 @@ void NVDisplay::edidCallout(thread_call_param_t param, thread_call_param_t) {
     }
     if (self->fetchEdid()) {
         self->fEdidFired = true;
-        self->saveEdidToNvram(self->fEdid);
+        self->saveEdidToNvram(nullptr);
         // Connection changed: IOFramebuffer re-probes and IODisplay re-reads
         // the EDID through getDDCBlock.
         self->setProperty("NVDisplay-edid-connect-fired", self->fConnProc != nullptr);
@@ -641,34 +866,47 @@ void NVDisplay::edidCallout(thread_call_param_t param, thread_call_param_t) {
     }
 }
 
-// 0.6.3: vblank watchdog — runs every 500 ms forever. If the client
-// enabled vblank but the GSP count has not advanced for 2+ ticks (dead GSP
-// after S3, slow re-boot), deliver a synthetic tick so CoreDisplay's VBL
-// waits complete instead of wedging WindowServer into a watchdog panic.
+// 0.6.3: vblank watchdog. 0.180.150: the MSI display vector is not armed at
+// the native615 phase-27 runtime (the GSP interrupt table never arrives), so
+// real head-0 vblanks do not reach onVblank. The old 500 ms watchdog then
+// synthesized only 2 ticks/s and the whole UI ran at that pace. Run at 60 Hz
+// and synthesize whenever the real count did not advance: with real vblanks
+// the count advances every tick and nothing is synthesized; without them
+// CoreDisplay gets a steady 60 Hz tick instead of wedging or lagging.
 // Real vblanks automatically preempt (the stall counter resets on any
-// advance); during S3 the callout is frozen with the CPU, so no ticks
-// fire while asleep.
+// advance); during S3 the callout is frozen with the CPU, so no ticks fire.
 void NVDisplay::vblWatchCallout(thread_call_param_t param, thread_call_param_t) {
     NVDisplay *self = static_cast<NVDisplay *>(param);
     const UInt32 count = self->fVblCount;
-    if (self->fVblEnabled && self->fVblProc) {
-        if (count == self->fVblWatchLast) {
-            if (++self->fVblWatchStall >= 2) {
-                self->fVblProc(self->fVblTarget, self->fVblRef);
-                ++self->fVblSynthetic;
-                self->setProperty("NVDisplay-vblank-synthetic", self->fVblSynthetic, 32);
-            }
-        } else {
-            self->fVblWatchLast = count;
-            self->fVblWatchStall = 0;
-        }
+    if (count == self->fVblWatchLast) {
+        if (self->deliverVbl() && (++self->fVblSynthetic & 63) == 1)
+            self->setProperty("NVDisplay-vblank-synthetic", self->fVblSynthetic, 32);
     } else {
         self->fVblWatchLast = count;
         self->fVblWatchStall = 0;
     }
-    uint64_t deadline = 0;
-    clock_interval_to_deadline(500, kMillisecondScale, &deadline);
-    thread_call_enter_delayed(self->fVblWatchCall, deadline);
+    // 1.4.1: "now + 16 ms" ticked at ~60.8 Hz against a 59.997 Hz mode, so
+    // WindowServer's frame schedule slipped a whole frame about once a second
+    // and every slip cost ~240 ms without a frame (ktrace, ca_spin). Tick on
+    // absolute deadlines at the mode's own refresh instead.
+    if (!self->fVblPeriodAbs || (self->fVblTicks++ & 1023) == 0) self->updateVblPeriod();
+    const uint64_t now = mach_absolute_time();
+    self->fVblNextAbs += self->fVblPeriodAbs;
+    if (self->fVblNextAbs <= now) self->fVblNextAbs = now + self->fVblPeriodAbs;   // late (sleep, stall): resync
+    thread_call_enter_delayed(self->fVblWatchCall, self->fVblNextAbs);
+}
+
+void NVDisplay::updateVblPeriod() {
+    IODisplayModeInformation info{};
+    UInt64 ns = 1000000000ULL / 60;
+    if (getInformationForDisplayMode(fCurMode, &info) == kIOReturnSuccess && info.refreshRate >= (24U << 16))
+        ns = (1000000000ULL << 16) / info.refreshRate;
+    uint64_t abs = 0;
+    nanoseconds_to_absolutetime(ns, &abs);
+    if (abs != fVblPeriodAbs) {
+        fVblPeriodAbs = abs;
+        setProperty("NVDisplay-vblank-period-ns", ns, 32);
+    }
 }
 
 bool NVDisplay::hasDDCConnect(IOIndex connectIndex) {
@@ -681,9 +919,14 @@ IOReturn NVDisplay::getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IOSele
         !blockNumber || !fetchEdid())
         return kIOReturnUnsupported;
     const size_t off = (blockNumber - 1) * 128;
-    if (off + 128 > fEdid->getLength()) return kIOReturnUnsupported;
+    IOLockLock(fEdidLock);
+    if (!fEdid || off + 128 > fEdid->getLength()) {
+        IOLockUnlock(fEdidLock);
+        return kIOReturnUnsupported;
+    }
     const size_t n = *length < 128 ? *length : 128;
     memcpy(data, static_cast<const UInt8 *>(fEdid->getBytesNoCopy()) + off, n);
+    IOLockUnlock(fEdidLock);
     *length = n;
     return kIOReturnSuccess;
 }
@@ -700,10 +943,25 @@ void NVDisplay::onVblank(void *ref, UInt32 count, UInt64) {
     // alone never picked it up in 0.2.0).
     if (!self->fEdidFired && self->fEdidCall && (count & 127) == 0)
         thread_call_enter(self->fEdidCall);
-    if (self->fVblEnabled && self->fVblProc) {
-        self->fVblProc(self->fVblTarget, self->fVblRef);
-        ++self->fVblDelivered;
+    if (self->deliverVbl()) ++self->fVblDelivered;
+}
+
+// 1.4.0: every enabled VBL client, from the GSP vblank or the watchdog
+bool NVDisplay::deliverVbl() {
+    bool any = false;
+    for (VblClient &c : fVbl) {
+        const IOFBInterruptProc proc = c.proc;
+        if (!c.enabled || !proc) continue;
+        proc(c.target, c.ref);
+        any = true;
     }
+    return any;
+}
+
+NVDisplay::VblClient *NVDisplay::vblClient(void *interruptRef) {
+    for (VblClient &c : fVbl)
+        if (interruptRef == &c) return &c;
+    return nullptr;
 }
 
 void NVDisplay::onHotplug(void *ref, UInt32 plugMask, UInt32 unplugMask) {
@@ -713,12 +971,25 @@ void NVDisplay::onHotplug(void *ref, UInt32 plugMask, UInt32 unplugMask) {
     self->setProperty("NVDisplay-hotplug-last", (UInt64(plugMask) << 32) | unplugMask, 64);
     // Drop the cached EDID; the callout re-fetches it (NVGspControl re-read it
     // over AUX before calling us on a plug) and raises the connect interrupt.
+    // Swap under fEdidLock so a reader cannot hold the old timing table while
+    // it is freed.
+    IOLockLock(self->fEdidLock);
+    nvedid::Info *oldInfo = self->fEdidInfo;
+    self->fEdidInfo = nullptr;
     OSData *old = self->fEdid;
     self->fEdid = nullptr;
+    IOLockUnlock(self->fEdidLock);
+    if (oldInfo) IOFree(oldInfo, sizeof(nvedid::Info));
     OSSafeReleaseNULL(old);
     self->fEdidFired = false;
     self->fEdidPolls = 0;
     if (self->fEdidCall) thread_call_enter(self->fEdidCall);
+    // 0.180.147: an unplug leaves no EDID to fetch, so edidCallout never gets
+    // past the failed fetch to raise the connect interrupt. Tell the display
+    // pipe now so WindowServer drops the display instead of scanning out to a
+    // dead link (the old screen stayed "online" until the next replug).
+    if (unplugMask && !plugMask && self->fConnProc)
+        self->fConnProc(self->fConnTarget, self->fConnRef);
 }
 
 void NVDisplay::registerHotplug() {
@@ -775,14 +1046,21 @@ IOReturn NVDisplay::registerForInterruptType(IOSelect interruptType, IOFBInterru
     if (interruptType != kIOFBVBLInterruptType)
         return IOFramebuffer::registerForInterruptType(interruptType, proc, target, ref,
                                                         interruptRef);
-    if (fVblProc) return kIOReturnBusy;
-    fVblTarget = target;
-    fVblRef = ref;
-    fVblEnabled = true;
-    fVblProc = proc;
-    if (interruptRef) *interruptRef = &fVblProc;
+    VblClient *c = nullptr;     // first free slot
+    int n = 0;
+    for (VblClient &e : fVbl) {
+        if (e.proc) ++n;
+        else if (!c) c = &e;
+    }
+    if (!c || !proc) return kIOReturnBusy;
+    c->target = target;
+    c->ref = ref;
+    c->proc = proc;
+    c->enabled = true;          // as 1.3.0: delivered until setInterruptState(0)
+    if (interruptRef) *interruptRef = c;
     attachVblank();
     setProperty("NVDisplay-vbl-registered", true);
+    setProperty("NVDisplay-vbl-clients", n + 1, 32);
     return kIOReturnSuccess;
 }
 
@@ -791,17 +1069,19 @@ IOReturn NVDisplay::unregisterInterrupt(void *interruptRef) {
         fConnProc = nullptr;
         return kIOReturnSuccess;
     }
-    if (interruptRef != &fVblProc) return IOFramebuffer::unregisterInterrupt(interruptRef);
-    fVblEnabled = false;
-    fVblProc = nullptr;
+    VblClient *c = vblClient(interruptRef);
+    if (!c) return IOFramebuffer::unregisterInterrupt(interruptRef);
+    c->enabled = false;
+    c->proc = nullptr;
     return kIOReturnSuccess;
 }
 
 IOReturn NVDisplay::setInterruptState(void *interruptRef, UInt32 state) {
     if (interruptRef == &fConnProc) return kIOReturnSuccess;
-    if (interruptRef != &fVblProc) return IOFramebuffer::setInterruptState(interruptRef, state);
-    fVblEnabled = state != 0;
-    if (fVblEnabled) attachVblank();   // NVGspControl may have come up late
+    VblClient *c = vblClient(interruptRef);
+    if (!c) return IOFramebuffer::setInterruptState(interruptRef, state);
+    c->enabled = state != 0;
+    if (c->enabled) attachVblank();    // NVGspControl may have come up late
     return kIOReturnSuccess;
 }
 
@@ -840,6 +1120,22 @@ IOReturn NVDisplay::enableController(void) {
     return kIOReturnSuccess;
 }
 
+// 1.1.0: type 2 is the IOAccelerator2D client (see NVDisplay2DClient).
+IOReturn NVDisplay::newUserClient(task_t owningTask, void *securityID, UInt32 type,
+                                  IOUserClient **handler) {
+    if (type != 2 || !handler) return IOFramebuffer::newUserClient(owningTask, securityID, type, handler);
+    NVDisplay2DClient *uc = OSTypeAlloc(NVDisplay2DClient);
+    if (!uc) return kIOReturnNoMemory;
+    if (!uc->initWithTask(owningTask, securityID, type, nullptr) || !uc->attach(this) || !uc->start(this)) {
+        uc->detach(this);
+        uc->release();
+        return kIOReturnError;
+    }
+    IOLog("NVDisplay: 2D client opened (type 2)\n");
+    *handler = uc;
+    return kIOReturnSuccess;
+}
+
 bool NVDisplay::isConsoleDevice(void) { return true; }
 
 IODeviceMemory *NVDisplay::getApertureRange(IOPixelAperture aperture) {
@@ -856,7 +1152,7 @@ IODeviceMemory *NVDisplay::getVRAMRange(void) {
 
 const char *NVDisplay::getPixelFormats(void) { return IO32BitDirectPixels "\0\0"; }
 
-void NVDisplay::pickDefaultMode() {
+void NVDisplay::pickDefaultModeLocked() {
     fDefaultMode = 0;
     IORegistryEntry *options = IORegistryEntry::fromPath("/options", gIODTPlane);
     OSData *d = options ? OSDynamicCast(OSData, options->getProperty("nvdisp-default-mode")) : nullptr;
@@ -871,7 +1167,7 @@ void NVDisplay::pickDefaultMode() {
     while (*p >= '0' && *p <= '9') h = h * 10 + static_cast<UInt32>(*p++ - '0');
     for (uint32_t i = 0; i < fEdidInfo->count; ++i) {
         const nvedid::Timing &t = fEdidInfo->timings[i];
-        if (extraModeOK(i) && t.hActive == w && t.vActive == h) {
+        if (extraModeOKLocked(i) && t.hActive == w && t.vActive == h) {
             fDefaultMode = kNVExtraModeBase + static_cast<IODisplayModeID>(i);
             break;
         }
@@ -881,31 +1177,39 @@ void NVDisplay::pickDefaultMode() {
 
 IOItemCount NVDisplay::getDisplayModeCount(void) {
     IOItemCount n = 1;
+    if (!fEdidLock || fNative615) return n;   // 0.10.0: native615 runs one mode
+    IOLockLock(fEdidLock);
     nvedid::Info *info = fEdidInfo;
-    for (uint32_t i = 0; info && i < info->count; ++i) n += extraModeOK(i);
+    for (uint32_t i = 0; info && i < info->count; ++i) n += extraModeOKLocked(i);
+    fModeCount = n;
+    IOLockUnlock(fEdidLock);
     return n;
 }
 
 IOReturn NVDisplay::getDisplayModes(IODisplayModeID *allDisplayModes) {
-    if (!allDisplayModes) return kIOReturnBadArgument;
+    if (!allDisplayModes || !fEdidLock) return kIOReturnBadArgument;
+    IOLockLock(fEdidLock);
+    const IOItemCount cap = fNative615 ? 1 : (fModeCount ? fModeCount : 1);
     IOItemCount n = 0;
     allDisplayModes[n++] = kNVDisplayMode;
     nvedid::Info *info = fEdidInfo;
-    for (uint32_t i = 0; info && i < info->count; ++i)
-        if (extraModeOK(i)) allDisplayModes[n++] = kNVExtraModeBase + static_cast<IODisplayModeID>(i);
+    for (uint32_t i = 0; info && i < info->count && n < cap; ++i)
+        if (extraModeOKLocked(i)) allDisplayModes[n++] = kNVExtraModeBase + static_cast<IODisplayModeID>(i);
+    IOLockUnlock(fEdidLock);
     return kIOReturnSuccess;
 }
 
 IOReturn NVDisplay::getInformationForDisplayMode(IODisplayModeID displayMode,
                                                  IODisplayModeInformation *info) {
     if (!info) return kIOReturnBadArgument;
+    nvedid::Timing t{};
+    const bool haveTiming = timingForMode(displayMode, &t);
     if (!nvModeOK(displayMode)) {
-        const nvedid::Timing *t = modeTiming(displayMode);
-        if (!t) return kIOReturnBadArgument;
+        if (!haveTiming) return kIOReturnBadArgument;
         bzero(info, sizeof(*info));
-        info->nominalWidth = t->hActive;
-        info->nominalHeight = t->vActive;
-        info->refreshRate = nvedid::refreshFixed16(*t);
+        info->nominalWidth = t.hActive;
+        info->nominalHeight = t.vActive;
+        info->refreshRate = nvedid::refreshFixed16(t);
         info->maxDepthIndex = 0;
         info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag |
                       (displayMode == fDefaultMode ? kDisplayModeDefaultFlag : 0);
@@ -914,8 +1218,8 @@ IOReturn NVDisplay::getInformationForDisplayMode(IODisplayModeID displayMode,
     bzero(info, sizeof(*info));
     info->nominalWidth = fBootW;
     info->nominalHeight = fBootH;
-    const nvedid::Timing *native = fRefreshOverride ? nullptr : nativeTiming();
-    info->refreshRate = native ? nvedid::refreshFixed16(*native) : (fRefresh << 16);
+    info->refreshRate = (haveTiming && !fRefreshOverride)
+                            ? nvedid::refreshFixed16(t) : (fRefresh << 16);
     info->maxDepthIndex = 0;
     info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeNativeFlag |
                   (fDefaultMode ? 0 : kDisplayModeDefaultFlag);
@@ -924,26 +1228,28 @@ IOReturn NVDisplay::getInformationForDisplayMode(IODisplayModeID displayMode,
 
 IOReturn NVDisplay::getTimingInfoForDisplayMode(IODisplayModeID displayMode,
                                                 IOTimingInformation *info) {
-    if (!info || (!nvModeOK(displayMode) && !modeTiming(displayMode))) return kIOReturnBadArgument;
+    if (!info) return kIOReturnBadArgument;
+    nvedid::Timing t{};
+    const bool haveTiming = timingForMode(displayMode, &t);
+    if (!nvModeOK(displayMode) && !haveTiming) return kIOReturnBadArgument;
     bzero(info, sizeof(*info));
     info->appleTimingID = kIOTimingIDInvalid;   // "timingInvalid": not an Apple constant
-    const nvedid::Timing *t = modeTiming(displayMode);
-    if (!t) return kIOReturnSuccess;            // no EDID yet: no detailed timing
+    if (!haveTiming) return kIOReturnSuccess;   // no EDID yet: no detailed timing
     IODetailedTimingInformationV2 &d = info->detailedInfo.v2;
-    d.pixelClock = static_cast<UInt64>(t->pixelClockKHz) * 1000ULL;
+    d.pixelClock = static_cast<UInt64>(t.pixelClockKHz) * 1000ULL;
     d.minPixelClock = d.pixelClock;
     d.maxPixelClock = d.pixelClock;
-    d.horizontalActive = t->hActive;
-    d.horizontalBlanking = t->hBlank;
-    d.horizontalSyncOffset = t->hSyncOffset;
-    d.horizontalSyncPulseWidth = t->hSyncWidth;
-    d.verticalActive = t->vActive;
-    d.verticalBlanking = t->vBlank;
-    d.verticalSyncOffset = t->vSyncOffset;
-    d.verticalSyncPulseWidth = t->vSyncWidth;
+    d.horizontalActive = t.hActive;
+    d.horizontalBlanking = t.hBlank;
+    d.horizontalSyncOffset = t.hSyncOffset;
+    d.horizontalSyncPulseWidth = t.hSyncWidth;
+    d.verticalActive = t.vActive;
+    d.verticalBlanking = t.vBlank;
+    d.verticalSyncOffset = t.vSyncOffset;
+    d.verticalSyncPulseWidth = t.vSyncWidth;
     // Borders are 0 (bzero); DTD borders are not used by DisplayPort sinks.
-    d.horizontalSyncConfig = (t->flags & nvedid::kFlagHSyncPositive) ? kIOSyncPositivePolarity : 0;
-    d.verticalSyncConfig = (t->flags & nvedid::kFlagVSyncPositive) ? kIOSyncPositivePolarity : 0;
+    d.horizontalSyncConfig = (t.flags & nvedid::kFlagHSyncPositive) ? kIOSyncPositivePolarity : 0;
+    d.verticalSyncConfig = (t.flags & nvedid::kFlagVSyncPositive) ? kIOSyncPositivePolarity : 0;
     d.signalConfig = kIODigitalSignal;
     info->flags = kIODetailedTimingValid;
     return kIOReturnSuccess;
@@ -953,12 +1259,13 @@ UInt64 NVDisplay::getPixelFormatsForDisplayMode(IODisplayModeID, IOIndex) { retu
 
 IOReturn NVDisplay::getPixelInformation(IODisplayModeID displayMode, IOIndex depth,
                                         IOPixelAperture aperture, IOPixelInformation *pixelInfo) {
-    const nvedid::Timing *mt = nvModeOK(displayMode) ? nullptr : modeTiming(displayMode);
-    if ((!nvModeOK(displayMode) && !mt) || depth != 0 || aperture != kIOFBSystemAperture ||
-        !pixelInfo)
+    nvedid::Timing mt{};
+    const bool haveTiming = nvModeOK(displayMode) ? false : timingForMode(displayMode, &mt);
+    if ((!nvModeOK(displayMode) && !haveTiming) || depth != 0 ||
+        aperture != kIOFBSystemAperture || !pixelInfo)
         return kIOReturnBadArgument;
     bzero(pixelInfo, sizeof(*pixelInfo));
-    pixelInfo->bytesPerRow = fRowBytes;
+    pixelInfo->bytesPerRow = haveTiming ? mt.hActive * 4 : fRowBytes;
     pixelInfo->bitsPerPixel = 32;
     pixelInfo->pixelType = kIORGBDirectPixels;
     pixelInfo->componentCount = 3;
@@ -966,8 +1273,8 @@ IOReturn NVDisplay::getPixelInformation(IODisplayModeID displayMode, IOIndex dep
     pixelInfo->componentMasks[0] = 0x00FF0000;
     pixelInfo->componentMasks[1] = 0x0000FF00;
     pixelInfo->componentMasks[2] = 0x000000FF;
-    pixelInfo->activeWidth = mt ? mt->hActive : fBootW;
-    pixelInfo->activeHeight = mt ? mt->vActive : fBootH;
+    pixelInfo->activeWidth = haveTiming ? mt.hActive : fBootW;
+    pixelInfo->activeHeight = haveTiming ? mt.vActive : fBootH;
     const char *src = IO32BitDirectPixels;
     size_t i = 0;
     while (src[i] && i < sizeof(pixelInfo->pixelFormat) - 1) {
@@ -989,25 +1296,27 @@ IOReturn NVDisplay::getCurrentDisplayMode(IODisplayModeID *displayMode, IOIndex 
 // Mode 0/1 back to the firmware timing uses the same path once we left it.
 IOReturn NVDisplay::setDisplayMode(IODisplayModeID displayMode, IOIndex depth) {
     if (depth != 0) return kIOReturnUnsupported;
-    const nvedid::Timing *t = modeTiming(displayMode);
-    if (!nvModeOK(displayMode) && !t) return kIOReturnUnsupported;
+    nvedid::Timing t{};
+    const bool haveTiming = timingForMode(displayMode, &t);
+    if (!nvModeOK(displayMode) && !haveTiming) return kIOReturnUnsupported;
     const bool same = (nvModeOK(displayMode) && nvModeOK(fCurMode)) || displayMode == fCurMode;
+    if (!same && fNative615) return kIOReturnUnsupported;   // 0.10.0: no native615 modeset yet
     if (!same) {
-        if (!t) return kIOReturnUnsupported;   // no EDID timing to go back to
-        UInt32 tv[10] = {t->pixelClockKHz, t->hActive, t->hBlank, t->hSyncOffset, t->hSyncWidth,
-                         t->vActive, t->vBlank, t->vSyncOffset, t->vSyncWidth,
-                         ((t->flags & nvedid::kFlagHSyncPositive) ? 1U : 0U) |
-                         ((t->flags & nvedid::kFlagVSyncPositive) ? 2U : 0U)};
+        if (!haveTiming) return kIOReturnUnsupported;   // no EDID timing to go back to
+        UInt32 tv[10] = {t.pixelClockKHz, t.hActive, t.hBlank, t.hSyncOffset, t.hSyncWidth,
+                         t.vActive, t.vBlank, t.vSyncOffset, t.vSyncWidth,
+                         ((t.flags & nvedid::kFlagHSyncPositive) ? 1U : 0U) |
+                         ((t.flags & nvedid::kFlagVSyncPositive) ? 2U : 0U)};
         UInt32 code = ~0U;
         const IOReturn r = gspCall("nvgsp-set-mode", tv, &code, nullptr);
         setProperty("NVDisplay-setmode-result", static_cast<UInt32>(r), 32);
         setProperty("NVDisplay-setmode-code", code, 32);
         IOLog("NVDisplay: mode 0x%x %ux%u pclk %u kHz -> 0x%x code 0x%x\n",
-              static_cast<unsigned>(displayMode), t->hActive, t->vActive, t->pixelClockKHz,
+              static_cast<unsigned>(displayMode), t.hActive, t.vActive, t.pixelClockKHz,
               r, code);
         if (r != kIOReturnSuccess) return kIOReturnIOError;
-        fWidth = t->hActive;
-        fHeight = t->vActive;
+        fWidth = t.hActive;
+        fHeight = t.vActive;
         setProperty("NVDisplay-mode", (UInt64(fWidth) << 32) | fHeight, 64);
     }
     fCurMode = displayMode;
@@ -1080,11 +1389,40 @@ void NVDisplay::setDpms(bool on) {
 bool NVDisplay::hwCursorAllowed() {
     if (fHwCursor >= 0) return fHwCursor == 1;
     IORegistryEntry *options = IORegistryEntry::fromPath("/options", gIODTPlane);
-    const bool opt = options && options->getProperty("nvdisp-hwcursor");
+    auto optionBool = [](OSObject *o, bool def) -> bool {
+        if (!o) return def;
+        if (OSBoolean *b = OSDynamicCast(OSBoolean, o)) return b->getValue();
+        if (OSNumber *n = OSDynamicCast(OSNumber, o)) return n->unsigned32BitValue() != 0;
+        if (OSData *d = OSDynamicCast(OSData, o))
+            return d->getLength() && (static_cast<const char *>(d->getBytesNoCopy())[0] == '1' ||
+                                      static_cast<const char *>(d->getBytesNoCopy())[0] == 'y' ||
+                                      static_cast<const char *>(d->getBytesNoCopy())[0] == 'Y');
+        if (OSString *s = OSDynamicCast(OSString, o))
+            return s->isEqualTo("1") || s->isEqualTo("yes") || s->isEqualTo("true");
+        return def;
+    };
+    const bool opt = options ? optionBool(options->getProperty("nvdisp-hwcursor"), true) : true;
+    const bool gspGate = options ? optionBool(options->getProperty("nvgsp-cursor"), true) : true;
     OSSafeReleaseNULL(options);
-    fHwCursor = opt ? 1 : 0;
-    setProperty("NVDisplay-hwcursor", fHwCursor == 1);
-    return fHwCursor == 1;
+    if (!opt || !gspGate) {
+        fHwCursor = 0;
+        setProperty("NVDisplay-hwcursor", false);
+        setProperty("NVDisplay-hwcursor-reason", "nvram-disabled");
+        return false;
+    }
+    // 0.180.13: ask the display core to arm the cursor ctxdma before telling
+    // WindowServer a hardware cursor exists. A NotReady result is transient
+    // (display core still initializing); do not cache it.
+    const IOReturn probe = gspCall("nvgsp-cursor-probe", nullptr, nullptr, nullptr);
+    if (probe != kIOReturnSuccess) {
+        setProperty("NVDisplay-hwcursor", false);
+        setProperty("NVDisplay-hwcursor-probe", static_cast<UInt32>(probe), 32);
+        return false;
+    }
+    fHwCursor = 1;
+    setProperty("NVDisplay-hwcursor", true);
+    setProperty("NVDisplay-hwcursor-reason", "probe-ok");
+    return true;
 }
 
 IOReturn NVDisplay::setCursorImage(void *cursorImage) {
@@ -1119,6 +1457,15 @@ IOReturn NVDisplay::setCursorImage(void *cursorImage) {
     // macOS positions the image's top-left (setCursorState), so hotspot 0.
     const IOReturn r = gspCall("nvgsp-cursor-image", fCursorBuf, nullptr, nullptr);
     setProperty("NVDisplay-cursor-image-result", static_cast<UInt32>(r), 32);
+    if (r != kIOReturnSuccess) {
+        // The cursor ctxdma is armed but CONTROL_CURSOR was rejected (or the
+        // display core faulted). Stop advertising a hardware cursor so
+        // WindowServer falls back instead of waiting on this path forever.
+        fHwCursor = 0;
+        setProperty("NVDisplay-hwcursor", false);
+        setProperty("NVDisplay-hwcursor-reason", "image-failed");
+        gspCall("nvgsp-cursor-show", nullptr, nullptr, nullptr);
+    }
     return r;
 }
 
@@ -1209,7 +1556,12 @@ IOReturn NVDisplay::setAttributeForConnection(IOIndex connectIndex, IOSelect att
 // 0.9.4: see the class. Accepts 1 or 3 channels of 8-bit or 16-bit entries,
 // any count (resampled to 1024), records whether it is the identity ramp.
 IOReturn NVDisplay::setGammaTable(UInt32 channelCount, UInt32 dataCount, UInt32 dataWidth, void *data) {
-    if (!data || !dataCount || (channelCount != 1 && channelCount != 3) || !dataWidth || dataWidth > 16)
+    // 0.180.12: the IOFramebuffer entry point does not pass the buffer
+    // length. Reject counts far beyond any real gamma table and check the
+    // 3*count index arithmetic before touching the caller's buffer.
+    if (!data || !dataCount || dataCount > 16384 ||
+        (channelCount != 1 && channelCount != 3) || !dataWidth || dataWidth > 16 ||
+        channelCount > UINT32_MAX / dataCount)
         return kIOReturnBadArgument;
     const bool bytes = dataWidth <= 8;
     const UInt32 maxIn = (1U << dataWidth) - 1;
@@ -1231,7 +1583,21 @@ IOReturn NVDisplay::setGammaTable(UInt32 channelCount, UInt32 dataCount, UInt32 
     ++fGammaSets;
     setProperty("NVDisplay-gamma-sets", fGammaSets, 32);
     setProperty("NVDisplay-gamma-identity", identity);
-    setProperty("NVDisplay-gamma-applied", identity);           // hardware LUT not programmed yet
+    // 0.180.11: upload to the head's OLUT, the identity ramp included so a
+    // nonidentity table can be undone. fGamma is 3 x 1024 entries, R/G/B
+    // contiguous, which is the layout gammaSet expects. gamma-applied now
+    // reports the hardware result instead of just "identity".
+    const IOReturn hw = gspCall("nvgsp-gamma-set", fGamma,
+        reinterpret_cast<void *>(static_cast<uintptr_t>(kGammaCount)), nullptr);
+    setProperty("NVDisplay-gamma-applied", hw == kIOReturnSuccess);
+    setProperty("NVDisplay-gamma-result", static_cast<UInt32>(hw), 32);
+    if (hw == kIOReturnSuccess) {
+        UInt32 status[2] = {0, 0};
+        if (gspCall("nvgsp-gamma-status", status, nullptr, nullptr) == kIOReturnSuccess) {
+            setProperty("NVDisplay-gamma-verified", status[0] != 0);
+            setProperty("NVDisplay-gamma-readback-mismatch", status[1], 32);
+        }
+    }
     return kIOReturnSuccess;
 }
 

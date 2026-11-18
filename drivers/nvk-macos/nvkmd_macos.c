@@ -310,6 +310,10 @@ macos_sync_init(struct vk_device *device, struct vk_sync *sync, uint64_t v)
    s->seq = 0;
    s->signaled = v != 0;
    s->timeline = sync->flags & VK_SYNC_IS_TIMELINE;
+   // Timeline value 0 is reached immediately; an initial value N means N is
+   // the last completed point, not just a boolean "signaled".
+   s->tl_value = v;
+   s->tl_done = v;
    return VK_SUCCESS;
 }
 
@@ -320,6 +324,10 @@ static VkResult
 macos_sync_signal(struct vk_device *device, struct vk_sync *sync, uint64_t v)
 {
    struct nvkmd_macos_sync *s = container_of(sync, struct nvkmd_macos_sync, base);
+   if (s->timeline) {
+      if (v > s->tl_value) s->tl_value = v;
+      s->tl_done = s->tl_value;
+   }
    s->signaled = true;
    return VK_SUCCESS;
 }
@@ -330,6 +338,7 @@ macos_sync_reset(struct vk_device *device, struct vk_sync *sync)
    struct nvkmd_macos_sync *s = container_of(sync, struct nvkmd_macos_sync, base);
    s->signaled = false;
    s->seq = 0;
+   s->tl_value = s->tl_done = 0;
    return VK_SUCCESS;
 }
 
@@ -360,8 +369,10 @@ macos_sync_wait_one(io_connect_t conn, struct nvkmd_macos_sync *s, uint64_t wait
                     enum vk_sync_wait_flags wait_flags, uint64_t abs_timeout_ns)
 {
    for (;;) {
-      if (s->signaled || macos_sync_trivial(s, wait_value) ||
-          (s->timeline && wait_value <= s->tl_done))
+      // A timeline is complete only at the requested point. The old
+      // `signaled` shortcut made a wait for value 10 succeed after value 5.
+      if (s->timeline ? (macos_sync_trivial(s, wait_value) || wait_value <= s->tl_done)
+                      : s->signaled)
          return VK_SUCCESS;
       if (s->seq) {
          if (wait_flags & VK_SYNC_WAIT_PENDING)
@@ -369,7 +380,8 @@ macos_sync_wait_one(io_connect_t conn, struct nvkmd_macos_sync *s, uint64_t wait
          VkResult r = kext_fence_wait(conn, s->engine, s->seq, abs_timeout_ns);
          if (r == VK_SUCCESS) {
             s->signaled = true;
-            s->tl_done = s->tl_value;
+            if (s->timeline) s->tl_done = s->tl_value;
+            if (!s->timeline || wait_value <= s->tl_done) return VK_SUCCESS;
          }
          return r;
       }
@@ -407,7 +419,9 @@ macos_sync_wait_many(struct vk_device *device, uint32_t wait_count,
       for (uint32_t i = 0; i < wait_count; i++) {
          struct nvkmd_macos_sync *s =
             container_of(waits[i].sync, struct nvkmd_macos_sync, base);
-         if (s->signaled || macos_sync_trivial(s, waits[i].wait_value))
+         if (s->timeline ? (macos_sync_trivial(s, waits[i].wait_value) ||
+                            waits[i].wait_value <= s->tl_done)
+                         : s->signaled)
             return VK_SUCCESS;
          if (s->seq) {
             if (wait_flags & VK_SYNC_WAIT_PENDING)
@@ -429,7 +443,13 @@ macos_sync_wait_many(struct vk_device *device, uint32_t wait_count,
          VkResult r = kext_fence_wait_once(conn, e, oldest[e]->seq, slice_us);
          if (r == VK_SUCCESS) {
             oldest[e]->signaled = true;
-            return VK_SUCCESS;
+            if (oldest[e]->timeline) oldest[e]->tl_done = oldest[e]->tl_value;
+            for (uint32_t i = 0; i < wait_count; i++) {
+               struct nvkmd_macos_sync *s =
+                  container_of(waits[i].sync, struct nvkmd_macos_sync, base);
+               if (s->timeline ? waits[i].wait_value <= s->tl_done : s->signaled)
+                  return VK_SUCCESS;
+            }
          }
          if (r != VK_TIMEOUT)
             return r;
@@ -451,15 +471,21 @@ macos_sync_get_value(struct vk_device *device, struct vk_sync *sync, uint64_t *v
    if (!s->signaled && s->seq &&
        kext_fence_wait_once(nvkmd_macos_conn(device), s->engine, s->seq, 0) == VK_SUCCESS)
       s->signaled = true;
-   if (s->signaled)
-      s->tl_done = s->tl_value;
-   *value = s->tl_done;
+   // A timeline may have a CPU signal for a future point; only report the
+   // highest point whose fence (or CPU signal) actually completed.
+   if (s->timeline) {
+      if (s->signaled) s->tl_done = s->tl_value;
+      *value = s->tl_done;
+   } else {
+      *value = s->signaled ? 1 : 0;
+   }
    return VK_SUCCESS;
 }
 
 static const struct vk_sync_type nvkmd_macos_sync_type_template = {
    .size = sizeof(struct nvkmd_macos_sync),
    .features = VK_SYNC_FEATURE_BINARY |
+               VK_SYNC_FEATURE_TIMELINE |
                VK_SYNC_FEATURE_GPU_WAIT |
                VK_SYNC_FEATURE_CPU_WAIT |
                VK_SYNC_FEATURE_CPU_RESET |
@@ -681,6 +707,8 @@ macos_ctx_build_acquires(struct nvkmd_macos_ctx *ctx, struct vk_object_base *log
       if (r != VK_SUCCESS)
          return r;
    }
+   if (!ctx->acq_mem || !ctx->acq_mem->map)
+      return MACOS_ERR(log_obj, VK_ERROR_MEMORY_MAP_FAILED);
    const uint32_t slot = ctx->acq_next++ % NVKMD_MACOS_ACQ_SLOTS;
    if (ctx->acq_slot_seq[slot] &&
        kext_fence_wait(dev->conn, ctx->engine, ctx->acq_slot_seq[slot], UINT64_MAX) != VK_SUCCESS)
@@ -707,7 +735,9 @@ macos_ctx_wait(struct nvkmd_ctx *_ctx, struct vk_object_base *log_obj,
    for (uint32_t i = 0; i < wait_count; i++) {
       struct nvkmd_macos_sync *s =
          container_of(waits[i].sync, struct nvkmd_macos_sync, base);
-      if (s->signaled || macos_sync_trivial(s, waits[i].wait_value) ||
+      if ((s->timeline ? (macos_sync_trivial(s, waits[i].wait_value) ||
+                          waits[i].wait_value <= s->tl_done)
+                       : s->signaled) ||
           (s->seq && s->engine == ctx->engine))
          continue;
       struct nvkmd_macos_pdev *pdev =
@@ -764,6 +794,7 @@ macos_ctx_exec(struct nvkmd_ctx *_ctx, struct vk_object_base *log_obj,
       uint32_t cnt = 1;
       if (IOConnectCallMethod(dev->conn, 21, &engine, 1, seg, n * sizeof(seg[0]),
                               &seq, &cnt, NULL, NULL)) {
+         if (acq_slot != UINT32_MAX) ctx->acq_slot_seq[acq_slot] = 0;
          nvkmd_macos_report_device_lost();
          return MACOS_ERR(log_obj, VK_ERROR_DEVICE_LOST);
       }
@@ -1470,9 +1501,12 @@ nvkmd_macos_try_create_pdev(struct vk_object_base *log_obj,
       pdev->gpu_wait = pdev->sem_va[0] && pdev->sem_va[1];
    pdev->base.bind_align_B = (uint32_t)pdev->bind_gran;
    pdev->sync_type = nvkmd_macos_sync_type_template;
-   pdev->timeline_type = vk_sync_timeline_get_type(&pdev->sync_type);
+   // 0.180.12: one backend type provides both binary and timeline syncs.
+   // Mixing the generic vk_sync_timeline wrapper with nvkmd_macos_sync casts
+   // was a type-size/offset mismatch. A timeline-capable type keeps the
+   // object layout exactly nvkmd_macos_sync.
    pdev->sync_types[0] = &pdev->sync_type;
-   pdev->sync_types[1] = &pdev->timeline_type.sync;
+   pdev->sync_types[1] = NULL;
    pdev->sync_types[2] = NULL;
    pdev->base.sync_types = pdev->sync_types;
    simple_mtx_init(&pdev->va_lock, mtx_plain);

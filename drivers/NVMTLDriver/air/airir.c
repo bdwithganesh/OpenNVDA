@@ -40,7 +40,10 @@ static char *ops_str(const bc_record *r, uint32_t from) {
 }
 
 static uint32_t add_type(air_module *m, air_type t) {
-    m->types = realloc(m->types, (m->ntypes + 1) * sizeof(air_type));
+    if (!m || m->ntypes >= (1u << 20)) return UINT32_MAX;
+    air_type *types = realloc(m->types, (size_t)(m->ntypes + 1) * sizeof(air_type));
+    if (!types) return UINT32_MAX;
+    m->types = types;
     m->types[m->ntypes] = t;
     return m->ntypes++;
 }
@@ -89,8 +92,11 @@ static int read_types(air_module *m, const bc_block *b, char *err, size_t errlen
         case TY_LABEL: t.kind = AT_LABEL; break;
         case TY_METADATA: t.kind = AT_METADATA; break;
         case TY_OPAQUE: t.kind = AT_OPAQUE; t.name = pending_name; pending_name = NULL; break;
-        case TY_INTEGER: t.kind = AT_INT; t.bits = (uint32_t)r->ops[0]; break;
+        case TY_INTEGER:
+            if (!r->nops) FAIL("short integer type record");
+            t.kind = AT_INT; t.bits = (uint32_t)r->ops[0]; break;
         case TY_POINTER:
+            if (!r->nops) FAIL("short pointer type record");
             t.kind = AT_PTR; t.elem = (uint32_t)r->ops[0];
             t.addrspace = r->nops > 1 ? (uint32_t)r->ops[1] : 0;
             break;
@@ -98,20 +104,24 @@ static int read_types(air_module *m, const bc_block *b, char *err, size_t errlen
             t.kind = AT_PTR; t.elem = ~0u; t.addrspace = r->nops ? (uint32_t)r->ops[0] : 0;
             break;
         case TY_ARRAY: case TY_VECTOR:
+            if (r->nops < 2) FAIL("short array/vector type record");
             t.kind = r->code == TY_ARRAY ? AT_ARRAY : AT_VEC;
             t.count = (uint32_t)r->ops[0]; t.elem = (uint32_t)r->ops[1];
             break;
         case TY_STRUCT_ANON: case TY_STRUCT_NAMED:
             t.kind = AT_STRUCT; t.packed = r->nops ? (int)r->ops[0] : 0;
             t.count = r->nops ? r->nops - 1 : 0;
-            t.members = calloc(t.count + 1, 4);
+            t.members = calloc((size_t)t.count + 1, 4);
+            if (!t.members) FAIL("struct type allocation failed");
             for (uint32_t k = 0; k < t.count; ++k) t.members[k] = (uint32_t)r->ops[k + 1];
             if (r->code == TY_STRUCT_NAMED) { t.name = pending_name; pending_name = NULL; }
             break;
         case TY_FUNCTION:
+            if (r->nops < 2) FAIL("short function type record");
             t.kind = AT_FUNC; t.vararg = (int)r->ops[0]; t.elem = (uint32_t)r->ops[1];
             t.count = r->nops - 2;
-            t.members = calloc(t.count + 1, 4);
+            t.members = calloc((size_t)t.count + 1, 4);
+            if (!t.members) FAIL("function type allocation failed");
             for (uint32_t k = 0; k < t.count; ++k) t.members[k] = (uint32_t)r->ops[k + 2];
             break;
         default:
@@ -124,7 +134,10 @@ static int read_types(air_module *m, const bc_block *b, char *err, size_t errlen
 }
 
 static uint32_t push_value(air_value **vals, uint32_t *n, air_value v) {
-    *vals = realloc(*vals, (*n + 1) * sizeof(air_value));
+    if (!vals || !n || *n == UINT32_MAX) return UINT32_MAX;
+    air_value *p = realloc(*vals, (size_t)(*n + 1) * sizeof(air_value));
+    if (!p) return UINT32_MAX;
+    *vals = p;
     (*vals)[*n] = v;
     return (*n)++;
 }
@@ -140,12 +153,20 @@ static int read_constants(air_module *m, const bc_block *b, air_value **vals, ui
         air_value v = {0};
         v.type = ty;
         switch (r->code) {
-        case CST_SETTYPE: ty = (uint32_t)r->ops[0]; continue;
+        case CST_SETTYPE:
+            if (!r->nops) FAIL("short SETTYPE constant record");
+            ty = (uint32_t)r->ops[0]; continue;
         case CST_NULL: v.kind = AV_CNULL; break;
         case CST_UNDEF: case CST_POISON: v.kind = AV_CUNDEF; break;
-        case CST_INTEGER: v.kind = AV_CINT; v.ival = (uint64_t)sext_vbr(r->ops[0]); break;
-        case CST_WIDE_INTEGER: v.kind = AV_CINT; v.ival = (uint64_t)sext_vbr(r->ops[0]); break;
-        case CST_FLOAT: v.kind = AV_CFP; v.ival = r->ops[0]; break;
+        case CST_INTEGER:
+            if (!r->nops) FAIL("short integer constant record");
+            v.kind = AV_CINT; v.ival = (uint64_t)sext_vbr(r->ops[0]); break;
+        case CST_WIDE_INTEGER:
+            if (r->nops < 1) FAIL("short wide-integer constant record");
+            v.kind = AV_CINT; v.ival = (uint64_t)sext_vbr(r->ops[0]); break;
+        case CST_FLOAT:
+            if (!r->nops) FAIL("short float constant record");
+            v.kind = AV_CFP; v.ival = r->ops[0]; break;
         case CST_AGGREGATE:
             v.kind = AV_CAGG; v.n = r->nops; v.elts = calloc(r->nops + 1, 4);
             for (uint32_t k = 0; k < r->nops; ++k) v.elts[k] = (uint32_t)r->ops[k];
@@ -156,12 +177,17 @@ static int read_constants(air_module *m, const bc_block *b, air_value **vals, ui
             for (uint32_t k = 0; k < r->nops; ++k) v.data[k] = r->ops[k];
             break;
         case CST_CE_CAST:
+            if (r->nops < 3) FAIL("short CE cast record");
             v.kind = AV_CEXPR; v.sub = 1; v.sub2 = (uint32_t)r->ops[0];
-            v.n = 1; v.elts = calloc(2, 4); v.elts[0] = (uint32_t)r->ops[2];
+            v.n = 1; v.elts = calloc(2, 4);
+            if (!v.elts) FAIL("CE cast allocation failed");
+            v.elts[0] = (uint32_t)r->ops[2];
             break;
         case CST_CE_BINOP:
+            if (r->nops < 3) FAIL("short CE binop record");
             v.kind = AV_CEXPR; v.sub = 2; v.sub2 = (uint32_t)r->ops[0];
             v.n = 2; v.elts = calloc(3, 4);
+            if (!v.elts) FAIL("CE binop allocation failed");
             v.elts[0] = (uint32_t)r->ops[1]; v.elts[1] = (uint32_t)r->ops[2];
             break;
         case CST_CE_GEP: case CST_CE_INBOUNDS_GEP: {
@@ -169,6 +195,7 @@ static int read_constants(air_module *m, const bc_block *b, air_value **vals, ui
             uint32_t k = r->nops & 1 ? 1 : 0;
             v.kind = AV_CEXPR; v.sub = 3; v.sub2 = k ? (uint32_t)r->ops[0] : ~0u;
             v.n = (r->nops - k) / 2; v.elts = calloc(v.n + 1, 4);
+            if (!v.elts) FAIL("CE GEP allocation failed");
             for (uint32_t e = 0; e < v.n; ++e) v.elts[e] = (uint32_t)r->ops[k + e * 2 + 1];
             break;
         }
@@ -176,7 +203,10 @@ static int read_constants(air_module *m, const bc_block *b, air_value **vals, ui
             v.kind = AV_BAD; v.sub = r->code;
             break;
         }
-        push_value(vals, n, v);
+        if (push_value(vals, n, v) == UINT32_MAX) {
+            free(v.elts); free(v.data);
+            return -1;
+        }
     }
     (void)m; (void)err; (void)errlen;
     return 0;
@@ -251,32 +281,47 @@ static void set_ops(air_inst *in, uint32_t n, const uint32_t *v) {
 }
 
 static uint32_t gep_result(air_module *m, uint32_t srcty, uint32_t ptrty, const uint32_t *idx,
-                           uint32_t n, const air_value *vals) {
+                           uint32_t n, const air_value *vals, uint32_t nvals) {
     /* ops[0] is the pointer, ops[1] steps over it, ops[2..] go into srcty */
+    if (!m) return 0;
+    /* 16 Nov: the result keeps the base pointer's address space even when the
+     * element type is not found. Struct indices from the function's own
+     * constants block are past m->nvalues; the old check returned type 0
+     * (address space 0), and CoreImage F11H/F11V then read their constant
+     * params through scratch (ld.local at a global address: the GR hang). */
+    const uint32_t as = ptrty < m->ntypes && m->types[ptrty].kind == AT_PTR
+                            ? m->types[ptrty].addrspace : 0;
     uint32_t t = srcty;
-    for (uint32_t k = 2; k < n; ++k) {
+    for (uint32_t k = 2; k < n && t < m->ntypes; ++k) {
         const air_type *tt = &m->types[t];
         if (tt->kind == AT_STRUCT) {
+            if (idx[k] >= nvals) { t = ~0u; break; }
             const uint32_t fi = (uint32_t)vals[idx[k]].ival;
-            t = fi < tt->count ? tt->members[fi] : 0;
-        } else t = tt->elem;
+            t = fi < tt->count && tt->members ? tt->members[fi] : ~0u;
+        } else {
+            t = tt->elem;
+        }
     }
-    const uint32_t as = m->types[ptrty].kind == AT_PTR ? m->types[ptrty].addrspace : 0;
-    return air_type_ptr(m, t, as);
+    return air_type_ptr(m, t < m->ntypes ? t : ~0u, as);
 }
 
 static int read_function(air_module *m, air_function *f, const bc_block *b, char *err, size_t errlen) {
+    if (!m || !f || !b || f->type >= m->ntypes ||
+        m->types[f->type].kind != AT_FUNC || m->types[f->type].count > 1024 ||
+        (m->types[f->type].count && !m->types[f->type].members))
+        return -1;
     /* module values, then arguments */
     f->nvalues = 0;
     f->values = NULL;
-    for (uint32_t i = 0; i < m->nvalues; ++i) push_value(&f->values, &f->nvalues, m->values[i]);
+    for (uint32_t i = 0; i < m->nvalues; ++i)
+        if (push_value(&f->values, &f->nvalues, m->values[i]) == UINT32_MAX) return -1;
     const air_type *ft = &m->types[f->type];
     f->first_arg = f->nvalues;
     f->nargs = ft->count;
     for (uint32_t i = 0; i < ft->count; ++i) {
         air_value v = {0};
         v.kind = AV_ARG; v.type = ft->members[i]; v.ival = i;
-        push_value(&f->values, &f->nvalues, v);
+        if (push_value(&f->values, &f->nvalues, v) == UINT32_MAX) return -1;
     }
     fnstate s = {f->nvalues};
     uint32_t bb = 0;
@@ -294,6 +339,24 @@ static int read_function(air_module *m, air_function *f, const bc_block *b, char
         fnrd x = {m, f, r, 0, 0};
         air_inst *in = NULL;
         uint32_t t0 = 0, t1 = 0, v[8];
+        // Direct r->ops[] users below need this minimum. Variable-length
+        // records are checked by their own loops/get_vt().
+        uint32_t minOps = 0;
+        switch (r->code) {
+        case FN_BINOP: case FN_UNOP: case FN_FREEZE: case FN_CAST:
+        case FN_VSELECT: case FN_EXTRACTELT: case FN_INSERTELT:
+        case FN_SHUFFLEVEC: case FN_CMP2: case FN_STORE:
+        case FN_EXTRACTVAL: case FN_ATOMICRMW: case FN_ATOMICRMW_OLD:
+        case FN_CMPXCHG: minOps = 1; break;
+        case FN_RET: minOps = 0; break;
+        case FN_DECLAREBLOCKS: case FN_BR: case FN_SWITCH:
+        case FN_PHI: case FN_FENCE: minOps = 1; break;
+        case FN_ALLOCA: case FN_LOAD: minOps = 4; break;
+        case FN_CALL: minOps = 3; break;
+        case FN_GEP: minOps = 2; break;
+        default: break;
+        }
+        if (r->nops < minOps) FAIL("%s: truncated instruction record %u", f->name, r->code);
         switch (r->code) {
         case FN_DECLAREBLOCKS: f->nblocks = (uint32_t)r->ops[0]; continue;
         case FN_BINOP: {
@@ -332,9 +395,10 @@ static int read_function(air_module *m, air_function *f, const bc_block *b, char
             const uint32_t src = (uint32_t)op(&x);
             uint32_t tmp[64], n = 0;
             while (x.i < r->nops && n < 64) tmp[n++] = get_vt(&x, &s, NULL);
+            if (!n) FAIL("%s: GEP without index operands", f->name);
             set_ops(in, n, tmp);
             in->callee_type = src;                    /* source element type */
-            in->type = gep_result(m, src, value_type(&x, tmp[0]), tmp, n, f->values);
+            in->type = gep_result(m, src, value_type(&x, tmp[0]), tmp, n, f->values, f->nvalues);
             break;
         }
         case FN_VSELECT:
@@ -547,9 +611,13 @@ static int read_function(air_module *m, air_function *f, const bc_block *b, char
 }
 
 /* ---- metadata ---- */
-static void add_md(air_module *m, air_md d) {
-    m->md = realloc(m->md, (m->nmd + 1) * sizeof(air_md));
+static int add_md(air_module *m, air_md d) {
+    if (!m || m->nmd >= (1u << 20)) return -1;
+    air_md *p = realloc(m->md, (size_t)(m->nmd + 1) * sizeof(air_md));
+    if (!p) return -1;
+    m->md = p;
     m->md[m->nmd++] = d;
+    return 0;
 }
 
 static int read_metadata(air_module *m, const bc_block *b, char *err, size_t errlen) {
@@ -559,20 +627,27 @@ static int read_metadata(air_module *m, const bc_block *b, char *err, size_t err
         air_md d = {0};
         switch (r->code) {
         case MD_STRINGS: {
+            if (r->nops < 2) FAIL("short metadata strings record");
             const uint32_t count = (uint32_t)r->ops[0], off = (uint32_t)r->ops[1];
-            if (!r->blob || off > r->blob_len) FAIL("bad metadata strings");
+            if (!r->blob || off > r->blob_len || count > (1u << 20))
+                FAIL("bad metadata strings");
             /* lengths: vbr6 in a little bitstream at the start of the blob */
             size_t pos = 0, cpos = off;
+            const size_t blobBits = (size_t)r->blob_len * 8;
             for (uint32_t k = 0; k < count; ++k) {
                 uint64_t len = 0;
                 for (unsigned shift = 0;; shift += 5) {
+                    if (shift >= 64) FAIL("metadata string length overflow");
                     uint32_t c = 0;
-                    for (unsigned bit = 0; bit < 6; ++bit, ++pos)
+                    for (unsigned bit = 0; bit < 6; ++bit, ++pos) {
+                        if (pos >= blobBits) FAIL("metadata string length out of range");
                         c |= (uint32_t)((r->blob[pos >> 3] >> (pos & 7)) & 1) << bit;
+                    }
                     len |= (uint64_t)(c & 31) << shift;
                     if (!(c & 32)) break;
                 }
-                if (cpos + len > r->blob_len) FAIL("metadata string out of range");
+                if (cpos > r->blob_len || len > r->blob_len - cpos)
+                    FAIL("metadata string out of range");
                 air_md s = {0};
                 s.kind = AM_STRING;
                 s.str = dupn(r->blob + cpos, len);
@@ -582,19 +657,24 @@ static int read_metadata(air_module *m, const bc_block *b, char *err, size_t err
             continue;
         }
         case MD_STRING_OLD: d.kind = AM_STRING; d.str = ops_str(r, 0); break;
-        case MD_VALUE: d.kind = AM_VALUE; d.type = (uint32_t)r->ops[0]; d.value = (uint32_t)r->ops[1]; break;
+        case MD_VALUE:
+            if (r->nops < 2) FAIL("short metadata value record");
+            d.kind = AM_VALUE; d.type = (uint32_t)r->ops[0]; d.value = (uint32_t)r->ops[1]; break;
         case MD_NODE: case MD_DISTINCT_NODE:
             d.kind = AM_NODE; d.n = r->nops; d.ops = calloc(r->nops + 1, 4);
             for (uint32_t k = 0; k < r->nops; ++k) d.ops[k] = (int32_t)r->ops[k] - 1;
             break;
         case MD_NAME: free(name); name = ops_str(r, 0); continue;
         case MD_NAMED_NODE: {
-            m->named = realloc(m->named, (m->nnamed + 1) * sizeof(air_named_md));
+            air_named_md *named = realloc(m->named, (size_t)(m->nnamed + 1) * sizeof(air_named_md));
+            if (!named) FAIL("named metadata allocation failed");
+            m->named = named;
             air_named_md *nm = &m->named[m->nnamed++];
             nm->name = name ? name : dupn("", 0);
             name = NULL;
             nm->n = r->nops;
-            nm->ops = calloc(r->nops + 1, 4);
+            nm->ops = calloc((size_t)r->nops + 1, 4);
+            if (!nm->ops) FAIL("named metadata operand allocation failed");
             for (uint32_t k = 0; k < r->nops; ++k) nm->ops[k] = (uint32_t)r->ops[k];
             continue;
         }
@@ -629,11 +709,16 @@ int air_read(const uint8_t *data, size_t len, air_module *m, char *err, size_t e
         goto out;
     }
     /* globals and functions, in record order */
-    uint32_t *bodies = calloc(mod->nrecords + 1, 4), nbodies = 0;
+    uint32_t *bodies = calloc((size_t)mod->nrecords + 1, 4), nbodies = 0;
+    if (!bodies) { snprintf(err, errlen, "module body table allocation failed"); goto out; }
     for (uint32_t i = 0; i < mod->nrecords; ++i) {
         const bc_record *r = &mod->records[i];
-        if (r->code == MOD_VERSION) { m->version = (uint32_t)r->ops[0]; continue; }
+        if (r->code == MOD_VERSION) {
+            if (!r->nops) { snprintf(err, errlen, "short module version"); free(bodies); goto out; }
+            m->version = (uint32_t)r->ops[0]; continue;
+        }
         if (r->code != MOD_GLOBALVAR && r->code != MOD_FUNCTION) continue;
+        if (r->nops < 5) { snprintf(err, errlen, "short module record"); free(bodies); goto out; }
         if (m->version < 2 || !st) { snprintf(err, errlen, "old bitcode (no string table)"); free(bodies); goto out; }
         const uint32_t so = (uint32_t)r->ops[0], sn = (uint32_t)r->ops[1];
         char *nm = so + (uint64_t)sn <= stlen ? dupn(st + so, sn) : dupn("?", 1);

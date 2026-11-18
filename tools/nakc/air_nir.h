@@ -59,6 +59,8 @@ typedef struct {
                                       i-th gets VARYING_SLOT_VAR0 + i in both stages */
     uint32_t tess_spacing;         /* post-tessellation vertex: 0 equal, 1 fractional odd, 2 fractional even */
     uint32_t tess_ccw;             /* 1: counter-clockwise output triangles */
+    uint32_t f16rt;                /* fragment: colour targets (bit n) in a 16-bit float format: float
+                                      outputs round to nearest even there (the ROP truncates) */
     /* compute [[stage_in]] from MTLComputePipelineDescriptor.stageInputDescriptor
      * (nakc args si<attr>=format,offset,buffer  sb<buffer>=stride,step,rate
      * sx=indexType,indexBuffer). MTLAttributeFormat / MTLStepFunction values. */
@@ -73,9 +75,9 @@ typedef struct {
     /* linked functions ([[visible]] ones the shader calls as NAME.MTL_VISIBLE_FN_REF),
      * from nakc args link=NAME@PATH: inlined from their own module */
     uint32_t nlink;
-    const char *link_name[16];
-    air_module *link_mod[16];
-    air_function *link_fn[16];
+    const char *link_name[64];
+    air_module *link_mod[64];
+    air_function *link_fn[64];
 } air_variant;
 
 /* Build the shader for entry point `f` (kernel, vertex or fragment, from its

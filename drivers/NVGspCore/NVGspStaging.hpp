@@ -56,6 +56,16 @@ public:
         return ready_ ? metadata_.busAddress() : 0;
     }
     const WprMeta *metadata() const { return ready_ ? &meta_ : nullptr; }
+    // 0.179.0: point the Booter at an alternate signature image (the GPU
+    // unlock V67 payload) without disturbing the pristine metadata used by a
+    // normal boot. rewriteMetadata() restores the stock signature pointer.
+    bool overrideSignature(uint64_t bus, uint64_t bytes) {
+        if (!ready_ || !bus || !bytes) return false;
+        WprMeta meta = meta_;
+        meta.sysmemAddrOfSignature = bus;
+        meta.sizeOfSignature = bytes;
+        return metadata_.write(0, &meta, sizeof(meta));
+    }
     // Booter/GSP write back into the DMA copy (verified, bootCount); NVIDIA
     // resets them before every bootstrap (kernel_gsp_tu102.c:816), so each
     // boot — incl. the S3 re-boot — re-publishes the pristine metadata.

@@ -5,6 +5,7 @@
 #import <IOKit/IOKitLib.h>
 #import <objc/message.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <os/lock.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -65,13 +66,22 @@ static void gpuMtxInit(void) {
     pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&gGpuMtx, &a);
 }
+static void nv615WaitPending(void);
 void nvGpuLock(void) {
     pthread_once(&gGpuOnce, gpuMtxInit);
     pthread_mutex_lock(&gGpuMtx);
+    nv615WaitPending();   // 0.9.51: nothing touches GPU memory under queued async work
 }
 void nvGpuUnlock(void) { pthread_mutex_unlock(&gGpuMtx); }
 static inline void gpuUnlockAtExit(int *p) { (void)p; nvGpuUnlock(); }
 #define NV_GPU_LOCKED nvGpuLock(); int nvLk_ __attribute__((cleanup(gpuUnlockAtExit), unused)) = 0
+// 0.9.64: the lock without waiting for queued async work. For paths that do
+// not touch memory the queued work may use (mapping new pages at a free VA,
+// bump allocation from a slab's untouched end). CoreAnimation's IOSurface
+// textures and buffers waited for all in-flight GPU work on every creation
+// (nvGr615WaitSeq: 405 of 3705 main-thread samples).
+static void nvGpuLockNoWait(void) { pthread_once(&gGpuOnce, gpuMtxInit); pthread_mutex_lock(&gGpuMtx); }
+#define NV_GPU_LOCKED_NOWAIT nvGpuLockNoWait(); int nvLk_ __attribute__((cleanup(gpuUnlockAtExit), unused)) = 0
 
 // 0.8.17: GPU work that failed on this thread (submit refused, fence never
 // came). The command buffer whose commit saw it reports an error instead of
@@ -104,6 +114,219 @@ static kern_return_t callOn(io_connect_t c, uint32_t sel, const uint64_t *in, ui
                             uint64_t *out, uint32_t *outN, const void *sIn, size_t sInN) {
     return IOConnectCallMethod(c, sel, in, inN, sIn, sInN, out, outN, NULL, NULL);
 }
+
+// 0.9.26: NVMTL_NATIVE615=1 runs this process on an owned native615 GR client
+// (NVGspControl >= 0.180.105, selectors 45-48): its own VAS, a 6 MiB staging
+// allocation (stage + GR batch area), MTLBuffer memory suballocated from 8 MiB
+// allocations, and GR method streams submitted with selector 48, which adds a
+// kernel HOST fence and waits. No copy engine, scratch (slm), VRAM objects or
+// native slabs on this path: those requests fail instead of using the legacy
+// selectors. Closing the process tears the client down in the kernel.
+static bool gN615;
+// 0.9.36: on by default once the kernel's native615 runtime is ready (the
+// legacy selectors are closed then); NVMTL_NATIVE615=0/1 still overrides.
+static bool nvN615KernelReady(void) {
+    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVGspControl"));
+    if (!s) return false;
+    CFTypeRef p = IORegistryEntryCreateCFProperty(s, CFSTR("NVGspControl-native615-ready"), kCFAllocatorDefault, 0);
+    const bool ready = p && CFGetTypeID(p) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)p);
+    if (p) CFRelease(p);
+    IOObjectRelease(s);
+    return ready;
+}
+static bool nvN615Requested(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_NATIVE615");
+        on = e ? atoi(e) != 0 : nvN615KernelReady();
+    }
+    return on;
+}
+bool nvGspNative615(void) { return nvN615Requested(); }
+#define NV615_STAGE_BYTES (6ull << 20)
+// 0.9.29 (kernel 0.180.107: 256 MiB window, 64 MiB allocations, 16 slots):
+// 32 MiB slabs, and a buffer above 32 MiB gets its own allocation (a "slab"
+// whose size is exactly that buffer).
+#define NV615_HEAP_SLAB (32ull << 20)
+// 0.9.40 (kernel 0.180.118: 1 GiB window, 512 MiB allocations, 32 slots)
+#define NV615_BIG_MAX (512ull << 20)
+#define NV615_HEAP_SLABS 30
+typedef struct { uint8_t *cpu; uint64_t va, used, size; uint32_t kind; } NV615Slab;
+// 0.9.34: PTE kind the next heap allocation needs (nvVramAllocKind sets it
+// under the GPU lock): zeta surfaces get their Z kind, colour GENERIC_MEMORY.
+static uint32_t g615ReqKind;
+static NV615Slab g615Slab[NV615_HEAP_SLABS];
+static unsigned g615NSlab;
+// 0.9.27: freed suballocations, reused first fit (a larger span is split)
+typedef struct { uint8_t *cpu; uint64_t va, len; uint32_t kind; } NV615Span;
+static NV615Span g615Free[1024];
+static unsigned g615NFree;
+// CPU address of [va, va+bytes) in staging or a heap slab, else NULL. Every
+// native615 GPU byte is pinned sysmem that this process also maps.
+static uint8_t *nv615WrapCpu(uint64_t va, uint64_t bytes);
+static uint8_t *nv615Cpu(uint64_t va, uint64_t bytes) {
+    if (va >= gVa && bytes <= NV615_STAGE_BYTES && va - gVa <= NV615_STAGE_BYTES - bytes) return gCpu + (va - gVa);
+    for (unsigned i = 0; i < g615NSlab; i++)
+        if (va >= g615Slab[i].va && bytes <= g615Slab[i].size && va - g615Slab[i].va <= g615Slab[i].size - bytes)
+            return g615Slab[i].cpu + (va - g615Slab[i].va);
+    return nv615WrapCpu(va, bytes);   // 0.9.42: wrapped IOSurfaces / NoCopy buffers (CAMetalLayer drawables)
+}
+// 0.9.30: block-linear surfaces on the CPU (no copy engine on native615).
+// GOB = 64 bytes x 8 rows = 512 bytes; a block is 2^ylog GOBs high and
+// 2^zlog deep, blocks laid out x, then y, then z. Inside a GOB the byte
+// offset interleaves x and y bits (see nv615BlOffset).
+// 0.9.39: the zeta kinds lay a GOB out their own way (measured with
+// zeta_probe / stencil_probe on the RTX 4080): gob 1 = Z16 (x[3:0], y0, y1,
+// y2, x4, x5); gob 2 = S8 (8x8 tiles, y2 ^= x3); gob 4 = ZF32_X24S8, planar:
+// GOBs in pairs of 1 KiB (the block's two GOBs, or two blocks side by side
+// when a block is one GOB): depth 256 B each, then stencil 64 B in each
+// second half; 8-byte texels (float, stencil, 3 unused) on the linear side.
+typedef struct { uint32_t rowBytes, rows, depth, ylog, zlog, gob; } NV615Bl;
+static uint64_t nv615BlBytes(const NV615Bl *b) {
+    const uint64_t bw = (b->rowBytes + 63) / 64, bh = (b->rows + (8u << b->ylog) - 1) / (8u << b->ylog);
+    const uint64_t bd = (b->depth + (1u << b->zlog) - 1) / (1u << b->zlog);
+    return bw * bh * bd * (512ull << (b->ylog + b->zlog));
+}
+static inline uint64_t nv615BlOffset(const NV615Bl *b, uint32_t x, uint32_t y, uint32_t z) {
+    const uint32_t blockH = 8u << b->ylog, blockD = 1u << b->zlog;
+    const uint64_t bw = (b->rowBytes + 63) / 64, bh = (b->rows + blockH - 1) / blockH;
+    const uint64_t block = ((uint64_t)(z / blockD) * bh + y / blockH) * bw + x / 64;
+    const uint32_t gob = (z % blockD) * (1u << b->ylog) + (y % blockH) / 8;
+    const uint32_t gx = x % 64, gy = y % 8;
+    // 0.9.32: measured on the RTX 4080 (mtl_bl_probe): x[3:0], y0, y1, x4, y2, x5
+    const uint32_t inner = b->gob == 1 ? (gx & 15) | gy << 4 | ((gx >> 4) & 1) << 7 | ((gx >> 5) & 1) << 8
+                         : b->gob == 2 ? ((gx & 7) | gy << 3 | (gx >> 3) << 6) ^ ((gx >> 3) & 1) << 5
+                         : (gx & 15) | (gy & 1) << 4 | ((gy >> 1) & 1) << 5 | ((gx >> 4) & 1) << 6 |
+                           ((gy >> 2) & 1) << 7 | ((gx >> 5) & 1) << 8;
+    return block * (512ull << (b->ylog + b->zlog)) + (uint64_t)gob * 512 + inner;
+}
+// 0.9.39: NVMTL_ZDUMP=<path>: raw bytes of a GPU-only surface (layout probes)
+void nvDebugDumpVa(uint64_t va, uint64_t bytes, const char *path) {
+    uint8_t *p = nv615Cpu(va, bytes);
+    FILE *f = p ? fopen(path, "wb") : NULL;
+    if (f) { fwrite(p, 1, bytes, f); fclose(f); }
+}
+// Copy widthBytes x height between a linear surface (va, pitch) and a
+// block-linear one at origin (x, y, z). Caller flushed queued GR work.
+static bool nv615BlCopy(bool toBL, uint64_t linVa, uint32_t linPitch, uint64_t blVa, const NV615Bl *b,
+                        uint32_t x, uint32_t y, uint32_t z, uint32_t widthBytes, uint32_t height) {
+    uint8_t *bl = nv615Cpu(blVa, nv615BlBytes(b));
+    uint8_t *lin = nv615Cpu(linVa, (uint64_t)linPitch * (height - 1) + widthBytes);
+    if (!bl || !lin) { NSLog(@"NVMTLGsp: native615 block-linear copy outside mapped memory"); return false; }
+    if (b->gob == 4) {
+        const uint32_t bw = (b->rowBytes + 63) / 64, blockH = 8u << b->ylog;
+        for (uint32_t r = 0; r < height; r++)
+            for (uint32_t i = 0; i < widthBytes; i++) {
+                const uint32_t px = (x + i) / 8, k = (x + i) % 8, py = y + r, gc = px / 8, lx = px % 8, ly = py % 8;
+                uint64_t pair;
+                uint32_t member;
+                if (b->ylog) {
+                    const uint32_t g = (py % blockH) / 8;
+                    pair = ((uint64_t)(py / blockH) * bw + gc) * (512ull << b->ylog) + (g >> 1) * 1024ull;
+                    member = g & 1;
+                } else {
+                    pair = ((uint64_t)(py / 8) * bw + (gc & ~1u)) * 512ull;
+                    member = gc & 1;
+                }
+                uint8_t *q = lin + (uint64_t)r * linPitch + i;
+                if (k > 4) { if (!toBL) *q = 0; continue; }
+                uint8_t *p = bl + pair + member * 256 + (k < 4 ? (lx & 3) * 4 + ly * 16 + (lx >> 2) * 128 + k
+                                                               : 512 + (lx & 3) + ly * 4 + (lx >> 2) * 32);
+                if (toBL) *p = *q; else *q = *p;
+            }
+        return true;
+    }
+    for (uint32_t r = 0; r < height; r++)
+        for (uint32_t i = 0; i < widthBytes; i++) {
+            uint8_t *p = bl + nv615BlOffset(b, x + i, y + r, z), *q = lin + (uint64_t)r * linPitch + i;
+            if (toBL) *p = *q; else *q = *p;
+        }
+    return true;
+}
+// 0.9.30: GPU-only surfaces (nvVramAllocKind) come from the same heap
+// 0.9.46: cpu NULL = a VRAM span (va, size) of PTE kind `kind`
+typedef struct { uint32_t id; uint8_t *cpu; uint64_t va, size; uint32_t kind; } NV615Kind;
+typedef struct { uint64_t va, size; } NV615VSpan;
+static NV615VSpan g615VK[8][256];   // free VRAM spans per PTE kind
+static unsigned g615NVK[8];
+static bool nv615VramTexOn(void);
+static bool nv615VramKindTake(uint32_t kind, uint64_t len, uint64_t *va);
+static void nv615VramKindGive(uint32_t kind, uint64_t va, uint64_t len);
+static NV615Kind g615Kind[2048];
+static unsigned g615NKind;
+static uint32_t g615KindId = 0x615000;
+// 0.9.34: kind = PTE kind for the whole allocation (kernel 0.180.111, 0..7)
+// 0.9.42: the CPU mirror of the client's 1 GiB allocation window. Every
+// kernel allocation is mapped at mirror + (va - window), so buffers adjacent
+// on the GPU are adjacent on the CPU too and freed spans can be merged.
+#define NV615_WINDOW_BYTES (2560ull << 20)   // 0.9.47: kernel 0.180.132 window
+static mach_vm_address_t g615Mirror;
+static uint64_t g615MirrorVa;
+// 0.9.76: native615 maps system memory uncached in the GPU L2 (VOL) unless
+// asked otherwise, so every GPU read of a Shared buffer or an IOSurface was a
+// PCIe round trip: a 4K pass reading 36 uniform words per pixel took 61 ms
+// against 0.16 ms without them, and CoreDisplay's colour pass cost 75 ms a
+// frame. Kernel 0.180.177 maps kind | 0x10 L2-cacheable and gives that
+// client's submissions the host access barrier (L2 sysmem invalidate before,
+// SET_REFERENCE before the fence). Heap slabs and wraps only: the staging
+// object holds the pushbuffers, which the host may fetch ahead of the barrier.
+static int g615SysCached = -1;
+static bool nvSysCachedOn(void) {
+    if (g615SysCached < 0) {
+        const char *e = getenv("NVMTL_SYSMEM_CACHED");
+        struct stat st;
+        g615SysCached = e ? atoi(e) != 0
+                          : (stat("/Library/Preferences/nvmtl-syscached", &st) == 0 && st.st_uid == 0);
+    }
+    return g615SysCached == 1;
+}
+static bool nv615Alloc(io_connect_t c, uint64_t bytes, uint8_t **cpu, uint64_t *va, uint32_t kind) {
+    uint64_t in[2] = {0, bytes | ((uint64_t)(kind & 0x17) << 56)}, out[3] = {0, 0, 0};
+    uint32_t n = 3;
+    kern_return_t kr = callOn(c, 47, in, 2, out, &n, NULL, 0);
+    if (kr && (kind & 0x10)) {   // a kernel before 0.180.177: uncached from now on
+        NSLog(@"NVMTLGsp: L2-cacheable system memory refused (0x%x), uncached", kr);
+        g615SysCached = 0;
+        return nv615Alloc(c, bytes, cpu, va, kind & 7);
+    }
+    if (kr || out[2] != bytes) { NSLog(@"NVMTLGsp: native615 alloc of %llu bytes -> 0x%x", bytes, kr); return false; }
+    mach_vm_address_t a = 0;
+    mach_vm_size_t s = 0;
+    if (!g615Mirror && mach_vm_allocate(mach_task_self(), &g615Mirror, NV615_WINDOW_BYTES, VM_FLAGS_ANYWHERE) == KERN_SUCCESS)
+        g615MirrorVa = out[1] & ~0x1fffffull;   // the first allocation (staging) sits just above the window base
+    kr = KERN_FAILURE;
+    if (g615Mirror && out[1] >= g615MirrorVa && out[1] - g615MirrorVa + bytes <= NV615_WINDOW_BYTES) {
+        a = g615Mirror + (out[1] - g615MirrorVa);
+        if (mach_vm_deallocate(mach_task_self(), a, bytes) == KERN_SUCCESS)
+            kr = IOConnectMapMemory64(c, 0x80615001u + (uint32_t)out[0], mach_task_self(), &a, &s, 0);
+        if (kr) { mach_vm_address_t r = a; mach_vm_allocate(mach_task_self(), &r, bytes, VM_FLAGS_FIXED); }
+    }
+    if (kr) { a = 0; kr = IOConnectMapMemory64(c, 0x80615001u + (uint32_t)out[0], mach_task_self(), &a, &s, kIOMapAnywhere); }
+    if (kr || s != bytes) { NSLog(@"NVMTLGsp: native615 map of slot %llu -> 0x%x", out[0], kr); return false; }
+    *cpu = (uint8_t *)(uintptr_t)a;
+    *va = out[1];
+    return true;
+}
+// 0.8.73: the reset generation of the connection in gConn. A NotReady is only
+// treated as "the client predates a reset" when the kext's counter moved;
+// otherwise every transient NotReady reopened the client (mediaanalysisd
+// reopened 13 times in one second and the GPU stayed wedged).
+static uint32_t gConnReset;
+static uint32_t nvResetCountNow(void) {
+    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVGspControl"));
+    if (!s) return 0;
+    uint32_t v = 0;
+    CFTypeRef p = IORegistryEntryCreateCFProperty(s, CFSTR("NVGspControl-gpu-reset-count"),
+                                                  kCFAllocatorDefault, 0);
+    if (p && CFGetTypeID(p) == CFNumberGetTypeID()) {
+        long long n = 0;
+        CFNumberGetValue((CFNumberRef)p, kCFNumberSInt64Type, &n);
+        v = (uint32_t)n;
+    }
+    if (p) CFRelease(p);
+    IOObjectRelease(s);
+    return v;
+}
 bool nvGspGenerationMatches(uint64_t generation) {
     uint64_t current = 0;
     uint32_t count = 1;
@@ -128,8 +351,12 @@ static bool callMethod(uint32_t sel, const uint64_t *in, uint32_t inN,
     // 0.6.12: after a GPU reset the kext refuses a client from before it
     // (kIOReturnOffline) for good; open a new one, put every object back at
     // its VA and go on, instead of failing every draw until WindowServer
-    // restarts
-    if (kr == kIOReturnOffline && !tEncoding && nvGspRecover(c)) {
+    // restarts. 0.8.72: a client whose reset finished but whose arena/channel
+    // stayed dead answers kIOReturnNotReady forever; treat that as offline too
+    // once the reset is no longer busy (WindowServer went black after this).
+    const bool stuckNotReady = kr == kIOReturnNotReady && !nvResetBusy() &&
+                               nvResetCountNow() != gConnReset;
+    if ((kr == kIOReturnOffline || stuckNotReady) && !tEncoding && nvGspRecover(c)) {
         // The old staging bytes disappeared with the connection. Rebinding
         // resources does not make an already-encoded method stream replayable.
         if (sel != kSelExecSeg) kr = callOn(gConn, sel, in, inN, out, outN, sIn, sInN);
@@ -180,6 +407,68 @@ static void nvGspOwnChannel(io_connect_t c) {
 
 // 6 MiB SYS object (2 MiB-aligned contiguous chunks, bindable) at gVa,
 // mapped into the task
+// 0.9.51: asynchronous submission (kernel 0.180.133 selector 48 flags).
+// The last batch of a command buffer may return right after the kick; the
+// next GPU-lock holder, waitUntilCompleted, status and completed handlers
+// wait for its sequence. NVMTL_ASYNC=0 turns it off.
+static uint32_t g615Pending, g615Completed;
+static bool g615AsyncTail;          // set by the encoder for the final flush
+static int g615AsyncOk = -1;        // kernel accepts flags (-1 unknown)
+static bool g615WaitFailed;
+bool nvGr615AsyncOn(void) {
+    static int on = -1;
+    // 0.9.52: default on (suite84 83/84, mtl4 16/16, 16 parallel, hang -> Error + recovery)
+    if (on < 0) { const char *e = getenv("NVMTL_ASYNC"); on = e ? strcmp(e, "0") != 0 : 1; }
+    return on && g615AsyncOk != 0;
+}
+void nvGr615SetAsyncTail(bool on) { g615AsyncTail = on; }
+uint32_t nvGr615PendingSeq(void) { return g615Pending > g615Completed ? g615Pending : 0; }
+// wait for `seq`; false when the GPU work failed (hang/fault)
+bool nvGr615WaitSeq(uint32_t seq) {
+    if (!seq || (int32_t)(seq - g615Completed) <= 0) return !g615WaitFailed || (int32_t)(seq - g615Completed) <= 0;
+    uint64_t in[3] = {seq, 0, 2}, out[3] = {0, 0, 0};
+    uint32_t n = 3;
+    const kern_return_t kr = callOn(gConn, 48, in, 3, out, &n, NULL, 0);
+    if (kr) {
+        NSLog(@"NVMTLGsp: native615 wait for sequence %u -> 0x%x", seq, kr);
+        g615WaitFailed = true; g615Completed = seq; nvNoteGpuFailure(2);
+        return false;
+    }
+    if ((int32_t)(out[1] - g615Completed) > 0) g615Completed = (uint32_t)out[1];
+    if ((int32_t)(seq - g615Completed) > 0) g615Completed = seq;
+    return true;
+}
+static void nv615WaitPending(void) {
+    if (gN615 && g615Pending && (int32_t)(g615Pending - g615Completed) > 0) nvGr615WaitSeq(g615Pending);
+}
+static bool nv615Submit(uint64_t va, uint32_t words) {
+    uint64_t in[3] = {va, words, 0}, out[3] = {0, 0, 0};
+    uint32_t n = 3;
+    const bool async = g615AsyncTail && nvGr615AsyncOn();
+    g615AsyncTail = false;
+    if (async) {
+        in[2] = 1;
+        const kern_return_t ka = callOn(gConn, 48, in, 3, out, &n, NULL, 0);
+        if (ka == KERN_SUCCESS) { g615AsyncOk = 1; g615Pending = (uint32_t)out[0]; return true; }
+        if (ka == kIOReturnBadArgument && g615AsyncOk < 0) {
+            g615AsyncOk = 0;   // an older kernel: synchronous from now on
+            NSLog(@"NVMTLGsp: native615 async submission unsupported by the kernel");
+        } else { NSLog(@"NVMTLGsp: native615 async submit of %u words -> 0x%x", words, ka); return false; }
+        n = 3;
+    }
+    static int trace = -1;
+    if (trace < 0) trace = getenv("NVMTL_TRACE") != NULL;
+    const uint64_t t0 = trace ? mach_absolute_time() : 0;
+    const kern_return_t kr = callOn(gConn, 48, in, 2, out, &n, NULL, 0);
+    if (kr == KERN_SUCCESS) g615Completed = (uint32_t)out[0];   // synchronous: everything before it is done too
+    if (trace) {
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+        NSLog(@"NVMTL_TRACE native615 submit %u words: %.1f us", words, (double)(mach_absolute_time() - t0) * tb.numer / tb.denom / 1e3);
+    }
+    if (kr) NSLog(@"NVMTLGsp: native615 submit of %u words at 0x%llx -> 0x%x", words, va, kr);
+    return kr == KERN_SUCCESS;
+}
+
 static bool nvGspStaging(io_connect_t c, uint32_t *handle, uint8_t **cpu) {
     uint64_t in[2] = {NVGSP_STAGE_BYTES, 1}, out[2] = {0, 0};
     uint32_t outN = 2;
@@ -204,6 +493,38 @@ static bool nvGspStaging(io_connect_t c, uint32_t *handle, uint8_t **cpu) {
 bool nvGspEnsure(void) {
     NV_GPU_LOCKED;
     if (gCpu) return true;
+    if (nvN615Requested()) {
+        // 0.9.61: sandboxed apps (Safari, iconservicesagent, NotificationCenter)
+        // cannot IOServiceOpen NVGspControl directly: MACF denies it and every
+        // heap allocation then fails. Use the accelerator's 'NVGP' proxy
+        // (IOAccelNVGspSharedClient, an IOAccelSharedUserClient2 that sandboxes
+        // allow) which owns the real NVGspControl client; fall back to the
+        // direct open only for older kexts.
+        io_connect_t c = nvGspOpen();
+        if (!c) { NSLog(@"NVMTLGsp: native615 open failed"); return false; }
+        uint64_t op = 3, out[3] = {0, 0, 0};
+        uint32_t n = 3;
+        kern_return_t kr = callOn(c, 45, &op, 1, out, &n, NULL, 0);
+        // 0.9.41: every client slot taken (or another client mid-operation):
+        // wait for one to free up rather than fail the app, up to 30 s
+        for (int i = 0; kr == kIOReturnBusy && i < 1500; i++) {
+            usleep(20000);
+            n = 3;
+            kr = callOn(c, 45, &op, 1, out, &n, NULL, 0);
+        }
+        uint8_t *cpu = NULL;
+        uint64_t va = 0;
+        if (kr || !nv615Alloc(c, NV615_STAGE_BYTES, &cpu, &va, 0)) {
+            NSLog(@"NVMTLGsp: native615 client create -> 0x%x", kr);
+            IOServiceClose(c);
+            return false;
+        }
+        gN615 = true;
+        gConn = c; gHandle = 0; gCpu = cpu; gVa = va;
+        gConnReset = nvResetCountNow();
+        NSLog(@"NVMTLGsp: native615 client: staging va 0x%llx cpu %p", gVa, gCpu);
+        return true;
+    }
     const io_connect_t c = nvGspOpen();
     if (!c) return false;
     uint32_t handle = 0;
@@ -218,6 +539,7 @@ bool nvGspEnsure(void) {
     // overwrite a live connection while this thread builds its staging.
     nvGspOwnChannel(c);
     gConn = c; gHandle = handle; gCpu = cpu;
+    gConnReset = nvResetCountNow();
     gVa = NVGSP_ARENA_BASE;
     NSLog(@"NVMTLGsp: staging va 0x%llx cpu %p handle %u", gVa, gCpu, gHandle);
     return true;
@@ -241,12 +563,22 @@ bool nvGspValidate(void) {
 // The MTLBuffer wraps the same pages (NoCopy), so CPU and GPU share them.
 #define NVGSP_USER_VA_BASE 0x2C00000000ULL
 #define NVGSP_USER_VA_END  0x2F00000000ULL      // NVK's replay range starts here
-enum { kSelUserMemBind = 33, kMaxUserBufs = 4096 };
+enum { kSelUserMemBind = 33, kMaxUserBufs = 16384, kMaxUFree = 16384 };
 typedef struct { uint8_t *cpu; uint64_t va, size; uint32_t handle, bindFlags; } NVUserBuf;
 static NVUserBuf gBufs[kMaxUserBufs];
 static unsigned gNBufs;
 static uint64_t gUserVa = NVGSP_USER_VA_BASE;
 static os_unfair_lock gHeapLock = OS_UNFAIR_LOCK_INIT;
+static uint8_t *nv615WrapCpu(uint64_t va, uint64_t bytes) {
+    uint8_t *p = NULL;
+    os_unfair_lock_lock(&gHeapLock);
+    for (unsigned i = 0; i < gNBufs && !p; i++)
+        if (gBufs[i].cpu && (gBufs[i].handle & 0x40000000u) && va >= gBufs[i].va && bytes <= gBufs[i].size &&
+            va - gBufs[i].va <= gBufs[i].size - bytes)
+            p = gBufs[i].cpu + (va - gBufs[i].va);
+    os_unfair_lock_unlock(&gHeapLock);
+    return p;
+}
 
 // 0.6.8: user VA is handed back on free. It used to only grow, and
 // WindowServer (a buffer or surface view every frame) ran through the 12 GiB
@@ -254,7 +586,7 @@ static os_unfair_lock gHeapLock = OS_UNFAIR_LOCK_INIT;
 // 0 and the GR exception + GPU reset showed as a black flash.
 // Spans are 64 KiB granular; caller holds gHeapLock.
 typedef struct { uint64_t va, size; } NVUSpan;
-static NVUSpan gUFree[4096];
+static NVUSpan gUFree[kMaxUFree];
 static unsigned gNUFree;
 static uint64_t userVaTakeLocked(uint64_t len, uint64_t align) {
     len = (len + 0xffff) & ~0xffffULL;
@@ -264,8 +596,8 @@ static uint64_t userVaTakeLocked(uint64_t len, uint64_t align) {
         if (gUFree[i].size < lead + len) continue;
         const NVUSpan f = gUFree[i];
         gUFree[i] = gUFree[--gNUFree];
-        if (lead && gNUFree < 4096) gUFree[gNUFree++] = (NVUSpan){f.va, lead};
-        if (f.size > lead + len && gNUFree < 4096) gUFree[gNUFree++] = (NVUSpan){a + len, f.size - lead - len};
+        if (lead && gNUFree < kMaxUFree) gUFree[gNUFree++] = (NVUSpan){f.va, lead};
+        if (f.size > lead + len && gNUFree < kMaxUFree) gUFree[gNUFree++] = (NVUSpan){a + len, f.size - lead - len};
         return a;
     }
     const uint64_t a = (gUserVa + align - 1) & ~(align - 1);
@@ -281,7 +613,7 @@ static void userVaGiveLocked(uint64_t va, uint64_t len) {
         if (va + len == gUFree[i].va) { len += gUFree[i].size; gUFree[i] = gUFree[--gNUFree]; i = (unsigned)-1; continue; }
     }
     if (va + len == gUserVa) { gUserVa = va; return; }  // top of the range: just lower it
-    if (gNUFree < 4096) gUFree[gNUFree++] = (NVUSpan){va, len};
+    if (gNUFree < kMaxUFree) gUFree[gNUFree++] = (NVUSpan){va, len};
 }
 
 // 0.8.5: the last user VA ranges handed back, to name an MMU fault after a
@@ -390,8 +722,57 @@ bool nvHeapAllocShared(uint64_t bytes, void **cpu, uint64_t *va) {
     return heapAllocFlags(bytes, cpu, va, vol ? 0 : 0x200);
 }
 static bool heapAllocFlags(uint64_t bytes, void **cpu, uint64_t *va, uint32_t flags) {
-    NV_GPU_LOCKED;
+    NV_GPU_LOCKED_NOWAIT;   // 0.9.64: waits below only before reusing a freed span
     if (!bytes || !nvGspEnsure()) return false;
+    if (gN615) {   // 0.9.26: bump suballocation, 64 KiB granular, never reused
+        const uint64_t len = (bytes + 0xffff) & ~0xffffULL;
+        const uint32_t kind = g615ReqKind;
+        if (len > NV615_BIG_MAX) { nvHeapFull(len); return false; }
+        bool reuse = false;
+        os_unfair_lock_lock(&gHeapLock);
+        for (unsigned i = 0; i < g615NFree; i++)
+            if (g615Free[i].len >= len && g615Free[i].kind == kind) { reuse = true; break; }
+        os_unfair_lock_unlock(&gHeapLock);
+        if (reuse) nv615WaitPending();   // queued work may still use a freed span
+        os_unfair_lock_lock(&gHeapLock);
+        for (unsigned i = 0; i < g615NFree && gNBufs < kMaxUserBufs; i++) {
+            if (g615Free[i].len < len || g615Free[i].kind != kind) continue;
+            NV615Span f = g615Free[i];
+            if (f.len > len) { g615Free[i] = (NV615Span){f.cpu + len, f.va + len, f.len - len, kind}; }
+            else g615Free[i] = g615Free[--g615NFree];
+            gBufs[gNBufs++] = (NVUserBuf){f.cpu, f.va, len, 0x20000000u, flags};
+            os_unfair_lock_unlock(&gHeapLock);
+            memset(f.cpu, 0, len);
+            *cpu = f.cpu; *va = f.va;
+            return true;
+        }
+        os_unfair_lock_unlock(&gHeapLock);
+        NV615Slab *s = NULL;
+        for (unsigned i = 0; i < g615NSlab && !s; i++)
+            if (g615Slab[i].kind == kind && g615Slab[i].used + len <= g615Slab[i].size) s = &g615Slab[i];
+        if (!s) {
+            uint8_t *c = NULL;
+            uint64_t v = 0;
+            const uint64_t size = len > NV615_HEAP_SLAB ? len : NV615_HEAP_SLAB;
+            if (g615NSlab >= NV615_HEAP_SLABS ||
+                !nv615Alloc(gConn, size, &c, &v, kind | (nvSysCachedOn() ? 0x10u : 0u))) { nvHeapFull(len); return false; }
+            s = &g615Slab[g615NSlab++];
+            *s = (NV615Slab){c, v, 0, size, kind};
+        }
+        os_unfair_lock_lock(&gHeapLock);
+        const bool room = gNBufs < kMaxUserBufs;
+        uint8_t *p = s->cpu + s->used;
+        const uint64_t v = s->va + s->used;
+        if (room) {
+            s->used += len;
+            gBufs[gNBufs++] = (NVUserBuf){p, v, len, 0x20000000u, flags};
+        }
+        os_unfair_lock_unlock(&gHeapLock);
+        if (!room) return false;
+        *cpu = p;
+        *va = v;
+        return true;
+    }
     const char *m = getenv("NVMTL_HEAP");
     if (m && m[0] == '2') return heapAllocChunks(bytes, cpu, va);
     const uint64_t len = (bytes + 0xfff) & ~0xfffULL;
@@ -419,27 +800,83 @@ static bool heapAllocFlags(uint64_t bytes, void **cpu, uint64_t *va, uint32_t fl
 
 void nvHeapFree(void *cpu, uint64_t bytes) {
     (void)bytes;
+    if (gN615) nvGrFlush();   // 0.9.27: nothing queued may still use a span we hand out again
     NVUserBuf u = {0};
     os_unfair_lock_lock(&gHeapLock);
     for (unsigned i = 0; i < gNBufs; i++)
         if (gBufs[i].cpu == cpu && !(gBufs[i].handle & 0x40000000u)) {   // never a wrapped surface
             u = gBufs[i]; gBufs[i] = gBufs[--gNBufs];
-            nvHeapReleaseVaLocked(u, u.handle & 0x7fffffffu); break;
+            // 0.9.26: native615 suballocations stay mapped until the process ends;
+            // 0.9.27: their span goes on the free list (after queued GPU work)
+            if (!(u.handle & 0x20000000u)) nvHeapReleaseVaLocked(u, u.handle & 0x7fffffffu);
+            else if (g615NFree < 1024) {
+                uint32_t k = 0;
+                for (unsigned j = 0; j < g615NSlab; j++)
+                    if (u.va >= g615Slab[j].va && u.va - g615Slab[j].va < g615Slab[j].size) k = g615Slab[j].kind;
+                NV615Span f = {u.cpu, u.va, u.size, k};
+                // 0.9.42: merge with free neighbours (adjacent on GPU and CPU, same kind)
+                for (unsigned j = 0; j < g615NFree;) {
+                    const NV615Span o = g615Free[j];
+                    if (o.kind == k && o.va + o.len == f.va && o.cpu + o.len == f.cpu) f = (NV615Span){o.cpu, o.va, o.len + f.len, k};
+                    else if (o.kind == k && f.va + f.len == o.va && f.cpu + f.len == o.cpu) f.len += o.len;
+                    else { j++; continue; }
+                    g615Free[j] = g615Free[--g615NFree];
+                }
+                g615Free[g615NFree++] = f;
+            }
+            break;
         }
     os_unfair_lock_unlock(&gHeapLock);
-    if (!u.cpu) return;
+    if (!u.cpu || (u.handle & 0x20000000u)) return;
     uint64_t h = u.handle & 0x7fffffffu;
     if (u.handle & 0x80000000u) {                               // kext SYS object
-        IOConnectUnmapMemory(gConn, nvMapType((uint32_t)h), mach_task_self(), (mach_vm_address_t)(uintptr_t)u.cpu);
+        IOConnectUnmapMemory(gConn, nvMapType((uint32_t)h), mach_task_self(),
+                             (mach_vm_address_t)(uintptr_t)u.cpu);
+        // 0.180.12: the mapping was released but the kext object was never
+        // freed. A long-running NVMTL_HEAP=2 process leaked every buffer on
+        // the GPU side until reset/reload.
+        uint64_t mh = h;
+        callMethod(kSelMemFree, &mh, 1, NULL, NULL, NULL, 0);
         return;
     }
     mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)(uintptr_t)u.cpu, u.size);
 }
 
 // handle bit 30: wrapped foreign memory (unbind only, the owner frees it)
+// 0.9.35: native615 wraps through the owned client (kernel 0.180.117,
+// selector 47 op 2/3); handle bit 28 marks them, the low bits are the index.
+static bool nv615Wrap(void *cpu, uint64_t len, uint64_t *va) {
+    const bool cached = nvSysCachedOn();   // 0.9.76
+    uint64_t in[3] = {2, (uint64_t)(uintptr_t)cpu, len | (cached ? 0x10ull << 56 : 0)}, out[3] = {0, 0, 0};
+    uint32_t n = 3;
+    kern_return_t kr = callOn(gConn, 47, in, 3, out, &n, NULL, 0);
+    if (kr && cached) {
+        NSLog(@"NVMTLGsp: L2-cacheable wrap refused (0x%x), uncached", kr);
+        g615SysCached = 0;
+        in[2] = len; n = 3;
+        kr = callOn(gConn, 47, in, 3, out, &n, NULL, 0);
+    }
+    if (kr || out[2] != len || !out[1]) {
+        NSLog(@"NVMTLGsp: native615 wrap of %llu bytes -> 0x%x", (unsigned long long)len, kr);
+        return false;
+    }
+    os_unfair_lock_lock(&gHeapLock);
+    const bool room = gNBufs < kMaxUserBufs;
+    if (room) gBufs[gNBufs++] = (NVUserBuf){(uint8_t *)cpu, out[1], len, 0x50000000u | (uint32_t)out[0], 0};
+    os_unfair_lock_unlock(&gHeapLock);
+    if (!room) {
+        uint64_t u[2] = {3, out[0]}, o[3];
+        uint32_t m = 3;
+        callOn(gConn, 47, u, 2, o, &m, NULL, 0);
+        return false;
+    }
+    *va = out[1];
+    return true;
+}
 bool nvHeapWrap(void *cpu, uint64_t bytes, uint64_t *va) {
-    NV_GPU_LOCKED;
+    NV_GPU_LOCKED_NOWAIT;   // 0.9.64: new pages at a free VA; queued work cannot see them
     if (!cpu || !bytes || ((uintptr_t)cpu & 0xfff) || !nvGspEnsure()) return false;
+    if (gN615) return nv615Wrap(cpu, (bytes + 0xfff) & ~0xfffULL, va);
     const uint64_t len = (bytes + 0xfff) & ~0xfffULL;
     os_unfair_lock_lock(&gHeapLock);
     const uint64_t v = gNBufs < kMaxUserBufs ? userVaTakeLocked(len, 0x10000) : 0;
@@ -464,15 +901,21 @@ bool nvHeapWrap(void *cpu, uint64_t bytes, uint64_t *va) {
 // the first entry with that CPU address unbound another texture's VA while
 // the GPU still used it (MMU fault, PTE invalid, GPU reset at login).
 void nvHeapUnwrap(void *cpu, uint64_t va) {
+    if (gN615) nvGrFlush();   // 0.9.35: queued work may still read the surface
     NVUserBuf u = {0};
     os_unfair_lock_lock(&gHeapLock);
     for (unsigned i = 0; i < gNBufs; i++)
         if (gBufs[i].cpu == cpu && gBufs[i].va == va && (gBufs[i].handle & 0x40000000u)) {
             u = gBufs[i]; gBufs[i] = gBufs[--gNBufs];
-            nvHeapReleaseVaLocked(u, u.handle & 0x3fffffffu); break;
+            if (!(u.handle & 0x10000000u)) nvHeapReleaseVaLocked(u, u.handle & 0x3fffffffu);
+            break;
         }
     os_unfair_lock_unlock(&gHeapLock);
-    if (!u.cpu) return;
+    if (!u.cpu || !(u.handle & 0x10000000u)) return;
+    uint64_t in[2] = {3, u.handle & 0xffffu}, out[3];
+    uint32_t n = 3;
+    const kern_return_t kr = callOn(gConn, 47, in, 2, out, &n, NULL, 0);
+    if (kr) NSLog(@"NVMTLGsp: native615 unwrap %u -> 0x%x", u.handle & 0xffffu, kr);
 }
 
 uint64_t nvHeapVa(const void *cpu, uint64_t bytes) {
@@ -560,8 +1003,34 @@ static void kindVaGiveLocked(uint64_t va, uint64_t len) {
     else if (gNBlFree < 2048) gBlFree[gNBlFree++] = (NVRange){va, len};
 }
 
-bool nvVramAllocKind(uint64_t bytes, uint32_t kind, uint64_t *va, uint32_t *handle) {
+static bool nvVramAllocKindRaw(uint64_t bytes, uint32_t kind, uint64_t *va, uint32_t *handle) {
     NV_GPU_LOCKED;
+    if (nvN615Requested()) {   // 0.9.30: pinned sysmem, PTE kind 0 (block linear is a TIC/copy layout)
+        const uint32_t k8 = kind <= 7 ? kind : 6;
+        if (gN615 && nv615VramTexOn()) {   // 0.9.46: VRAM with the surface's kind
+            uint64_t v = 0;
+            const uint64_t len = (bytes + 0xffff) & ~0xffffULL;
+            if (bytes && g615NKind < 2048 && nv615VramKindTake(k8, len, &v)) {
+                os_unfair_lock_lock(&gHeapLock);
+                const uint32_t id = ++g615KindId;
+                g615Kind[g615NKind++] = (NV615Kind){id, NULL, v, len, k8};
+                os_unfair_lock_unlock(&gHeapLock);
+                *va = v; *handle = id;
+                return true;
+            }
+        }
+        void *cpu = NULL;
+        g615ReqKind = kind <= 7 ? kind : 6;
+        const bool got = bytes && g615NKind < 2048 && heapAllocFlags(bytes, &cpu, va, 0);
+        g615ReqKind = 0;
+        if (!got) return false;
+        os_unfair_lock_lock(&gHeapLock);
+        const uint32_t id = ++g615KindId;
+        g615Kind[g615NKind++] = (NV615Kind){id, (uint8_t *)cpu, *va, bytes, k8};
+        os_unfair_lock_unlock(&gHeapLock);
+        *handle = id;
+        return true;
+    }
     if (!bytes || bytes > NVGSP_BL_VA_END - NVGSP_BL_VA_BASE || !nvGspValidate()) return false;
     const uint64_t len = (bytes + 0x1fffff) & ~0x1fffffULL;
     os_unfair_lock_lock(&gHeapLock);
@@ -595,6 +1064,16 @@ bool nvVramAllocKind(uint64_t bytes, uint32_t kind, uint64_t *va, uint32_t *hand
 
 void nvVramFreeKind(uint32_t handle) {
     if (!handle) return;
+    if (gN615) {   // 0.9.30
+        NV615Kind u = {0};
+        os_unfair_lock_lock(&gHeapLock);
+        for (unsigned i = 0; i < g615NKind; i++)
+            if (g615Kind[i].id == handle) { u = g615Kind[i]; g615Kind[i] = g615Kind[--g615NKind]; break; }
+        os_unfair_lock_unlock(&gHeapLock);
+        if (u.cpu) nvHeapFree(u.cpu, 0);
+        else if (u.id && u.size) { nvGrFlush(); nv615VramKindGive(u.kind, u.va, u.size); }
+        return;
+    }
     // Do not take the encoding mutex in a completion handler. Holding the
     // heap lock across the pure free prevents recovery swapping namespaces.
     os_unfair_lock_lock(&gHeapLock);
@@ -643,6 +1122,7 @@ const char *nvVaState(uint64_t p) {
 
 static void nvSlabsReleaseAll(void);
 static bool nvGspRecover(io_connect_t dead) {
+    if (gN615) return false;   // 0.9.26: a lost native615 client is not rebuilt
     // Allocation callers may hold gHeapLock. Never block on gGpuMtx from
     // there: an encoder can hold it while looking up a heap VA. Defer that
     // caller's recovery if encoding is in progress on another thread.
@@ -665,6 +1145,12 @@ static bool nvGspRecover(io_connect_t dead) {
     uint8_t *scpu = NULL;
     bool ok = c && nvGspStaging(c, &sh, &scpu);
     if (ok) nvGspOwnChannel(c);
+    // 0.8.79: keep the dead client alive until every rebind succeeds. The
+    // kext's shared GR context block is allocated from client heap memory;
+    // closing the old client first freed it and grRing() then failed
+    // (seg-stage 2). kMaxMem is 65535 in kext 0.178.30, so the table has room
+    // for the old + new objects during recovery.
+    bool deadClosed = false;
     unsigned nb = 0, nv = 0, nk = 0;
     // the caller may hold the heap lock (vramGrow under nvVramAlloc): then
     // this call fails and the next one recovers
@@ -679,25 +1165,71 @@ static bool nvGspRecover(io_connect_t dead) {
     const unsigned total = gNBufs + gNVChunk + gNKObj;
     uint32_t *handles = calloc(total ? total : 1, sizeof(uint32_t));
     if (!handles) ok = false;
+    const char *rstage = ok ? "rebind" : "open";
+    unsigned rindex = 0;
+    uint64_t rva = 0, rsize = 0;
+    kern_return_t rkr = 0;
     for (unsigned i = 0; ok && i < gNBufs; i++) {          // process pages: bind them again
         NVUserBuf *u = &gBufs[i];
         if (u->handle & 0x80000000u) continue;              // NVMTL_HEAP=2 objects are not kept
         uint64_t in[4] = {(uint64_t)(uintptr_t)u->cpu, u->size, u->va, u->bindFlags}, out[1] = {0};
         uint32_t outN = 1;
-        if (callOn(c, kSelUserMemBind, in, 4, out, &outN, NULL, 0) || !out[0]) { ok = false; break; }
+        rindex = i; rva = u->va; rsize = u->size;
+        rkr = callOn(c, kSelUserMemBind, in, 4, out, &outN, NULL, 0);
+        if (rkr || !out[0]) { ok = false; rstage = "bind"; break; }
         handles[i] = (uint32_t)out[0] | (u->handle & 0x40000000u);
         nb++;
     }
     unsigned adopted = 0;
+    // NVMTL_HEAP=2 big-page objects: they live in gBufs with the tag bit but
+    // are kext SYS objects, so the user-page path above skips them. Re-adopt
+    // or reallocate them at the same VA and keep the child mapping valid.
+    for (unsigned i = 0; ok && i < gNBufs; i++) {
+        NVUserBuf *u = &gBufs[i];
+        if (!(u->handle & 0x80000000u)) continue;
+        const uint32_t oldHandle = u->handle & 0x7fffffffu;
+        uint64_t in[2] = {u->size, 1}, out[2] = {0, 0};
+        uint32_t outN = 2;
+        uint64_t ah[1] = {oldHandle};
+        rindex = i; rva = u->va; rsize = u->size;
+        if (!callOn(c, kSelMemAdopt, ah, 1, out, &outN, NULL, 0) && out[0]) {
+            adopted++;
+        } else if ((outN = 2, out[0] = 0,
+                    callOn(c, kSelMemAlloc, in, 2, out, &outN, NULL, 0)) || !out[0]) {
+            ok = false; rstage = "chunk-alloc"; break;
+        }
+        uint64_t b[3] = {out[0], u->va, 0};
+        rkr = callOn(c, kSelVaBindObj, b, 3, NULL, NULL, NULL, 0);
+        if (rkr) { ok = false; rstage = "chunk-bind"; break; }
+        // The CPU mapping belonged to the old client. Map the adopted object
+        // through the new client before the old client is closed; otherwise
+        // the next contents access is a stale mapping (or unmapped memory).
+        mach_vm_address_t naddr = 0;
+        mach_vm_size_t msz = 0;
+        rkr = IOConnectMapMemory(c, nvMapType((uint32_t)out[0]), mach_task_self(),
+                                 &naddr, &msz, kIOMapAnywhere);
+        if (rkr != KERN_SUCCESS || msz < u->size) {
+            if (rkr == KERN_SUCCESS)
+                mach_vm_deallocate(mach_task_self(), naddr, msz);
+            ok = false; rstage = "chunk-map"; break;
+        }
+        IOConnectUnmapMemory(dead, nvMapType(oldHandle), mach_task_self(),
+                             (mach_vm_address_t)(uintptr_t)u->cpu);
+        u->cpu = (uint8_t *)(uintptr_t)naddr;
+        handles[i] = (uint32_t)out[0] | 0x80000000u;
+        nb++;
+    }
     for (unsigned i = 0; ok && i < gNVChunk; i++) {        // VRAM: same memory if the kext kept it, same VA
         uint64_t in[2] = {gVChunk[i].size, 0}, out[2] = {0, 0};
         uint32_t outN = 2;
         // 0.8.52: take the old object over (kext 0.177: its contents were saved and put back)
         uint64_t ah[1] = {gVChunk[i].handle};
         if (!callOn(c, kSelMemAdopt, ah, 1, out, &outN, NULL, 0) && out[0]) adopted++;
-        else if ((outN = 2, out[0] = 0, callOn(c, kSelMemAlloc, in, 2, out, &outN, NULL, 0)) || !out[0]) { ok = false; break; }
+        else if ((outN = 2, out[0] = 0, callOn(c, kSelMemAlloc, in, 2, out, &outN, NULL, 0)) || !out[0]) { ok = false; rstage = "vram-alloc"; break; }
         uint64_t b[3] = {out[0], gVChunk[i].va, 0};
-        if (callOn(c, kSelVaBindObj, b, 3, NULL, NULL, NULL, 0)) { ok = false; break; }
+        rindex = i; rva = gVChunk[i].va; rsize = gVChunk[i].size;
+        rkr = callOn(c, kSelVaBindObj, b, 3, NULL, NULL, NULL, 0);
+        if (rkr) { ok = false; rstage = "vram-bind"; break; }
         handles[gNBufs + i] = (uint32_t)out[0];
         nv++;
     }
@@ -706,20 +1238,23 @@ static bool nvGspRecover(io_connect_t dead) {
         uint32_t outN = 2;
         uint64_t ah[1] = {gKObj[i].handle};
         if (!callOn(c, kSelMemAdopt, ah, 1, out, &outN, NULL, 0) && out[0]) adopted++;
-        else if ((outN = 2, out[0] = 0, callOn(c, kSelMemAlloc, in, 2, out, &outN, NULL, 0)) || !out[0]) { ok = false; break; }
+        else if ((outN = 2, out[0] = 0, callOn(c, kSelMemAlloc, in, 2, out, &outN, NULL, 0)) || !out[0]) { ok = false; rstage = "kobj-alloc"; break; }
         uint64_t b[3] = {out[0], gKObj[i].va, gKObj[i].kind & 0xff};
-        if (callOn(c, kSelVaBindObj, b, 3, NULL, NULL, NULL, 0)) { ok = false; break; }
+        rindex = i; rva = gKObj[i].va; rsize = gKObj[i].size;
+        rkr = callOn(c, kSelVaBindObj, b, 3, NULL, NULL, NULL, 0);
+        if (rkr) { ok = false; rstage = "kobj-bind"; break; }
         handles[gNBufs + gNVChunk + i] = (uint32_t)out[0];
         nk++;
     }
     if (ok) {
         for (unsigned i = 0; i < gNBufs; i++)
-            if (!(gBufs[i].handle & 0x80000000u)) gBufs[i].handle = handles[i];
+            gBufs[i].handle = handles[i];
         for (unsigned i = 0; i < gNVChunk; i++) gVChunk[i].handle = handles[gNBufs + i];
         for (unsigned i = 0; i < gNKObj; i++) gKObj[i].handle = handles[gNBufs + gNVChunk + i];
         gConn = c; gHandle = sh; gCpu = scpu;
+        gConnReset = nvResetCountNow();
         gRecoverySerial++;
-        IOServiceClose(dead);                               // the old client's objects go
+        if (!deadClosed) IOServiceClose(dead);              // the old client's objects go
     }
     free(handles);
     os_unfair_lock_unlock(&gHeapLock);
@@ -728,6 +1263,9 @@ static bool nvGspRecover(io_connect_t dead) {
     if (ok || fails < 5 || !(fails % 100))
         NSLog(@"NVMTLGsp: GPU reset: %s (recovery %u: %u buffers, %u VRAM chunks, %u surfaces, %u kept with contents)",
               ok ? "reopened" : "could not reopen", n, nb, nv, nk, adopted);
+    if (!ok)
+        NSLog(@"NVMTLGsp: reset detail: stage %s index %u va 0x%llx size %llu kr 0x%x",
+              rstage, rindex, rva, rsize, rkr);
     if (ok) { fails = 0; nextTry = 0; gPostResetLog = 20; }
     // 0.8.29: VRAM contents are gone, so the command buffer that saw the
     // reset reports an error. WindowServer then flushes its display space
@@ -748,8 +1286,74 @@ static bool nvGspRecover(io_connect_t dead) {
     return ok;
 }
 
-bool nvVramAlloc(uint64_t bytes, uint64_t *va) {
+// 0.9.45: Private buffers in VRAM (kernel 0.180.131
+// selector 47 op 4: zeroed by the kernel, GPU-only, no CPU mapping). They
+// are reached only through the copy engine (blits, fills, staging reads).
+static bool nv615CeOn(void);
+static bool nv615VramOn(void) {
+    static int on = -1;
+    // default on (suite84 83/84, 128 MiB compute copy 505 GB/s vs 5-42 in sysmem); NVMTL_N615_VRAM=0 off
+    if (on < 0) { const char *e = getenv("NVMTL_N615_VRAM"); on = !e || strcmp(e, "0"); }
+    return on;
+}
+static bool nv615VramGrowLocked(uint64_t len) {
+    const uint64_t bytes = len > (64ull << 20) ? (len + 0x1fffff) & ~0x1fffffULL : (64ull << 20);
+    uint64_t in[2] = {4, bytes}, out[3] = {0, 0, 0};
+    uint32_t n = 3;
+    os_unfair_lock_unlock(&gHeapLock);
+    const kern_return_t kr = callOn(gConn, 47, in, 2, out, &n, NULL, 0);
+    os_unfair_lock_lock(&gHeapLock);
+    if (kr || out[2] < bytes || gNVFree >= 2048) {
+        NSLog(@"NVMTLGsp: native615 VRAM slab of %llu bytes -> 0x%x", bytes, kr);
+        return false;
+    }
+    gVFree[gNVFree++] = (NVRange){out[1], out[2]};
+    return true;
+}
+static bool nv615VramTexOn(void) {
+    static int on = -1;
+    // 0.9.46: block-linear textures, MSAA and zeta in VRAM by default (suite84 83/84); NVMTL_N615_VRAMTEX=0 off
+    if (on < 0) { const char *e = getenv("NVMTL_N615_VRAMTEX"); on = !e || strcmp(e, "0"); }
+    return on && nv615VramOn() && nv615CeOn();
+}
+static bool nv615VramKindTake(uint32_t kind, uint64_t len, uint64_t *va) {
+    os_unfair_lock_lock(&gHeapLock);
+    for (int pass = 0; pass < 2; pass++) {
+        for (unsigned i = 0; i < g615NVK[kind]; i++) {
+            NV615VSpan *f = &g615VK[kind][i];
+            if (f->size < len) continue;
+            *va = f->va;
+            if (f->size == len) *f = g615VK[kind][--g615NVK[kind]];
+            else { f->va += len; f->size -= len; }
+            os_unfair_lock_unlock(&gHeapLock);
+            return true;
+        }
+        if (pass || g615NVK[kind] >= 256) break;
+        const uint64_t bytes = len > (64ull << 20) ? (len + 0x1fffff) & ~0x1fffffULL : (64ull << 20);
+        uint64_t in[2] = {4, bytes | ((uint64_t)kind << 56)}, out[3] = {0, 0, 0};
+        uint32_t n = 3;
+        os_unfair_lock_unlock(&gHeapLock);
+        const kern_return_t kr = callOn(gConn, 47, in, 2, out, &n, NULL, 0);
+        os_unfair_lock_lock(&gHeapLock);
+        if (kr || out[2] < bytes) { NSLog(@"NVMTLGsp: native615 VRAM kind %u slab of %llu bytes -> 0x%x", kind, bytes, kr); break; }
+        g615VK[kind][g615NVK[kind]++] = (NV615VSpan){out[1], out[2]};
+    }
+    os_unfair_lock_unlock(&gHeapLock);
+    return false;
+}
+static void nv615VramKindGive(uint32_t kind, uint64_t va, uint64_t len) {
+    os_unfair_lock_lock(&gHeapLock);
+    for (unsigned i = 0; i < g615NVK[kind]; i++) {
+        NV615VSpan *f = &g615VK[kind][i];
+        if (f->va + f->size == va) { va = f->va; len += f->size; *f = g615VK[kind][--g615NVK[kind]]; i = (unsigned)-1; }
+        else if (va + len == f->va) { len += f->size; *f = g615VK[kind][--g615NVK[kind]]; i = (unsigned)-1; }
+    }
+    if (g615NVK[kind] < 256) g615VK[kind][g615NVK[kind]++] = (NV615VSpan){va, len};
+    os_unfair_lock_unlock(&gHeapLock);
+}
+static bool nvVramAllocRaw(uint64_t bytes, uint64_t *va) {
     if (!bytes || !nvGspEnsure()) return false;
+    if (gN615 && !(nv615VramOn() && nv615CeOn())) { void *cpu = NULL; return heapAllocFlags(bytes, &cpu, va, 0); }   // 0.9.27
     const uint64_t len = (bytes + 0xffff) & ~0xffffULL;
     bool ok = false;
     os_unfair_lock_lock(&gHeapLock);
@@ -762,13 +1366,19 @@ bool nvVramAlloc(uint64_t bytes, uint64_t *va) {
             ok = true;
             break;
         }
-        if (!ok && (pass || !vramGrow(len))) break;
+        if (!ok && (pass || !(gN615 ? nv615VramGrowLocked(len) : vramGrow(len)))) break;
     }
     os_unfair_lock_unlock(&gHeapLock);
     return ok;
 }
 
 void nvVramFree(uint64_t va, uint64_t bytes) {
+    if (gN615) {   // 0.9.27; 0.9.45: a VRAM span has no CPU address
+        uint8_t *c = nv615Cpu(va, bytes ? bytes : 1);
+        if (c) { nvHeapFree(c, bytes); return; }
+        if (!nv615VramOn()) return;
+        nvGrFlush();   // queued work may still use the span
+    }
     uint64_t len = (bytes + 0xffff) & ~0xffffULL;
     os_unfair_lock_lock(&gHeapLock);
     // 0.8.38: a freed bridge must absorb BOTH neighbours. Merging only
@@ -792,7 +1402,36 @@ uint64_t nvStageVa(void) { return gVa; }
 // One 8-word fence tail is appended by the kext (submitSegments); the
 // pushbuffer holds SET_OBJECT + copy chunks only.
 // Submit w words from the push area on the CE and wait for them.
+// 0.9.43: kernel 0.180.128 gives every owned client a copy object on its GR
+// channel (client615-copy-engine). NVMTL_N615_CE=1 sends the CE method
+// streams there (subchannel 4 bound to AMPERE_DMA_COPY_B per stream).
+static bool nv615VramOn(void);
+static bool nv615CeOn(void) {
+    static int on = -1;
+    if (on >= 0) return on;
+    on = 0;
+    const char *e = getenv("NVMTL_N615_CE");
+    if ((!e || strcmp(e, "1")) && !nv615VramOn()) return false;
+    io_service_t sv = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVGspControl"));
+    CFTypeRef p = sv ? IORegistryEntryCreateCFProperty(sv, CFSTR("NVGspControl-client615-copy-engine"), kCFAllocatorDefault, 0) : NULL;
+    long long ce = 0;
+    if (p && CFGetTypeID(p) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)p, kCFNumberSInt64Type, &ce);
+    if (p) CFRelease(p);
+    if (sv) IOObjectRelease(sv);
+    on = ce >= 9;
+    NSLog(@"NVMTLGsp: native615 copy engine %s (engine %lld)", on ? "on" : "unavailable", ce);
+    return on;
+}
 static bool ceSubmit(uint32_t w) {
+    if (gN615) {
+        if (!nv615CeOn()) { NSLog(@"NVMTLGsp: native615 has no copy engine (%u words refused)", w); nvNoteGpuFailure(1); return false; }
+        if (!nvGrFlush()) return false;
+        uint32_t *pb = (uint32_t *)(gCpu + NVGSP_STAGE_PUSH);
+        memmove(pb + 2, pb, (size_t)w * 4);
+        pb[0] = mthd(NVGSP_CE_SUBCH, 0x0, 1); pb[1] = 0xC7B5;   // SET_OBJECT AMPERE_DMA_COPY_B
+        if (!nv615Submit(gVa + NVGSP_STAGE_PUSH, w + 2)) { nvNoteGpuFailure(1); return false; }
+        return true;
+    }
     nvGrFlush();                                   // queued launches first, in order
     nvNativeDrain();                               // 0.8.0: and native GR work (other ring)
     struct { uint64_t va; uint32_t dw; uint32_t pad; } seg = {gVa + NVGSP_STAGE_PUSH, w, 0};
@@ -815,6 +1454,14 @@ static bool ceSubmit(uint32_t w) {
 bool nvCeCopy(uint64_t dstVa, uint64_t srcVa, uint64_t bytes) {
     NV_GPU_LOCKED;
     if (!gCpu || !bytes) return false;
+    // 0.9.27: the CPU sees every sysmem native615 byte; 0.9.45: VRAM goes through the CE
+    if (gN615 && (!nv615CeOn() || (nv615Cpu(dstVa, bytes) && nv615Cpu(srcVa, bytes)))) {
+        if (!nvGrFlush()) return false;
+        uint8_t *d = nv615Cpu(dstVa, bytes), *s = nv615Cpu(srcVa, bytes);
+        if (!d || !s) { NSLog(@"NVMTLGsp: native615 copy outside mapped memory"); nvNoteGpuFailure(1); return false; }
+        memmove(d, s, bytes);
+        return true;
+    }
     uint32_t *pb = (uint32_t *)(gCpu + NVGSP_STAGE_PUSH);
     uint32_t w = 0;
     const uint32_t cap = NVGSP_STAGE_PUSH_MAX / 4;
@@ -838,6 +1485,14 @@ bool nvCeCopy2DBL(bool toBL, uint64_t pitchVa, uint32_t pitch, uint64_t blVa, ui
                   uint32_t bh, uint32_t widthBytes, uint32_t height) {
     NV_GPU_LOCKED;
     if (!gCpu || !widthBytes || !height) return false;
+    const NV615Bl b615 = {blWidthBytes, height, 1, bh & 15, 0, (bh >> 8) & 0xff};
+    if (gN615 && (!nv615CeOn() || (nv615Cpu(pitchVa, (uint64_t)pitch * (height - 1) + widthBytes) &&
+                                   nv615Cpu(blVa, nv615BlBytes(&b615))))) {   // 0.9.30; 0.9.45 CE when VRAM
+        if (!nvGrFlush()) return false;
+        const NV615Bl b = b615;   // bh bits 8+: GOB variant (the CE takes it from the PTE kind)
+        if (!nv615BlCopy(toBL, pitchVa, pitch, blVa, &b, 0, 0, 0, widthBytes, height)) { nvNoteGpuFailure(1); return false; }
+        return true;
+    }
     uint32_t *pb = (uint32_t *)(gCpu + NVGSP_STAGE_PUSH), w = 0;
     const uint64_t s = toBL ? pitchVa : blVa, d = toBL ? blVa : pitchVa;
     // block-linear side: block size (1 GOB wide, 2^bh high, GOB height 8), width in bytes,
@@ -862,6 +1517,14 @@ bool nvCeCopyBLRegion(bool toBL, uint64_t linVa, uint32_t linPitch, uint64_t blB
                       uint32_t xBytes, uint32_t y, uint32_t z, uint32_t widthBytes, uint32_t height) {
     NV_GPU_LOCKED;
     if (!gCpu || !widthBytes || !height) return false;
+    const NV615Bl r615 = {blRowBytes, blRows, blDepth ? blDepth : 1, ylog & 15, zlog & 15};
+    if (gN615 && (!nv615CeOn() || (nv615Cpu(linVa, (uint64_t)linPitch * (height - 1) + widthBytes) &&
+                                   nv615Cpu(blBase, nv615BlBytes(&r615))))) {   // 0.9.30; 0.9.45 CE when VRAM
+        if (!nvGrFlush()) return false;
+        const NV615Bl b = r615;
+        if (!nv615BlCopy(toBL, linVa, linPitch, blBase, &b, xBytes, y, z, widthBytes, height)) { nvNoteGpuFailure(1); return false; }
+        return true;
+    }
     uint32_t *pb = (uint32_t *)(gCpu + NVGSP_STAGE_PUSH), w = 0;
     const uint64_t s = toBL ? linVa : blBase, d = toBL ? blBase : linVa;
     const uint32_t blk = ((ylog & 15) << 4) | ((zlog & 15) << 8) | (1u << 12);
@@ -881,6 +1544,38 @@ bool nvCeCopyBLRegion(bool toBL, uint64_t linVa, uint32_t linPitch, uint64_t blB
 bool nvCeCopySurf(const NVCeSurf *src, const NVCeSurf *dst, uint32_t widthBytes, uint32_t height) {
     NV_GPU_LOCKED;
     if (!gCpu || !widthBytes || !height) return false;
+    // 0.9.45: a VRAM side (no CPU address) goes to the copy engine
+    bool cpuSides = true;
+    if (gN615 && nv615CeOn()) {
+        const NV615Bl sb = {src->rowBytes, src->rows, src->depth ? src->depth : 1, src->ylog & 15, src->zlog & 15};
+        const NV615Bl db = {dst->rowBytes, dst->rows, dst->depth ? dst->depth : 1, dst->ylog & 15, dst->zlog & 15};
+        cpuSides = (src->bl ? nv615Cpu(src->va, nv615BlBytes(&sb)) : nv615Cpu(src->va, (uint64_t)src->pitch * (height - 1) + widthBytes)) &&
+                   (dst->bl ? nv615Cpu(dst->va, nv615BlBytes(&db)) : nv615Cpu(dst->va, (uint64_t)dst->pitch * (height - 1) + widthBytes));
+    }
+    if (gN615 && cpuSides) {   // 0.9.27: linear <-> linear rows on the CPU; 0.9.30: block linear sides too
+        if (!nvGrFlush()) { nvNoteGpuFailure(1); return false; }
+        if (src->bl || dst->bl) {
+            const NV615Bl sb = {src->rowBytes, src->rows, src->depth ? src->depth : 1, src->ylog & 15, src->zlog & 15};
+            const NV615Bl db = {dst->rowBytes, dst->rows, dst->depth ? dst->depth : 1, dst->ylog & 15, dst->zlog & 15};
+            uint8_t *sp = src->bl ? nv615Cpu(src->va, nv615BlBytes(&sb)) : nv615Cpu(src->va, (uint64_t)src->pitch * (height - 1) + widthBytes);
+            uint8_t *dp = dst->bl ? nv615Cpu(dst->va, nv615BlBytes(&db)) : nv615Cpu(dst->va, (uint64_t)dst->pitch * (height - 1) + widthBytes);
+            if (!sp || !dp) { nvNoteGpuFailure(1); return false; }
+            for (uint32_t r = 0; r < height; r++)
+                for (uint32_t i = 0; i < widthBytes; i++) {
+                    const uint64_t so = src->bl ? nv615BlOffset(&sb, src->xBytes + i, src->y + r, src->z) : (uint64_t)r * src->pitch + i;
+                    const uint64_t dO = dst->bl ? nv615BlOffset(&db, dst->xBytes + i, dst->y + r, dst->z) : (uint64_t)r * dst->pitch + i;
+                    dp[dO] = sp[so];
+                }
+            return true;
+        }
+        for (uint32_t r = 0; r < height; r++) {
+            uint8_t *d = nv615Cpu(dst->va + (uint64_t)r * dst->pitch, widthBytes);
+            uint8_t *s = nv615Cpu(src->va + (uint64_t)r * src->pitch, widthBytes);
+            if (!d || !s) { nvNoteGpuFailure(1); return false; }
+            memmove(d, s, widthBytes);
+        }
+        return true;
+    }
     uint32_t *pb = (uint32_t *)(gCpu + NVGSP_STAGE_PUSH), w = 0;
     const NVCeSurf *side[2] = {dst, src};
     for (int k = 0; k < 2; ++k) {                                 // SET_DST_* (0x70c), SET_SRC_* (0x728)
@@ -925,10 +1620,37 @@ static bool slmEnsure(uint32_t perLane) {
     if (warp <= gSlmPerWarp) return true;
     nvGrFlush();                                    // queued launches still use the old area
     nvNativeDrain();                                // 0.8.7: and command buffers still out with it
-    if (warp < 0x2000) warp = 0x2000;               // 256 B per lane at least, fewer regrows
+    if (warp < 0x2000 && !gN615) warp = 0x2000;     // 256 B per lane at least, fewer regrows
     const uint64_t tpc = (warp * 48 * 2 + 0x7fff) & ~0x7fffULL;
     const uint64_t size = (tpc * NVSLM_TPCS + 0x1ffff) & ~0x1ffffULL;
-    uint64_t va; uint32_t h;
+    uint64_t va = 0; uint32_t h = 0;
+    if (gN615) {   // 0.9.28: scratch is pinned sysmem from the native615 heap (exact size, at most one slab)
+        void *cpu = NULL;
+        bool ok = false;
+        if (size <= NV615_BIG_MAX) ok = heapAllocFlags(size, &cpu, &va, 0);
+        else if (size <= 2 * NV615_BIG_MAX) {
+            // 0.9.39: SceneKit's 624 B per lane needs 74 MiB, past one kernel
+            // allocation. Two halves over a slab each get fresh slabs, which the
+            // kernel bump-allocates next to each other; use them only if they are.
+            const uint64_t half = ((size / 2) + 0xffff) & ~0xffffULL;
+            void *cpu2 = NULL;
+            uint64_t va2 = 0;
+            if (half > NV615_HEAP_SLAB && heapAllocFlags(half, &cpu, &va, 0)) {
+                if (heapAllocFlags(size - half, &cpu2, &va2, 0) && va2 == va + half) ok = true;
+                else {
+                    if (cpu2) nvHeapFree(cpu2, size - half);
+                    nvHeapFree(cpu, half);
+                    NSLog(@"NVMTLGsp: native615 scratch halves not adjacent (0x%llx, 0x%llx)", va, va2);
+                }
+            }
+        }
+        if (!ok) {
+            NSLog(@"NVMTLGsp: native615 scratch area of %llu bytes failed", size);
+            return false;
+        }
+        gSlmVa = va; gSlmHandle = 0; gSlmPerWarp = warp; gSlmPerTpc = tpc; gSlmSize = size;
+        return true;
+    }
     if (!nvVramAllocKind(size, 0, &va, &h)) {
         NSLog(@"NVMTLGsp: scratch area of %llu bytes failed", size);
         return false;
@@ -1080,6 +1802,10 @@ bool nvGrLaunch(const uint32_t *code, uint32_t codeWords, uint32_t regs, uint32_
     pb[c++] = mthd(1, 0x2B4, 1); pb[c++] = (uint32_t)(qmdVa >> 8);
     pb[c++] = (0x4u << 29) | (3u << 16) | (1u << 13) | (0x2C0u >> 2); // IMMD(0x2C0,3)
     struct { uint64_t va; uint32_t dw; uint32_t pad; } seg = {gVa + NVGSP_GR_PUSH, c, 0};
+    if (gN615) {   // 0.9.26: synchronous, kernel fence
+        if (!nv615Submit(seg.va, seg.dw)) { nvNoteGpuFailure(2); return false; }
+        return true;
+    }
     uint64_t in[1] = {0}; // engine 0 = GR
     uint64_t out[1] = {0};
     uint32_t outN = 1;
@@ -1183,6 +1909,7 @@ void nvGrBatchBegin(void) { nvGpuLock(); gBDepth++; }
 bool nvNativeEnabled(void) {
     static int on = -1;
     if (on >= 0) return on;
+    if (nvN615Requested()) { on = 0; return on; }   // 0.9.26: no family slabs on native615
     const char *e = getenv("NVMTL_NATIVE");
     if (e) { on = atoi(e) != 0; return on; }
     if (access("/Library/Preferences/nvmtl-native-off", F_OK) == 0) { on = 0; return on; }
@@ -1229,6 +1956,11 @@ void nvGrSync(void) { nvGrFlush(); nvNativeDrain(); }
 bool nvBatchOn(void) {
     static int on = -1;
     if (on < 0) {
+        // 0.8.84: isolation switch. Native mode normally forces batching on;
+        // NVMTL_NO_BATCH=1 submits each launch through the one-shot path so a
+        // hanging kernel can be named without disabling the whole pipeline.
+        const char *nb = getenv("NVMTL_NO_BATCH");
+        if (nb && atoi(nb)) { on = 0; return on; }
         const char *e = getenv("NVMTL_BATCH");
         on = e ? atoi(e) != 0 : 1;
         if (nvNativeEnabled()) on = 1;
@@ -1375,21 +2107,34 @@ bool nvGrFlush(void) {
     NV_GPU_LOCKED;
     if (gB3DDirty) gBPush = nv3DFlushWords((uint32_t *)gBCpu, gBPush);
     const uint32_t words = gBPush, n = gBN;
+    char batchLabels[512];
+    snprintf(batchLabels, sizeof batchLabels, "%s", gBLabels[0] ? gBLabels : "(no label)");
     nvPostResetNote("batch", n, words, gBVa);
     gBPush = gBData = gBN = gBNCode = 0; gBComputeSeen = false;
     gBLabels[0] = 0;          // the area is free again whatever happens
     struct { uint64_t va; uint32_t dw; uint32_t pad; } seg = {gBVa, words, 0};
+    if (gN615) {   // 0.9.26
+        if (!nv615Submit(seg.va, words)) {
+            NSLog(@"NVMTLGsp: native615 batch of %u launches failed: %s", n, batchLabels);
+            nvNoteGpuFailure(2); return false;
+        }
+        return true;
+    }
     uint64_t in[1] = {0}, out[1] = {0};
     uint32_t outN = 1;
     const uint64_t ta = mach_absolute_time();
+    if (getenv("NVMTL_TRACE"))
+        NSLog(@"NVMTL_TRACE gr batch labels: %s", batchLabels);
     if (!callMethod(kSelExecSeg, in, 1, out, &outN, &seg, sizeof(seg)) || !out[0]) {
-        NSLog(@"NVMTLGsp: GR batch of %u launches: execSegments failed", n); nvNoteGpuFailure(1); return false;
+        NSLog(@"NVMTLGsp: GR batch of %u launches: execSegments failed: %s", n,
+              batchLabels); nvNoteGpuFailure(1); return false;
     }
     const uint64_t tb0 = mach_absolute_time();
     uint64_t wi[2] = {out[0], nvFenceUs()}, wo[1] = {0};
     outN = 1;
     if (IOConnectCallMethod(gConn, 18, wi, 2, NULL, 0, wo, &outN, NULL, NULL)) {
-        NSLog(@"NVMTLGsp: GR batch of %u launches: fenceWait failed", n); nvNoteGpuFailure(2); return false;
+        NSLog(@"NVMTLGsp: GR batch of %u launches: fenceWait failed: %s", n,
+              batchLabels); nvNoteGpuFailure(2); return false;
     }
     static int trace = -1;
     if (trace < 0) trace = getenv("NVMTL_TRACE") != NULL;
@@ -1423,6 +2168,16 @@ static bool grQueue(bool force, const uint32_t *code, uint32_t codeWords, uint32
                     const uint32_t *push, uint32_t npush,
                     const uint32_t grid[3], const uint32_t block[3]) {
     NV_GPU_LOCKED;
+    // 0.9.37: never launch a threadgroup the SM cannot hold; it hangs the channel
+    if (block[0] && block[1] && block[2]) {
+        const uint64_t threads = (uint64_t)block[0] * block[1] * block[2];
+        const uint64_t warps = (threads + 31) / 32, r = (regs + 7) & ~7u;
+        if (threads > 1024 || warps * 32 * r > 65536) {
+            nvGrWhy = "threadgroup exceeds the SM register file";
+            NSLog(@"NVMTLGsp: refused launch %ux%ux%u with %u registers", block[0], block[1], block[2], regs);
+            return false;
+        }
+    }
     const bool on = nvBatchOn() || force;
     if (gBSlab < 0 && nvNativeDrainShared && !gBN) {   // 0.8.0: shared area still owned by a command buffer
         nvNativeDrain(); nvNativeDrainShared = false;
@@ -1519,6 +2274,13 @@ static bool grQueue(bool force, const uint32_t *code, uint32_t codeWords, uint32
 bool nvCeFill(uint64_t dstVa, uint64_t bytes, uint32_t value) {
     NV_GPU_LOCKED;
     if (!gCpu || !bytes) return false;
+    if (gN615 && (!nv615CeOn() || (bytes & 3) || nv615Cpu(dstVa, bytes))) {   // 0.9.27; 0.9.45 CE for VRAM
+        if (!nvGrFlush()) return false;
+        uint8_t *d = nv615Cpu(dstVa, bytes);
+        if (!d) { NSLog(@"NVMTLGsp: native615 fill outside mapped memory"); nvNoteGpuFailure(1); return false; }
+        for (uint64_t i = 0; i < bytes; i++) d[i] = (uint8_t)(value >> (8 * (i & 3)));
+        return true;
+    }
     uint32_t *pb = (uint32_t *)(gCpu + NVGSP_STAGE_PUSH);
     const uint32_t cap = NVGSP_STAGE_PUSH_MAX / 4, maxDim = 1u << 15;
     uint32_t w = 0;
@@ -1616,6 +2378,79 @@ static void nvGr3DDump(const NV3DDraw *d) {
 // command buffer of draws and dispatches is one submission; the family
 // completes it on the native path. Outside a batch it is submitted and
 // waited for as before.
+// 0.9.75: per-draw GPU time. With /Library/Preferences/nvmtl-gputime, every
+// 3D draw is bracketed by two four-word semaphore releases ({id, 0, GPU
+// timestamp}): one after the earlier work (start), one after the draw's own
+// writes (end), so GPU idle time between frames is not charged to the draw.
+// A thread folds finished pairs by draw label every 2 s and logs the top
+// costs as NVMTL_GPUTIME. Diagnostic only: the extra releases order the pipe.
+#define NV_GT_N 4096                             // draws in flight in the ring
+typedef struct { uint32_t id, pad; uint64_t ts; } nvGtStamp;
+static nvGtStamp *gGt;                           // 2 stamps per draw
+static uint64_t gGtVa;
+static uint32_t gGtNext;
+static char gGtLabel[NV_GT_N][96];
+static uint32_t gGtId[NV_GT_N];                  // id the slot expects (0: free)
+static void *nvGpuTimeThread(void *arg) {
+    (void)arg;
+    for (;;) {
+        sleep(2);
+        struct { char label[96]; uint64_t ns, max; uint32_t n; } agg[64];
+        uint32_t na = 0;
+        uint64_t total = 0;
+        for (uint32_t i = 0; i < NV_GT_N; i++) {
+            const uint32_t id = gGtId[i];
+            if (!id) continue;
+            const nvGtStamp a = gGt[2 * i], b = gGt[2 * i + 1];
+            if (a.id != id || b.id != id || b.ts < a.ts) continue;   // not finished yet
+            const uint64_t ns = b.ts - a.ts;
+            gGtId[i] = 0;
+            total += ns;
+            uint32_t k = 0;
+            while (k < na && strcmp(agg[k].label, gGtLabel[i])) k++;
+            if (k == na) {
+                if (na == 64) continue;
+                snprintf(agg[na].label, sizeof agg[na].label, "%s", gGtLabel[i]);
+                agg[na].ns = agg[na].max = 0; agg[na].n = 0; na++;
+            }
+            agg[k].ns += ns; agg[k].n++;
+            if (ns > agg[k].max) agg[k].max = ns;
+        }
+        if (!total) continue;
+        for (uint32_t r = 0; r < 12 && r < na; r++) {   // top 12 by total time
+            uint32_t best = r;
+            for (uint32_t k = r + 1; k < na; k++) if (agg[k].ns > agg[best].ns) best = k;
+            if (best != r) { __typeof__(agg[0]) t = agg[r]; agg[r] = agg[best]; agg[best] = t; }
+            NSLog(@"NVMTL_GPUTIME %5.1f%% %8.3f ms total %5u draws avg %7.3f max %7.3f ms  %s",
+                  100.0 * agg[r].ns / total, agg[r].ns / 1e6, agg[r].n, agg[r].ns / 1e6 / agg[r].n,
+                  agg[r].max / 1e6, agg[r].label);
+        }
+        NSLog(@"NVMTL_GPUTIME window total %.3f ms over 2 s", total / 1e6);
+    }
+    return NULL;
+}
+static bool nvGpuTimeOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        struct stat st;
+        on = stat("/Library/Preferences/nvmtl-gputime", &st) == 0 && st.st_uid == 0;
+        void *mem = NULL;
+        if (on && posix_memalign(&mem, 4096, NV_GT_N * 2 * sizeof(nvGtStamp)) == 0) {
+            memset(mem, 0, NV_GT_N * 2 * sizeof(nvGtStamp));
+            uint64_t va = 0;
+            if (nvHeapWrap(mem, NV_GT_N * 2 * sizeof(nvGtStamp), &va)) {
+                gGt = mem; gGtVa = va;
+                pthread_t th;
+                pthread_create(&th, NULL, nvGpuTimeThread, NULL);
+                pthread_detach(th);
+                NSLog(@"NVMTL_GPUTIME on (ring %u draws at 0x%llx)", NV_GT_N, (unsigned long long)va);
+            }
+        }
+        if (!gGt) on = 0;
+    }
+    return on == 1;
+}
+
 bool nvGr3DDraw(const NV3DDraw *d) {
     NV_GPU_LOCKED;
     // 0.8.8: draws stay out of the batch unless NVMTL_DRAWBATCH=1 or the file
@@ -1624,8 +2459,10 @@ bool nvGr3DDraw(const NV3DDraw *d) {
     // (downsample_blur / narrow_blur passes sampling the previous pass)
     static int drawBatch = -1;
     if (drawBatch < 0) {
+        // 0.9.44: on by default on native615 (suite84 83/84 and fps 107 -> 120
+        // with it; the login hangs were the legacy channel)
         const char *e = getenv("NVMTL_DRAWBATCH");
-        drawBatch = e ? atoi(e) != 0 : access("/Library/Preferences/nvmtl-drawbatch", F_OK) == 0;
+        drawBatch = e ? atoi(e) != 0 : (gN615 || access("/Library/Preferences/nvmtl-drawbatch", F_OK) == 0);
     }
     const bool batched = gBDepth && nvBatchOn() && drawBatch;
     if (!batched) nvGrFlush();
@@ -1640,6 +2477,7 @@ bool nvGr3DDraw(const NV3DDraw *d) {
     uint32_t *pb = batched ? (uint32_t *)gBCpu + gBPush : (uint32_t *)(gCpu + NVGSP_GR_PUSH), c = 0;
 #define M3(m, n) (0x20000000u | ((uint32_t)(n) << 16) | (0u << 13) | ((m) >> 2))
 #define P1(m, v) do { pb[c++] = M3(m, 1); pb[c++] = (uint32_t)(v); } while (0)
+    uint32_t gtSlot = 0, gtId = 0;                                      // 0.9.75: per-draw GPU time
     // 0.8.22: the next draw of the same pass follows without a wait; a new
     // pass (or compute before it) first flushes the previous pass's ROP writes
     // 0.8.40: a draw that reads its colour attachments waits for the earlier draws' writes too
@@ -1648,9 +2486,15 @@ bool nvGr3DDraw(const NV3DDraw *d) {
         if (gB3DDirty) c = nv3DFlushWords(pb, c);
         else pb[c++] = (0x4u << 29) | (0u << 13) | (0x110u >> 2);   // IMMD WAIT_FOR_IDLE after earlier work
     }
-    pb[c++] = M3(0x0, 1); pb[c++] = 0xC997;                              // SET_OBJECT ADA_A, subch 0
-    memcpy(pb + c, kInit3D, sizeof kInit3D);
-    c += sizeof kInit3D / 4;
+    // 0.9.48: the next draw of the same pass keeps the class and the static
+    // init state (a third of every draw's words); NVMTL_3D_REINIT=1 restores it
+    static int reinit = -1;
+    if (reinit < 0) reinit = getenv("NVMTL_3D_REINIT") != NULL;
+    if (!samePass || reinit) {
+        pb[c++] = M3(0x0, 1); pb[c++] = 0xC997;                          // SET_OBJECT ADA_A, subch 0
+        memcpy(pb + c, kInit3D, sizeof kInit3D);
+        c += sizeof kInit3D / 4;
+    }
     if (gSlmVa) {   // SET_SHADER_LOCAL_MEMORY_A..E (the SPH carries each stage's size)
         pb[c++] = M3(0x790, 5);
         pb[c++] = (uint32_t)(gSlmVa >> 32); pb[c++] = (uint32_t)gSlmVa;
@@ -1692,7 +2536,8 @@ bool nvGr3DDraw(const NV3DDraw *d) {
     // picks the slice (SET_RT_LAYER CONTROL = shader selects, as NVK when the
     // stage writes the layer); otherwise slice 0
     P1(0x15cc, d->layers > 1 ? 1u << 16 : 0);
-    const int zdbg = getenv("NVMTL_ZDBG") ? atoi(getenv("NVMTL_ZDBG")) : 0;
+    static int zdbg = -1;   // 0.9.48: read once, not per draw
+    if (zdbg < 0) zdbg = getenv("NVMTL_ZDBG") ? atoi(getenv("NVMTL_ZDBG")) : 0;
     if (d->zVa && !(zdbg & 1)) {                                        // zeta: block linear
         pb[c++] = M3(0x0fe0, 5);
         pb[c++] = (uint32_t)(d->zVa >> 32); pb[c++] = (uint32_t)d->zVa;
@@ -1767,7 +2612,8 @@ bool nvGr3DDraw(const NV3DDraw *d) {
     for (uint32_t i = 0; i < d->nrt; ++i) if (d->rt[i].clear) P1(0x1a00 + i * 4, d->rt[i].writeMask);
     // NVMTL_3D_STOP=n cuts the stream after phase n (1 clears, 2 fixed
     // state, 3 programs, 4 vertex fetch) to find a method the class refuses
-    const int stop = getenv("NVMTL_3D_STOP") ? atoi(getenv("NVMTL_3D_STOP")) : 99;
+    static int stop = -1;
+    if (stop < 0) stop = getenv("NVMTL_3D_STOP") ? atoi(getenv("NVMTL_3D_STOP")) : 99;
     if (d->draw && stop > 1) {
         // Metal: y up in NDC, z in [0,1]
         const float sx = (float)(d->vp[2] / 2), sy = (float)(-d->vp[3] / 2);
@@ -1888,6 +2734,16 @@ bool nvGr3DDraw(const NV3DDraw *d) {
         }
         if (stop <= 4) goto submit;
         // draw
+        if (nvGpuTimeOn()) {                                            // 0.9.75: start stamp
+            gtSlot = gGtNext++ % NV_GT_N;
+            gtId = gGtNext;
+            gGtId[gtSlot] = 0;
+            snprintf(gGtLabel[gtSlot], sizeof gGtLabel[gtSlot], "%s rt %ux%u", gLastLabel, d->rt[0].w, d->rt[0].h);
+            const uint64_t a = gGtVa + (uint64_t)gtSlot * 2 * sizeof(nvGtStamp);
+            pb[c++] = M3(0x1b00, 4);
+            pb[c++] = (uint32_t)(a >> 32); pb[c++] = (uint32_t)a; pb[c++] = gtId;
+            pb[c++] = (1u << 4) | (15u << 12);                          // RELEASE after writes, ALL, FOUR_WORDS (+timestamp)
+        }
         P1(0x1434, (uint32_t)d->baseVertex);                            // GLOBAL_BASE_VERTEX_INDEX
         P1(0x1118, (uint32_t)d->baseVertex);                            // VERTEX_ID_BASE
         P1(0x1438, d->baseInstance);                                    // GLOBAL_BASE_INSTANCE_INDEX
@@ -1909,6 +2765,13 @@ bool nvGr3DDraw(const NV3DDraw *d) {
         P1(0x1614, 0);                                                  // END
     }
 submit:
+    if (gtId) {                                                         // 0.9.75: end stamp
+        const uint64_t a = gGtVa + (uint64_t)gtSlot * 2 * sizeof(nvGtStamp) + sizeof(nvGtStamp);
+        pb[c++] = M3(0x1b00, 4);
+        pb[c++] = (uint32_t)(a >> 32); pb[c++] = (uint32_t)a; pb[c++] = gtId;
+        pb[c++] = (1u << 4) | (15u << 12);
+        gGtId[gtSlot] = gtId;
+    }
     // 0.5.4: release a semaphore after all writes, with the flush on: ROP
     // writes still in the colour caches otherwise miss a copy engine readback.
     // 0.8.22: a batched draw leaves it to the pass end (gB3DDirty)
@@ -1930,11 +2793,17 @@ submit:
 #undef M3
     if (c > maxw) { NSLog(@"NVMTLGsp: 3D method stream too long"); return false; }
     if (batched) { gBPush += c; gBN++; return true; }
-    if (getenv("NVMTL_TRACE"))
+    static int trace3d = -1;
+    if (trace3d < 0) trace3d = getenv("NVMTL_TRACE") != NULL;
+    if (trace3d)
         NSLog(@"NVMTL_TRACE 3d: rt0 va 0x%llx pitch %u %ux%u fmt 0x%x clear %d, vs 0x%llx fs 0x%llx, %u words",
               d->rt[0].va, d->rt[0].pitch, d->rt[0].w, d->rt[0].h, d->rt[0].format, d->rt[0].clear,
               d->vs.va, d->fs.va, c);
     struct { uint64_t va; uint32_t dw; uint32_t pad; } seg = {gVa + NVGSP_GR_PUSH, c, 0};
+    if (gN615) {   // 0.9.33: draws on the owned client channel (3D object allocated with it)
+        if (!nv615Submit(seg.va, seg.dw)) { nvNoteGpuFailure(2); nvGr3DDump(d); return false; }
+        return true;
+    }
     uint64_t in[1] = {0}, out[1] = {0};
     uint32_t outN = 1;
     if (!callMethod(kSelExecSeg, in, 1, out, &outN, &seg, sizeof(seg)) || !out[0]) {
@@ -1945,5 +2814,30 @@ submit:
     if (IOConnectCallMethod(gConn, 18, wi, 2, NULL, 0, wo, &outN, NULL, NULL)) {
         NSLog(@"NVMTLGsp: 3D fenceWait failed"); nvNoteGpuFailure(2); nvGr3DDump(d); return false;
     }
+    return true;
+}
+
+// 0.9.80: macOS hands out new GPU resources zero-filled (fresh VM pages), and
+// frameworks rely on it: RenderBox loads new private icon layers without a
+// clear, so a VRAM span recycled from an earlier icon showed that icon
+// (Stocks with the Apps grid). It also keeps one process's freed VRAM from
+// reaching another. NVMTL_ZERO_NEW=0 or /Library/Preferences/nvmtl-zeronew-off: old behaviour.
+static bool nvZeroNewOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_ZERO_NEW");
+        on = e ? atoi(e) != 0 : access("/Library/Preferences/nvmtl-zeronew-off", F_OK) != 0;
+    }
+    return on;
+}
+bool nvVramAlloc(uint64_t bytes, uint64_t *va) {
+    if (!nvVramAllocRaw(bytes, va)) return false;
+    if (nvZeroNewOn() && !nvCeFill(*va, (bytes + 3) & ~3ULL, 0)) NSLog(@"NVMTLGsp: zero fill of a new VRAM span failed");
+    return true;
+}
+bool nvVramAllocKind(uint64_t bytes, uint32_t kind, uint64_t *va, uint32_t *handle) {
+    NV_GPU_LOCKED;
+    if (!nvVramAllocKindRaw(bytes, kind, va, handle)) return false;
+    if (nvZeroNewOn() && !nvCeFill(*va, (bytes + 3) & ~3ULL, 0)) NSLog(@"NVMTLGsp: zero fill of a new surface failed");
     return true;
 }

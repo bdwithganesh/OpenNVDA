@@ -1,6 +1,10 @@
 #include "nvenc_h264.h"
 #include <string.h>
 
+// The NVENC ABI is the LP64 macOS one. MSVC's bitfield layout on a Windows
+// host makes the same declarations 12 bytes larger; the driver never runs
+// there, so only assert the layout for the actual target ABI.
+#if defined(__LP64__) && !defined(_WIN32)
 _Static_assert(sizeof(nvenc_h264_drv_pic_setup_s) == 512, "picture ABI");
 _Static_assert(sizeof(nvenc_h264_slice_control_s) == 128, "slice ABI");
 _Static_assert(sizeof(nvenc_h264_me_control_s) == 192, "ME ABI");
@@ -8,6 +12,7 @@ _Static_assert(sizeof(nvenc_h264_md_control_s) == 128, "MD ABI");
 _Static_assert(sizeof(nvenc_h264_quant_control_s) == 192, "quant ABI");
 _Static_assert(sizeof(nvenc_pic_stat_s) == 128, "status ABI");
 _Static_assert(sizeof(nvenc_h264_setup) <= NVENC_SETUP_BYTES, "setup allocation");
+#endif
 
 static uint32_t align_up(uint32_t n, uint32_t a) { return (n + a - 1) & ~(a - 1); }
 

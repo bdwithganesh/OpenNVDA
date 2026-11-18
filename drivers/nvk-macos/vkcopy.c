@@ -71,8 +71,11 @@ main(int argc, char **argv)
       .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
       .pApplicationName = "vkcopy", .apiVersion = VK_API_VERSION_1_3,
    };
+   const char *exts[] = { "VK_KHR_portability_enumeration" };
    const VkInstanceCreateInfo ici = {
       .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
+      .enabledExtensionCount = 1, .ppEnabledExtensionNames = exts,
+      .flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR,
    };
    VkInstance inst;
    CHECK(vkCreateInstance(&ici, NULL, &inst));

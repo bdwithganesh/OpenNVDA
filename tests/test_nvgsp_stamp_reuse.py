@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the real ordered-stamp routine with closed/reused channel slots."""
 import argparse
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -71,7 +72,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="nvgsp-stamp-reuse-") as tmp:
         cpp, exe = Path(tmp) / "check.cpp", Path(tmp) / "check"
         cpp.write_text(MOCK + source[start:end])
-        subprocess.run(["clang++", "-std=c++17", "-fsanitize=undefined",
+        subprocess.run([os.environ.get('CXX', 'clang++'), "-std=c++17", "-fsanitize=undefined",
                         str(cpp), "-o", str(exe)], check=True)
         return subprocess.run([str(exe)], timeout=10).returncode
 

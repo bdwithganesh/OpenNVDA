@@ -10,6 +10,7 @@
 #include "air_nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_builtin_builder.h"
+#include "nak_private.h"   /* nak_nir_cmat_mul_add_flags (tensor-core simdgroup_matrix) */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,6 +66,11 @@ typedef struct {
     char *err;
     size_t errlen;
     int failed;
+    int smat_mma;           /* simdgroup_matrix lanes in the tensor-core layout (smat_layout_free) */
+    /* multiply_accumulate calls already computed as the rows 8-15 half of
+     * an earlier paired HMMA (smat_partner): their results */
+    struct { const air_function *f; uint32_t inst; nir_def *d; } smat_pend[32];
+    uint32_t smat_npend;
 } ctx;
 
 static void fail(ctx *c, const char *fmt, ...) {
@@ -92,6 +98,8 @@ static void layout(ctx *c, uint32_t t, uint32_t *size, uint32_t *align) {
     case AT_INT: *size = x->bits <= 8 ? 1 : x->bits / 8; *align = *size; return;
     case AT_FLOAT: *size = *align = x->bits / 8; return;
     case AT_PTR: *size = *align = 8; return;
+    /* bfloat16 is a 16-bit storage type: 2 bytes, 2-byte aligned */
+    case AT_OTHER: *size = *align = (x->bits + 7) / 8; return;
     case AT_VEC: {
         uint32_t es, ea;
         layout(c, x->elem, &es, &ea);
@@ -158,6 +166,10 @@ static int scalar_shape(ctx *c, uint32_t t, uint32_t *bits, uint32_t *comps) {
     switch (x->kind) {
     case AT_INT: *bits = x->bits; break;
     case AT_FLOAT: *bits = x->bits; break;
+    /* bfloat16: 2 bytes in memory, an fp32 value in NIR (exact: bf16 is the
+     * top half of fp32). Loads widen, stores round to nearest even, so every
+     * bfloat operation runs as fp32 arithmetic. */
+    case AT_OTHER: if (x->bits != 16) return -1; *bits = 32; break;
     case AT_PTR: *bits = (x->addrspace == 1 || x->addrspace == 2 || x->addrspace == 6) ? 64 : 32; break;
     default: return -1;
     }
@@ -165,10 +177,25 @@ static int scalar_shape(ctx *c, uint32_t t, uint32_t *bits, uint32_t *comps) {
     return 0;
 }
 
+static int is_bf16(ctx *c, uint32_t t) {
+    const air_type *x = T(c, t);
+    if (x->kind == AT_VEC) x = T(c, x->elem);
+    return x->kind == AT_OTHER && x->bits == 16;
+}
+/* bf16 bits (16-bit) -> fp32 value; fp32 value -> bf16 bits, round to nearest even */
+static nir_def *bf2f(nir_builder *b, nir_def *v) { return nir_ishl_imm(b, nir_u2u32(b, v), 16); }
+static nir_def *f2bf(nir_builder *b, nir_def *v) {
+    nir_def *u = v->bit_size == 32 ? v : nir_f2f32(b, v);
+    nir_def *r = nir_iadd(b, nir_iadd_imm(b, u, 0x7fff), nir_iand_imm(b, nir_ushr_imm(b, u, 16), 1));
+    nir_def *q = nir_ior_imm(b, nir_ushr_imm(b, u, 16), 0x40);   /* NaN stays a quiet NaN */
+    return nir_u2u16(b, nir_bcsel(b, nir_fneu(b, u, u), q, nir_ushr_imm(b, r, 16)));
+}
+static nir_def *bf_round(nir_builder *b, nir_def *v) { return bf2f(b, f2bf(b, v)); }
+
 static int is_float(ctx *c, uint32_t t) {
     const air_type *x = T(c, t);
     if (x->kind == AT_VEC) x = T(c, x->elem);
-    return x->kind == AT_FLOAT;
+    return x->kind == AT_FLOAT || (x->kind == AT_OTHER && x->bits == 16);
 }
 
 static uint32_t ptr_as(ctx *c, uint32_t t) {
@@ -194,6 +221,7 @@ static nir_def *imm(ctx *c, uint64_t val, uint32_t bits) {
 static tval zero_of(ctx *c, uint32_t t) {
     tval r = {0};
     const air_type *x = T(c, t);
+    if (x->kind == AT_VOID) return r;   // a void operand (ret void, void call) has no value
     if (x->kind == AT_STRUCT || x->kind == AT_ARRAY) {
         r.n = x->kind == AT_STRUCT ? x->count : x->count;
         r.m = ralloc_array(c->s, tval, r.n ? r.n : 1);
@@ -202,7 +230,11 @@ static tval zero_of(ctx *c, uint32_t t) {
         return r;
     }
     uint32_t bits, comps;
-    if (scalar_shape(c, t, &bits, &comps)) { fail(c, "zero of unsupported type"); return r; }
+    if (scalar_shape(c, t, &bits, &comps)) {
+        const air_type *y = x->kind == AT_VEC ? T(c, x->elem) : x;
+        fail(c, "zero of unsupported type id %u kind %u bits %u count %u elem %u", t, y->kind, y->bits, y->count, y->elem);
+        return r;
+    }
     nir_def *z = imm(c, 0, bits);
     if (comps > 1) {
         nir_def *e[16];
@@ -223,7 +255,7 @@ static tval const_value(ctx *c, const air_value *v, uint32_t id) {
     case AV_CINT: case AV_CFP: {
         uint32_t bits, comps;
         if (scalar_shape(c, v->type, &bits, &comps)) { fail(c, "constant of odd type"); return r; }
-        r.d = imm(c, v->ival, bits);
+        r.d = imm(c, is_bf16(c, v->type) ? (uint64_t)(uint16_t)v->ival << 16 : v->ival, bits);
         return r;
     }
     case AV_CNULL: case AV_CUNDEF: return zero_of(c, v->type);
@@ -232,8 +264,9 @@ static tval const_value(ctx *c, const air_value *v, uint32_t id) {
             uint32_t bits, comps;
             if (scalar_shape(c, v->type, &bits, &comps)) { fail(c, "vector constant"); return r; }
             nir_def *e[16];
-            for (uint32_t i = 0; i < comps && i < 16; ++i)
-                e[i] = v->kind == AV_CDATA ? imm(c, v->data[i], bits) : get(c, v->elts[i]).d;
+            for (uint32_t i = 0; i < comps && i < 64; ++i)
+                e[i] = v->kind == AV_CDATA ? imm(c, is_bf16(c, v->type) ? (uint64_t)(uint16_t)v->data[i] << 16 : v->data[i], bits)
+                                           : get(c, v->elts[i]).d;
             r.d = nir_vec(&c->b, e, comps);
             return r;
         }
@@ -244,7 +277,7 @@ static tval const_value(ctx *c, const air_value *v, uint32_t id) {
             else {
                 uint32_t bits, comps;
                 scalar_shape(c, x->elem, &bits, &comps);
-                r.m[i].d = imm(c, v->data[i], bits);
+                r.m[i].d = imm(c, is_bf16(c, x->elem) ? (uint64_t)(uint16_t)v->data[i] << 16 : v->data[i], bits);
             }
         }
         return r;
@@ -391,6 +424,26 @@ static uint64_t ctor_mask(ctx *c, uint32_t t, uint64_t x) {
     if (ty->kind != AT_INT || ty->bits >= 64) return x;
     return x & ((1ull << ty->bits) - 1);
 }
+static const char *callee_name(ctx *c, const air_inst *in);
+
+/* Whether a function-constant pointer (AV_GLOBAL name.MTL_FC_INIT_i_type, or a
+ * CEXPR chain to it) received a value from the pipeline. Air folds
+ * air.is_function_constant_defined with this, before setup_args reads the
+ * globals the ctor writes. */
+static int fc_defined_ptr(ctx *c, uint32_t v) {
+    for (int d = 0; d < 8; ++d) {
+        const air_value *x = &c->f->values[v];
+        if (x->kind == AV_GLOBAL) {
+            const int fc = fc_index(c->m->globals[x->ival].name);
+            return fc >= 0 && fc < 128 &&
+                   (c->var->fc_defined[fc / 32] & (1u << (fc % 32))) != 0;
+        }
+        if (x->kind != AV_CEXPR || !x->n) break;
+        v = x->elts[0];
+    }
+    return 0;
+}
+
 static void run_ctors(ctx *c) {
     air_function *kf = c->f;
     for (uint32_t fi = 0; fi < c->m->nfunctions; ++fi) {
@@ -401,6 +454,7 @@ static void run_ctors(ctx *c) {
         uint8_t *have = calloc(fn->nvalues + 1, 1);
         uint32_t stores = 0;
         const char *why = NULL;
+        const char *why_name = NULL;
         for (uint32_t i = 0; i < fn->ninsts && !why; ++i) {
             const air_inst *in = &fn->insts[i];
             uint64_t a = 0, b2 = 0, r = 0;
@@ -507,7 +561,11 @@ static void run_ctors(ctx *c) {
                     else r = (uint64_t)(name[7] == 'a' ? (sa > sb ? sa : sb) : (sa < sb ? sa : sb));
                     break;
                 }
-                if (!name || strncmp(name, "air.normalize_function_constant_predicate", 41)) { why = "call"; break; }
+                if (name && !strcmp(name, "air.is_function_constant_defined")) {
+                    r = (uint64_t)fc_defined_ptr(c, in->ops[1]);
+                    break;
+                }
+                if (!name || strncmp(name, "air.normalize_function_constant_predicate", 41)) { why = "call"; why_name = name; break; }
                 if (!ctor_val(c, v, have, in->ops[1], &a)) { why = "call operand"; break; }
                 r = ctor_mask(c, fn->values[in->ops[1]].type, a) != 0;
                 break;
@@ -518,7 +576,7 @@ static void run_ctors(ctx *c) {
             if (why) break;
             if (in->value < fn->nvalues) { v[in->value] = ctor_mask(c, in->type, r); have[in->value] = 1; }
         }
-        if (why) fprintf(stderr, "air: %s: stopped after %u stores (%s)\n", fn->name, stores, why);
+        if (why) fprintf(stderr, "air: %s: stopped after %u stores (%s%s%s)\n", fn->name, stores, why, why_name ? ": " : "", why_name ? why_name : "");
         free(v); free(have);
     }
     c->f = kf;
@@ -601,7 +659,7 @@ static void place_globals(ctx *c) {
     /* 0.8.16: linked [[visible]] functions keep their own globals (RenderBox
      * effects in SecurityAgent sample through a constexpr sampler) */
     air_module *km = c->m;
-    for (uint32_t li = 0; li < c->var->nlink && li < 16; ++li) {
+    for (uint32_t li = 0; li < c->var->nlink && li < 64; ++li) {
         if (!c->var->link_mod[li]) continue;
         c->m = c->var->link_mod[li];
         place_module_globals(c, &c->link_goff[li], &c->link_gused[li], &c->link_csamp[li], &tg, &cd);
@@ -619,7 +677,7 @@ static void place_globals(ctx *c) {
         c->abi->cdata = calloc(cd, 1);
         c->abi->cdata_bytes = cd;
         init_module_globals(c, c->global_off, c->gused, c->const_samp_slot);
-        for (uint32_t li = 0; li < c->var->nlink && li < 16; ++li) {
+        for (uint32_t li = 0; li < c->var->nlink && li < 64; ++li) {
             if (!c->link_goff[li]) continue;
             c->m = c->var->link_mod[li];
             init_module_globals(c, c->link_goff[li], c->link_gused[li], c->link_csamp[li]);
@@ -718,13 +776,19 @@ static tval load_typed(ctx *c, uint32_t as, nir_def *addr, uint32_t t, uint32_t 
         return r;
     }
     uint32_t bits, comps;
-    if (scalar_shape(c, t, &bits, &comps)) { fail(c, "load of unsupported type"); return r; }
+    if (scalar_shape(c, t, &bits, &comps)) {
+        const air_type *y = x->kind == AT_VEC ? T(c, x->elem) : x;
+        fail(c, "load of unsupported type id %u kind %u bits %u count %u elem %u", t, y->kind, y->bits, y->count, y->elem);
+        return r;
+    }
     if (x->kind == AT_PTR || (x->kind == AT_VEC && T(c, x->elem)->kind == AT_PTR)) {
         /* pointers are 64-bit in memory whatever space they point to */
         nir_def *p = mem_load(c, as, addr, 64, comps, align);
         r.d = bits == 64 ? p : nir_u2u32(&c->b, p);
         return r;
     }
+    const int bf = is_bf16(c, t);
+    if (bf) bits = 16;                           /* memory holds bf16 bits */
     if (comps > 4) {                             /* split wide vectors */
         nir_def *e[16];
         const uint32_t es = (bits == 1 ? 8 : bits) / 8;
@@ -734,9 +798,11 @@ static tval load_typed(ctx *c, uint32_t as, nir_def *addr, uint32_t t, uint32_t 
             for (uint32_t k = 0; k < n; ++k) e[i + k] = nir_channel(&c->b, part, k);
         }
         r.d = nir_vec(&c->b, e, comps);
+        if (bf) r.d = bf2f(&c->b, r.d);
         return r;
     }
     r.d = mem_load(c, as, addr, bits, comps, align);
+    if (bf) r.d = bf2f(&c->b, r.d);
     return r;
 }
 
@@ -753,6 +819,7 @@ static void store_typed(ctx *c, uint32_t as, nir_def *addr, uint32_t t, tval v, 
     if (!v.d) { fail(c, "store of an aggregate as a scalar"); return; }
     nir_def *d = v.d;
     if (x->kind == AT_PTR && d->bit_size != 64) d = nir_u2u64(&c->b, d);
+    if (is_bf16(c, t) && d->bit_size != 16) d = f2bf(&c->b, d);
     if (d->num_components > 4) {
         const uint32_t es = (d->bit_size == 1 ? 8 : d->bit_size) / 8;
         for (uint32_t i = 0; i < d->num_components; i += 4) {
@@ -840,10 +907,40 @@ static nir_def *splat_like(nir_builder *b, nir_def *s, nir_def *like) {
     return nir_vec(b, e, like->num_components);
 }
 
+/* bcsel with one condition for every component of x */
+static nir_def *sel_lanes(nir_builder *b, nir_def *cond, nir_def *x, nir_def *y) {
+    return nir_bcsel(b, x->num_components > 1 ? nir_replicate(b, cond, x->num_components) : cond, x, y);
+}
+
+/* reduction name (sum, product, min, max, and, or, xor) -> ALU op */
+static nir_op reduce_alu(const char *n, int f, int sgn) {
+    if (!strcmp(n, "sum")) return f ? nir_op_fadd : nir_op_iadd;
+    if (!strcmp(n, "product")) return f ? nir_op_fmul : nir_op_imul;
+    if (!strcmp(n, "min")) return f ? nir_op_fmin : sgn ? nir_op_imin : nir_op_umin;
+    if (!strcmp(n, "max")) return f ? nir_op_fmax : sgn ? nir_op_imax : nir_op_umax;
+    if (!strcmp(n, "and")) return nir_op_iand;
+    if (!strcmp(n, "or")) return nir_op_ior;
+    if (!strcmp(n, "xor")) return nir_op_ixor;
+    return nir_num_opcodes;
+}
+
+/* prefix scan over the 4 lanes of a quad (Hillis-Steele, shuffles up) */
+static nir_def *quad_scan(nir_builder *b, nir_def *v, nir_op op, int inclusive, int f, int mul) {
+    nir_def *q = nir_iand_imm(b, nir_load_subgroup_invocation(b), 3);
+    for (int d = 1; d < 4; d <<= 1) {
+        nir_def *o = nir_shuffle_up(b, v, nir_imm_int(b, d));
+        v = sel_lanes(b, nir_uge(b, q, nir_imm_int(b, d)), nir_build_alu2(b, op, v, o), v);
+    }
+    if (inclusive) return v;
+    nir_def *id = f ? nir_imm_floatN_t(b, mul ? 1.0 : 0.0, v->bit_size) : nir_imm_intN_t(b, mul ? 1 : 0, v->bit_size);
+    if (v->num_components > 1) id = nir_replicate(b, id, v->num_components);
+    return sel_lanes(b, nir_ieq_imm(b, q, 0), id, nir_shuffle_up(b, v, nir_imm_int(b, 1)));
+}
+
 /* atomic op name -> nir op */
 static int atomic_op(const char *n, int is_signed, int is_float, nir_atomic_op *op) {
     if (!strcmp(n, "add")) *op = is_float ? nir_atomic_op_fadd : nir_atomic_op_iadd;
-    else if (!strcmp(n, "sub")) *op = nir_atomic_op_iadd;          /* negated operand */
+    else if (!strcmp(n, "sub")) *op = is_float ? nir_atomic_op_fadd : nir_atomic_op_iadd;   /* negated operand */
     else if (!strcmp(n, "and")) *op = nir_atomic_op_iand;
     else if (!strcmp(n, "or")) *op = nir_atomic_op_ior;
     else if (!strcmp(n, "xor")) *op = nir_atomic_op_ixor;
@@ -996,14 +1093,27 @@ static nir_def *cast(ctx *c, uint32_t op, nir_def *a, uint32_t srct, uint32_t ds
     case 2: return a->bit_size == 1 ? nir_ineg(b, nir_b2iN(b, a, bits)) : nir_i2iN(b, a, bits);
     case 3: return nir_f2uN(b, a, bits);
     case 4: return nir_f2iN(b, a, bits);
-    case 5: return a->bit_size == 1 ? nir_b2fN(b, a, bits) : nir_u2fN(b, a, bits);
-    case 6: return a->bit_size == 1 ? nir_fneg(b, nir_b2fN(b, a, bits)) : nir_i2fN(b, a, bits);
-    case 7: case 8: return nir_f2fN(b, a, bits);
+    case 5: {
+        nir_def *f = a->bit_size == 1 ? nir_b2fN(b, a, bits) : nir_u2fN(b, a, bits);
+        return is_bf16(c, dstt) ? bf_round(b, f) : f;
+    }
+    case 6: {
+        nir_def *f = a->bit_size == 1 ? nir_fneg(b, nir_b2fN(b, a, bits)) : nir_i2fN(b, a, bits);
+        return is_bf16(c, dstt) ? bf_round(b, f) : f;
+    }
+    case 7: case 8:                                                  /* fptrunc, fpext */
+        return is_bf16(c, dstt) ? bf_round(b, nir_f2f32(b, a)) : nir_f2fN(b, a, bits);
     case 9: case 10: case 12:                                        /* ptr<->int, addrspace */
         return a->bit_size == bits ? a : nir_u2uN(b, a, bits);
     case 11: {                                                       /* bitcast */
         if (ptr_as(c, srct) != ~0u || ptr_as(c, dstt) != ~0u)
             return a->bit_size == bits ? a : nir_u2uN(b, a, bits);
+        /* bfloat bitcasts move the 16-bit storage form */
+        if (is_bf16(c, srct)) a = f2bf(b, a);
+        if (is_bf16(c, dstt)) {
+            nir_def *v = a->bit_size == 16 ? a : nir_bitcast_vector(b, a, 16);
+            return bf2f(b, v);
+        }
         if (a->bit_size == bits && a->num_components == comps) return a;
         if (a->bit_size == 1 || bits == 1) { fail(c, "bitcast of i1 vectors"); return a; }
         return nir_bitcast_vector(b, a, bits);
@@ -1108,7 +1218,7 @@ static void emit_inst(ctx *c, const air_inst *in) {
         const air_value *mv = &c->f->values[in->ops[2]];
         const uint32_t n = T(c, in->type)->count;
         nir_def *e[16];
-        for (uint32_t i = 0; i < n && i < 16; ++i) {
+        for (uint32_t i = 0; i < n && i < 64; ++i) {
             int64_t k = 0;
             if (mv->kind == AV_CDATA) k = (int64_t)mv->data[i];
             else if (mv->kind == AV_CAGG) {
@@ -1472,6 +1582,13 @@ static tval texture_op(ctx *c, const air_inst *in, const char *name) {
         uint32_t i = 1 + (na > 1 && is_read_sampler(c, OPV(1)) ? 1 : 0) + (k.shadow ? 1 : 0);
         nir_def *coord = nir_u2u32(b, A(i++));
         nir_def *layer = k.array ? nir_u2u32(b, A(i++)) : NULL;
+        /* 16 Nov: newer AIR has an integer texel offset before lod
+         * (coord, [layer], offset, lod, i32); it was read as the lod, so
+         * every read(coord, lod) fetched mip 0 */
+        if (k.dim != GLSL_SAMPLER_DIM_MS && i + 3 <= na) {
+            nir_def *off = nir_u2u32(b, A(i++));
+            if (off->num_components == coord->num_components) coord = nir_iadd(b, coord, off);
+        }
         nir_def *lod = i < na && k.dim != GLSL_SAMPLER_DIM_MS ? nir_u2u32(b, A(i)) : nir_imm_int(b, 0);
         nir_def *v = emit_tex2(c, nir_texop_txf, &k, tex_handle(c, A(0), NULL), coord, layer, lod, NULL, NULL, NULL,
                                NULL, NULL, 0, ty, 4);
@@ -1527,13 +1644,22 @@ static tval texture_op(ctx *c, const air_inst *in, const char *name) {
  * col = (qid & 2) * 2 + (lane % 2) * 2; the lane holds (row, col) and
  * (row, col + 1). Multiplies gather rows of A and columns of B with
  * subgroup shuffles. ---- */
-static void smat_rc(nir_builder *b, nir_def *lane, nir_def **row, nir_def **col) {
+/* The tensor-core fragment layout (c->smat_mma): row = lane / 4, col =
+ * 2 * (lane % 4), the m16n8k8 A/C/D fragment rows 0-7. Used when nothing in
+ * the module can observe the layout (smat_layout_free). */
+static void smat_rc(ctx *c, nir_builder *b, nir_def *lane, nir_def **row, nir_def **col) {
+    if (c->smat_mma) {
+        *row = nir_ushr_imm(b, lane, 2);
+        *col = nir_ishl_imm(b, nir_iand_imm(b, lane, 3), 1);
+        return;
+    }
     nir_def *qid = nir_ushr_imm(b, lane, 2);
     *row = nir_iadd(b, nir_iand_imm(b, qid, 4), nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 3));
     *col = nir_iadd(b, nir_ishl_imm(b, nir_iand_imm(b, qid, 2), 1), nir_ishl_imm(b, nir_iand_imm(b, lane, 1), 1));
 }
 /* the lane holding (row, col), col even */
-static nir_def *smat_lane(nir_builder *b, nir_def *row, nir_def *col) {
+static nir_def *smat_lane(ctx *c, nir_builder *b, nir_def *row, nir_def *col) {
+    if (c->smat_mma) return nir_ior(b, nir_ishl_imm(b, row, 2), nir_ushr_imm(b, col, 1));
     nir_def *l = nir_iand_imm(b, nir_ushr_imm(b, col, 1), 1);
     l = nir_ior(b, l, nir_ishl_imm(b, nir_iand_imm(b, row, 3), 1));
     l = nir_ior(b, l, nir_ishl_imm(b, nir_iand_imm(b, nir_ushr_imm(b, col, 2), 1), 3));
@@ -1542,7 +1668,14 @@ static nir_def *smat_lane(nir_builder *b, nir_def *row, nir_def *col) {
 static uint32_t smat_bits(ctx *c, uint32_t t) {
     const air_type *x = T(c, t);
     if (x->kind == AT_VEC) x = T(c, x->elem);
+    if (x->kind == AT_OTHER) return 32;                  /* bfloat: fp32 values */
     return x->bits ? x->bits : 32;
+}
+/* simdgroup_matrix element type: 1 half (IEEE fp16), 2 bfloat, 0 other */
+static int smat_half(ctx *c, uint32_t value) {
+    const air_type *x = T(c, c->f->values[value].type);
+    if (x->kind == AT_VEC) x = T(c, x->elem);
+    return x->kind == AT_FLOAT && x->bits == 16 ? 1 : x->kind == AT_OTHER && x->bits == 16 ? 2 : 0;
 }
 static nir_def *fconv(nir_builder *b, nir_def *v, uint32_t bits) {
     return v->bit_size == bits ? v : bits == 16 ? nir_f2f16(b, v) : nir_f2f32(b, v);
@@ -1557,12 +1690,150 @@ static nir_def *smat_addr(ctx *c, nir_def *ptr, nir_def *epr, nir_def *orig, nir
     nir_def *off = nir_imul_imm(b, nir_iadd(b, nir_imul(b, nir_iadd(b, oy, mr), nir_u2u64(b, epr)), nir_iadd(b, ox, mc)), es);
     return nir_iadd(b, ptr, ptr->bit_size == 64 ? off : nir_u2u32(b, off));
 }
+/* whether type t is, points to or holds a simdgroup_matrix (<64 x T>) */
+static int smat_holds(ctx *c, uint32_t t, int depth) {
+    if (t >= c->m->ntypes || depth > 8) return 0;
+    const air_type *x = &c->m->types[t];
+    if (x->kind == AT_VEC) return x->count == 64;
+    if (x->kind == AT_PTR || x->kind == AT_ARRAY) return smat_holds(c, x->elem, depth + 1);
+    if (x->kind == AT_STRUCT)
+        for (uint32_t i = 0; i < x->count; ++i) if (smat_holds(c, x->members[i], depth + 1)) return 1;
+    return 0;
+}
+/* The lane layout of a simdgroup_matrix is only observable through its
+ * elements (thread_elements() = extractelement/insertelement on <64 x T>),
+ * a cast, a matrix in memory other kernels may read, or code we cannot see.
+ * If the module does none of that, any layout gives the same results. */
+static int smat_layout_free(ctx *c) {
+    if (c->var && c->var->nlink) return 0;
+    for (uint32_t fi = 0; fi < c->m->nfunctions; ++fi) {
+        const air_function *fn = &c->m->functions[fi];
+        if (fn->is_proto) continue;
+        for (uint32_t k = 0; k < fn->ninsts; ++k) {
+            const air_inst *in = &fn->insts[k];
+            int touch = in->type != ~0u && smat_holds(c, in->type, 0);
+            for (uint32_t o = 0; o < in->nops && !touch; ++o)
+                if (in->ops[o] < fn->nvalues) touch = smat_holds(c, fn->values[in->ops[o]].type, 0);
+            if (!touch) continue;
+            switch (in->op) {
+            case AI_PHI: case AI_SELECT: case AI_ALLOCA: case AI_EXTRACTVAL: case AI_INSERTVAL:
+            case AI_RET: case AI_FREEZE: break;
+            case AI_GEP: if (!smat_holds(c, in->type, 0)) return 0; break;   /* an element pointer */
+            case AI_LOAD: case AI_STORE: {
+                const air_type *pt = T(c, fn->values[in->ops[0]].type);
+                if (pt->kind != AT_PTR || pt->addrspace != 0) return 0;      /* thread memory only */
+                break;
+            }
+            case AI_CALL: {
+                const air_value *cv = &fn->values[in->ops[0]];
+                if (cv->kind != AV_FUNCTION) return 0;
+                const air_function *callee = &c->m->functions[cv->ival];
+                if (!strncmp(callee->name, "air.simdgroup_matrix_8x8_", 25)) break;
+                if (callee->is_proto) return 0;                              /* scanned when it has a body */
+                break;
+            }
+            default: return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+/* A later multiply_accumulate of the same block that can share this call's
+ * HMMA: same intrinsic (types), same B value, its A and C defined before
+ * this call (so they exist here and do not depend on its result), and not
+ * already taken by an earlier pair. NAKC_NO_PAIR=1 disables pairing. */
+static const air_inst *smat_partner(ctx *c, const air_inst *in, uint32_t ii) {
+    const air_function *f = c->f;
+    if (getenv("NAKC_NO_PAIR") || c->smat_npend >= 32) return NULL;
+    const char *name = callee_name(c, in);
+    if (!name) return NULL;
+    for (uint32_t k = ii + 1; k < f->ninsts && k < ii + 128 && f->insts[k].bb == in->bb; ++k) {
+        const air_inst *x = &f->insts[k];
+        if (x->op != AI_CALL || x->nops != in->nops || x->ops[2] != in->ops[2] || x->type != in->type) continue;
+        const char *xn = callee_name(c, x);
+        if (!xn || strcmp(xn, name)) continue;
+        int ok = 1;
+        for (uint32_t o = 1; o <= 3 && ok; o += 2) {   /* ops[1] = A, ops[3] = C */
+            const air_value *v = &f->values[x->ops[o]];
+            if (v->kind == AV_INST && v->inst >= ii) ok = 0;
+        }
+        for (uint32_t q = 0; q < c->smat_npend && ok; ++q)
+            if (c->smat_pend[q].f == f && c->smat_pend[q].inst == k) ok = 0;
+        if (ok) return x;
+    }
+    return NULL;
+}
+
+/* whether a multiply_accumulate call runs on the tensor cores (HMMA path) */
+static int smat_hmma_call(ctx *c, const air_inst *x) {
+    if (x->op != AI_CALL || x->nops != 4 || getenv("NAKC_NO_HMMA")) return 0;
+    const char *n = callee_name(c, x);
+    if (!n || strncmp(n, "air.simdgroup_matrix_8x8_multiply_accumulate", 44)) return 0;
+    const int ht = smat_half(c, x->ops[1]);
+    return ht && ht == smat_half(c, x->ops[2]);
+}
+/* number of uses of value v in the current function */
+static uint32_t smat_uses(ctx *c, uint32_t v) {
+    uint32_t n = 0;
+    for (uint32_t k = 0; k < c->f->ninsts; ++k)
+        for (uint32_t o = 0; o < c->f->insts[k].nops; ++o) n += c->f->insts[k].ops[o] == v;
+    return n;
+}
+/* value v exists before instruction ii (an argument, a constant or defined earlier) */
+static int smat_before(ctx *c, uint32_t v, uint32_t ii) {
+    const air_value *x = &c->f->values[v];
+    return x->kind != AV_INST || x->inst < ii;
+}
+/* The next step of a k chain: a later tensor-core multiply of the same block
+ * and intrinsic whose C is this call's result, that result used nowhere
+ * else, and whose A and B exist before instruction ii. NAKC_NO_K16=1 off. */
+static const air_inst *smat_kchain(ctx *c, const air_inst *in, uint32_t ii) {
+    const air_function *f = c->f;
+    if (getenv("NAKC_NO_K16") || in->value == ~0u || smat_uses(c, in->value) != 1) return NULL;
+    const char *name = callee_name(c, in);
+    const uint32_t me = (uint32_t)(in - f->insts);
+    for (uint32_t k = me + 1; k < f->ninsts && k < me + 128 && f->insts[k].bb == in->bb; ++k) {
+        const air_inst *x = &f->insts[k];
+        if (x->op != AI_CALL || x->nops != in->nops || x->ops[3] != in->value) continue;
+        const char *xn = callee_name(c, x);
+        if (!xn || !name || strcmp(xn, name) || !smat_hmma_call(c, x)) return NULL;
+        if (!smat_before(c, x->ops[1], ii) || !smat_before(c, x->ops[2], ii)) return NULL;
+        for (uint32_t q = 0; q < c->smat_npend; ++q)
+            if (c->smat_pend[q].f == f && c->smat_pend[q].inst == k) return NULL;
+        return x;
+    }
+    return NULL;
+}
+
+/* Value v is a simdgroup_matrix load whose every use is the B operand (and
+ * only the B operand) of a tensor-core multiply: it lives in the B-fragment
+ * layout. Pure function of the IR, so load and multiply agree.
+ * NAKC_NO_BLOAD=1 disables it. */
+static int smat_b_layout(ctx *c, uint32_t v) {
+    const air_function *f = c->f;
+    if (getenv("NAKC_NO_BLOAD") || v >= f->nvalues || f->values[v].kind != AV_INST) return 0;
+    const air_inst *def = &f->insts[f->values[v].inst];
+    const char *dn = def->op == AI_CALL ? callee_name(c, def) : NULL;
+    if (!dn || strncmp(dn, "air.simdgroup_matrix_8x8_load", 29)) return 0;
+    int uses = 0;
+    for (uint32_t k = 0; k < f->ninsts; ++k) {
+        const air_inst *x = &f->insts[k];
+        for (uint32_t o = 0; o < x->nops; ++o) {
+            if (x->ops[o] != v) continue;
+            if (o != 2 || !smat_hmma_call(c, x) || x->ops[1] == v || x->ops[3] == v) return 0;
+            ++uses;
+        }
+    }
+    return uses > 0;
+}
+
 static int smat_call(ctx *c, const air_inst *in, const char *name, tval *r) {
     if (strncmp(name, "air.simdgroup_matrix_8x8_", 25)) return 0;
     nir_builder *b = &c->b;
     const char *op = name + 25;
     nir_def *lane = nir_load_subgroup_invocation(b), *row, *col;
-    smat_rc(b, lane, &row, &col);
+    smat_rc(c, b, lane, &row, &col);
     if (!strncmp(op, "init_filled", 11) || !strncmp(op, "init_diag", 9)) {
         const uint32_t bits = smat_bits(c, in->type);
         nir_def *v = fconv(b, arg(c, in, 0), bits), *z = nir_imm_floatN_t(b, 0.0, bits);
@@ -1576,7 +1847,9 @@ static int smat_call(ctx *c, const air_inst *in, const char *name, tval *r) {
         const uint32_t pi = st ? 1 : 0;
         const uint32_t pt = c->f->values[in->ops[1 + pi]].type;
         const uint32_t as = T(c, pt)->addrspace;
-        const uint32_t bits = smat_bits(c, st ? c->f->values[in->ops[1]].type : in->type), es = bits / 8;
+        const uint32_t vt = st ? c->f->values[in->ops[1]].type : in->type;
+        const int bf = is_bf16(c, vt);
+        const uint32_t bits = bf ? 16 : smat_bits(c, vt), es = bits / 8;   /* storage width */
         nir_def *ptr = arg(c, in, pi);
         nir_def *val = st ? arg(c, in, 0) : NULL, *e[2];
         /* Sonoma: (ptr, i64 elements_per_row, <2 x i64> origin, i1 transpose).
@@ -1594,20 +1867,135 @@ static int smat_call(ctx *c, const air_inst *in, const char *name, tval *r) {
             epr = arg(c, in, pi + 1); orig = arg(c, in, pi + 2);
             tr = nir_i2b(b, arg(c, in, pi + 3));
         }
+        /* a B-only load gathers the B fragment: element (2t + k, g) */
+        const int bl = !st && smat_b_layout(c, in->value);
+        nir_def *bg = nir_ushr_imm(b, lane, 2), *bt2 = nir_ishl_imm(b, nir_iand_imm(b, lane, 3), 1);
         for (int k = 0; k < 2; ++k) {
             nir_def *a;
+            nir_def *er = bl ? nir_iadd_imm(b, bt2, k) : row, *ec = bl ? bg : nir_iadd_imm(b, col, k);
             if (strided) {
-                nir_def *cc = nir_u2u64(b, nir_iadd_imm(b, col, k)), *rr = nir_u2u64(b, row);
+                nir_def *cc = nir_u2u64(b, ec), *rr = nir_u2u64(b, er);
                 nir_def *x = nir_iadd(b, nir_u2u64(b, nir_channel(b, orig, 0)), cc);
                 nir_def *y = nir_iadd(b, nir_u2u64(b, nir_channel(b, orig, 1)), rr);
                 nir_def *off = nir_imul_imm(b, nir_iadd(b, nir_imul(b, x, nir_u2u64(b, nir_channel(b, str, 0))),
                                                          nir_imul(b, y, nir_u2u64(b, nir_channel(b, str, 1)))), es);
                 a = nir_iadd(b, ptr, ptr->bit_size == 64 ? off : nir_u2u32(b, off));
-            } else a = smat_addr(c, ptr, epr, orig, tr, row, nir_iadd_imm(b, col, k), es);
-            if (st) mem_store(c, as, a, nir_channel(b, val, k), es);
+            } else a = smat_addr(c, ptr, epr, orig, tr, er, ec, es);
+            if (st) mem_store(c, as, a, bf ? f2bf(b, nir_channel(b, val, k)) : nir_channel(b, val, k), es);
             else e[k] = mem_load(c, as, a, bits, 1, es);
         }
-        if (!st) r->d = nir_vec2(b, e[0], e[1]);
+        if (!st) r->d = bf ? bf2f(b, nir_vec2(b, e[0], e[1])) : nir_vec2(b, e[0], e[1]);
+        return 1;
+    }
+    const int ht = smat_half(c, in->ops[1]);
+    if (!strncmp(op, "multiply_accumulate", 19) && ht && ht == smat_half(c, in->ops[2]) &&
+        !getenv("NAKC_NO_HMMA")) {
+        /* half A and B: one tensor-core HMMA.16816-class m16n8k8 (fp32
+         * accumulate). The 8x8 operands fill rows 0-7 of the 16x8 A/C/D
+         * fragments; rows 8-15 carry a second multiply_accumulate of the
+         * block with the same B (smat_partner), or zeros. Lanes are
+         * re-gathered between the matrix layout and the PTX fragment layout
+         * (g = lane / 4, t = lane % 4): A, C, D (g, 2t..2t+1); B (2t + i, g). */
+        const uint32_t ii = (uint32_t)(in - c->f->insts);
+        for (uint32_t k = 0; k < c->smat_npend; ++k)
+            if (c->smat_pend[k].f == c->f && c->smat_pend[k].inst == ii) {   /* done with its partner */
+                r->d = c->smat_pend[k].d;
+                c->smat_pend[k] = c->smat_pend[--c->smat_npend];
+                return 1;
+            }
+        const air_inst *pin = smat_partner(c, in, ii);
+        /* k chain: this call's result feeds only the next step (kin); with a
+         * row partner, the partner's next step (kpin) must share kin's B */
+        const air_inst *kin = smat_kchain(c, in, ii), *kpin = NULL;
+        if (kin && pin) {
+            kpin = smat_kchain(c, pin, ii);
+            if (!kpin || kpin->ops[2] != kin->ops[2] || kpin == kin) kpin = NULL;
+            if (!kpin) pin = NULL;           /* keep the k16 pair, rows 8-15 zero */
+        }
+        const uint32_t bits = smat_bits(c, kin ? kin->type : in->type);
+        nir_def *A = arg(c, in, 0), *C = arg(c, in, 2);
+        nir_def *A2 = pin ? arg(c, pin, 0) : NULL, *C2 = pin ? arg(c, pin, 2) : NULL;
+        nir_def *g = nir_ushr_imm(b, lane, 2), *t2 = nir_ishl_imm(b, nir_iand_imm(b, lane, 3), 1);
+        nir_def *lp = smat_lane(c, b, g, t2);                    /* lane with pair (g, 2t) */
+        nir_def *z16 = nir_imm_floatN_t(b, 0.0, 16), *z32 = nir_imm_float(b, 0.0f);
+        /* operands: fp16 values, or bf16 bits. A bfloat matrix value is an
+         * exact bf16 in fp32 (loads widen, bfloat results round), so its
+         * bits are the top half: no rounding needed. */
+#define HOP(v) (ht == 2 ? nir_u2u16(b, nir_ushr_imm(b, (v), 16)) : nir_f2f16(b, (v)))
+#define AFR(M, k) (c->smat_mma ? HOP(nir_channel(b, M, k)) : nir_shuffle(b, HOP(nir_channel(b, M, k)), lp))
+#define CFR(M, k) (c->smat_mma ? nir_f2f32(b, nir_channel(b, M, k)) : nir_shuffle(b, nir_f2f32(b, nir_channel(b, M, k)), lp))
+        nir_def *nodd = nir_i2b(b, nir_iand_imm(b, g, 1)), *neven = nir_iand_imm(b, g, ~1), *fb[4];
+        /* the B fragment (2t + i, g) of matrix value bv */
+        for (int h = 0; h < (kin ? 2 : 1); ++h) {
+            const uint32_t bv = h ? kin->ops[2] : in->ops[2];
+            nir_def *B = getd(c, bv);
+            if (smat_b_layout(c, bv)) {
+                fb[2 * h] = HOP(nir_channel(b, B, 0));
+                fb[2 * h + 1] = HOP(nir_channel(b, B, 1));
+            } else if (c->smat_mma) {
+                /* each B row pair travels packed */
+                nir_def *bp = nir_pack_32_2x16_split(b, HOP(nir_channel(b, B, 0)), HOP(nir_channel(b, B, 1)));
+                for (int i = 0; i < 2; ++i) {
+                    nir_def *v = nir_shuffle(b, bp, smat_lane(c, b, nir_iadd_imm(b, t2, i), neven));
+                    fb[2 * h + i] = nir_bcsel(b, nodd, nir_unpack_32_2x16_split_y(b, v), nir_unpack_32_2x16_split_x(b, v));
+                }
+            } else {
+                for (int i = 0; i < 2; ++i) {
+                    nir_def *lb = smat_lane(c, b, nir_iadd_imm(b, t2, i), neven);
+                    fb[2 * h + i] = nir_bcsel(b, nodd, nir_shuffle(b, HOP(nir_channel(b, B, 1)), lb),
+                                                     nir_shuffle(b, HOP(nir_channel(b, B, 0)), lb));
+                }
+            }
+        }
+        nir_def *fa, *fbv;
+        if (kin) {
+            /* m16n8k16: a0,a1 (g, k 2t..), a2,a3 (g + 8, k 2t..), a4,a5 (g, k 2t + 8..),
+             * a6,a7 (g + 8, k 2t + 8..); b0,b1 k 2t.., b2,b3 k 2t + 8.. */
+            nir_def *K = arg(c, kin, 0), *K2 = kpin ? arg(c, kpin, 0) : NULL;
+            nir_def *e[8] = {AFR(A, 0), AFR(A, 1), A2 ? AFR(A2, 0) : z16, A2 ? AFR(A2, 1) : z16,
+                             AFR(K, 0), AFR(K, 1), K2 ? AFR(K2, 0) : z16, K2 ? AFR(K2, 1) : z16};
+            fa = nir_vec(b, e, 8);
+            fbv = nir_vec4(b, fb[0], fb[1], fb[2], fb[3]);
+        } else {
+            fa = nir_vec4(b, AFR(A, 0), AFR(A, 1), A2 ? AFR(A2, 0) : z16, A2 ? AFR(A2, 1) : z16);
+            fbv = nir_vec2(b, fb[0], fb[1]);
+        }
+        nir_def *fc = nir_vec4(b, CFR(C, 0), CFR(C, 1), C2 ? CFR(C2, 0) : z32, C2 ? CFR(C2, 1) : z32);
+#undef CFR
+#undef AFR
+#undef HOP
+        const struct nak_nir_cmat_mul_add_flags flags = {
+            .cmat_type = kin ? NAK_CMAT_TYPE_M16N8K16_FLOAT : NAK_CMAT_TYPE_M16N8K8_FLOAT,
+            .a_type = ht == 2 ? GLSL_TYPE_BFLOAT16 : GLSL_TYPE_FLOAT16,
+            .b_type = ht == 2 ? GLSL_TYPE_BFLOAT16 : GLSL_TYPE_FLOAT16, .sat = false,
+        };
+        nir_def *d = nir_cmat_muladd_nv(b, 4, fa, fbv, fc, .flags = NAK_AS_U32(flags));
+        /* In the tensor-core layout D rows 0-7 are already the result, but
+         * an HMMA result that goes straight into a loop-carried value hung
+         * the GPU with 3+ accumulators (a counter register was clobbered on
+         * the back edge, ctxsw timeout 109). Taking D through a shuffle in
+         * the same block, as the Apple layout does, avoids it; ld is the
+         * lane itself here. NAKC_MMA_NODSHUF=1 skips it (diagnostics). */
+        const int direct = c->smat_mma && getenv("NAKC_MMA_NODSHUF");
+        /* matrix lane (row, col) takes D[row][col..col+1] from MMA lane row * 4 + col / 2 */
+        nir_def *ld = nir_ior(b, nir_ishl_imm(b, row, 2), nir_ushr_imm(b, col, 1));
+        /* a bfloat result is rounded to bf16 like every bfloat value */
+        const int bfres = is_bf16(c, kin ? kin->type : in->type);
+#define DSH(k) (direct ? nir_channel(b, d, k) : nir_shuffle(b, nir_channel(b, d, k), ld))
+#define DFR(k) (bfres ? bf_round(b, DSH(k)) : fconv(b, DSH(k), bits))
+        nir_def *lo = nir_vec2(b, DFR(0), DFR(1)), *hi = pin ? nir_vec2(b, DFR(2), DFR(3)) : NULL;
+#undef DFR
+#undef DSH
+        /* results: the first step's are only used by the second (unused) */
+        const air_inst *done[3] = {kin ? kin : pin, kin ? kpin : NULL, kin ? pin : NULL};
+        nir_def *res[3] = {kin ? lo : hi, kin ? hi : NULL, kin ? lo : NULL};
+        r->d = lo;
+        for (int q = 0; q < 3; ++q)
+            if (done[q] && c->smat_npend < 32) {
+                c->smat_pend[c->smat_npend].f = c->f;
+                c->smat_pend[c->smat_npend].inst = (uint32_t)(done[q] - c->f->insts);
+                c->smat_pend[c->smat_npend++].d = res[q];
+            }
         return 1;
     }
     if (!strncmp(op, "multiply_accumulate", 19)) {
@@ -1617,8 +2005,8 @@ static int smat_call(ctx *c, const air_inst *in, const char *name, tval *r) {
         nir_def *b0 = nir_f2f32(b, nir_channel(b, B, 0)), *b1 = nir_f2f32(b, nir_channel(b, B, 1));
         nir_def *acc0 = nir_f2f32(b, nir_channel(b, C, 0)), *acc1 = nir_f2f32(b, nir_channel(b, C, 1));
         for (int k = 0; k < 8; ++k) {
-            nir_def *la = smat_lane(b, row, nir_imm_int(b, k & ~1));   /* A[row][k] */
-            nir_def *lb = smat_lane(b, nir_imm_int(b, k), col);       /* B[k][col], B[k][col + 1] */
+            nir_def *la = smat_lane(c, b, row, nir_imm_int(b, k & ~1));   /* A[row][k] */
+            nir_def *lb = smat_lane(c, b, nir_imm_int(b, k), col);       /* B[k][col], B[k][col + 1] */
             nir_def *ak = nir_shuffle(b, (k & 1) ? a1 : a0, la);
             acc0 = nir_ffma(b, ak, nir_shuffle(b, b0, lb), acc0);
             acc1 = nir_ffma(b, ak, nir_shuffle(b, b1, lb), acc1);
@@ -1691,7 +2079,7 @@ static tval indirect_call(ctx *c, const air_inst *in) {
     uint32_t k = 0;
     if (nl) make_leaf_vars(c, rett, rv, &k);
     nir_block *join = new_block(c);
-    for (uint32_t i = 0; i < c->var->nlink && i < 16 && !c->failed; ++i) {
+    for (uint32_t i = 0; i < c->var->nlink && i < 64 && !c->failed; ++i) {
         if (!c->var->link_fn[i] || c->var->link_fn[i]->nargs > in->nops - 1) continue;
         nir_block *yes = new_block(c), *no = new_block(c);
         nir_goto_if(b, yes, nir_ieq_imm(b, id, (int)(i + 1)), no);
@@ -1962,8 +2350,8 @@ static tval call(ctx *c, const air_inst *in) {
         uint32_t v = in->ops[1];
         for (int d = 0; d < 4 && c->f->values[v].kind == AV_CEXPR && c->f->values[v].n; ++d) v = c->f->values[v].elts[0];
         const air_value *x = &c->f->values[v];
-        const int fc = x->kind == AV_GLOBAL ? fc_index(c->m->globals[x->ival].name) : -1;
-        r.d = nir_imm_bool(b, fc >= 0 && (c->var->fc_defined[fc / 32] & (1u << (fc % 32))));
+        (void)x;
+        r.d = nir_imm_bool(b, fc_defined_ptr(c, in->ops[1]));
         return r;
     }
     if (!strncmp(name, "air.normalize_function_constant_predicate", 41)) {
@@ -1983,28 +2371,36 @@ static tval call(ctx *c, const air_inst *in) {
         const char *e = strchr(p, '.');
         snprintf(opn, sizeof opn, "%.*s", e ? (int)(e - p) : (int)strlen(p), p);
         if (e && (e[1] == 's' || e[1] == 'u' || e[1] == 'f') && e[2] == '.') sk = e[1];
+        /* float atomics come as air.atomic.global.add.f32, without the .f. marker */
+        if (in->nops > 3 && is_float(c, c->f->values[in->ops[2]].type)) sk = 'f';
         const uint32_t as = local ? 3 : T(c, c->f->values[in->ops[1]].type)->addrspace;
         nir_def *ptr = arg(c, in, 0);
         if (!strcmp(opn, "load")) { r.d = mem_load(c, as, ptr, in->type == ~0u ? 32 : (T(c, in->type)->bits), 1, 4); return r; }
         if (!strcmp(opn, "store")) { mem_store(c, as, ptr, arg(c, in, 1), 4); return r; }
         if (!strncmp(opn, "cmpxchg", 7)) {
-            /* (ptr, expected*, desired, ...) returns bool, updates *expected */
+            /* (ptr, expected*, desired, ...) returns the old value, updates *expected */
             const uint32_t eas = T(c, c->f->values[in->ops[2]].type)->addrspace;
             nir_def *expp = arg(c, in, 1);
             nir_def *expected = mem_load(c, eas, expp, 32, 1, 4);
             nir_def *old = atomic_swap(c, as, ptr, expected, arg(c, in, 2));
             mem_store(c, eas, expp, old, 4);
-            r.d = nir_ieq(b, old, expected);
+            r.d = in->type != ~0u && T(c, in->type)->bits == 1 ? nir_ieq(b, old, expected) : old;
             return r;
         }
         nir_atomic_op op;
         if (atomic_op(opn, sk == 's', sk == 'f', &op)) { fail(c, "%s", name); return r; }
         nir_def *v = arg(c, in, 1);
-        if (!strcmp(opn, "sub")) v = nir_ineg(b, v);
+        if (!strcmp(opn, "sub")) v = sk == 'f' ? nir_fneg(b, v) : nir_ineg(b, v);
         r.d = atomic(c, as, ptr, v, op);
         return r;
     }
 
+    /* texture.fence(): the thread's earlier writes to the texture before its later reads */
+    if (!strncmp(name, "air.fence_texture", 17) || !strncmp(name, "air.fence_depth", 15)) {
+        nir_barrier(b, .execution_scope = SCOPE_NONE, .memory_scope = SCOPE_WORKGROUP,
+                    .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_image);
+        return r;
+    }
     if (strstr(name, "_texture_") || strstr(name, "_depth_2d") || strstr(name, "_depth_cube"))
         return texture_op(c, in, name);
 
@@ -2078,10 +2474,6 @@ static tval call(ctx *c, const air_inst *in) {
     else if (!strcmp(base, "simd_and")) r.d = nir_reduce(b, a0, .reduction_op = nir_op_iand);
     else if (!strcmp(base, "simd_or")) r.d = nir_reduce(b, a0, .reduction_op = nir_op_ior);
     else if (!strcmp(base, "simd_xor")) r.d = nir_reduce(b, a0, .reduction_op = nir_op_ixor);
-    else if (!strcmp(base, "simd_prefix_exclusive_sum"))
-        r.d = nir_exclusive_scan(b, a0, .reduction_op = f ? nir_op_fadd : nir_op_iadd);
-    else if (!strcmp(base, "simd_prefix_inclusive_sum"))
-        r.d = nir_inclusive_scan(b, a0, .reduction_op = f ? nir_op_fadd : nir_op_iadd);
     else if (!strcmp(base, "simd_shuffle")) r.d = nir_shuffle(b, a0, nir_u2u32(b, a1));
     else if (!strcmp(base, "simd_shuffle_xor")) r.d = nir_shuffle_xor(b, a0, nir_u2u32(b, a1));
     else if (!strcmp(base, "simd_shuffle_up")) r.d = nir_shuffle_up(b, a0, nir_u2u32(b, a1));
@@ -2148,8 +2540,71 @@ static tval call(ctx *c, const air_inst *in) {
         uint32_t ub, uc;
         if (!scalar_shape(c, in->type, &ub, &uc) && ub != 32) r.d = nir_f2fN(b, r.d, ub);
     }
-    else if (!strcmp(base, "quad_shuffle_down")) r.d = nir_shuffle_down(b, a0, nir_u2u32(b, a1));
-    else if (!strcmp(base, "quad_shuffle_up")) r.d = nir_shuffle_up(b, a0, nir_u2u32(b, a1));
+    else if (!strcmp(base, "quad_shuffle_down") || !strcmp(base, "quad_shuffle_up")) {
+        /* within the quad: a lane whose source is outside it keeps its value
+         * (a whole-simdgroup shuffle read the next quad) */
+        const int down = strstr(base, "_down") != NULL;
+        nir_def *lane = nir_load_subgroup_invocation(b), *d = nir_u2u32(b, a1);
+        nir_def *q = nir_iand_imm(b, lane, 3);
+        nir_def *src = down ? nir_iadd(b, q, d) : nir_isub(b, q, d);
+        nir_def *inside = down ? nir_ult(b, src, nir_imm_int(b, 4)) : nir_uge(b, q, d);
+        nir_def *v = nir_shuffle(b, a0, nir_ior(b, nir_iand_imm(b, lane, ~3), nir_iand_imm(b, src, 3)));
+        r.d = sel_lanes(b, inside, v, a0);
+    }
+    else if (!strcmp(base, "simd_shuffle_rotate_down") || !strcmp(base, "simd_shuffle_rotate_up") ||
+             !strcmp(base, "quad_shuffle_rotate_down") || !strcmp(base, "quad_shuffle_rotate_up")) {
+        const int w = base[0] == 'q' ? 4 : 32;
+        nir_def *lane = nir_load_subgroup_invocation(b), *d = nir_u2u32(b, a1);
+        nir_def *pos = strstr(base, "_down") ? nir_iadd(b, lane, d) : nir_isub(b, lane, d);
+        r.d = nir_shuffle(b, a0, nir_ior(b, nir_iand_imm(b, lane, ~(w - 1)), nir_iand_imm(b, pos, w - 1)));
+    }
+    else if (!strncmp(base, "quad_prefix_", 12) || !strncmp(base, "simd_prefix_", 12)) {
+        /* {simd,quad}_prefix_{inclusive,exclusive}_{sum,product} */
+        const int incl = strstr(base, "inclusive") != NULL, mul = strstr(base, "product") != NULL;
+        const nir_op op = mul ? (f ? nir_op_fmul : nir_op_imul) : (f ? nir_op_fadd : nir_op_iadd);
+        if (!strstr(base, "_sum") && !mul) fail(c, "intrinsic %s", name);
+        else if (base[0] == 's')
+            r.d = incl ? nir_inclusive_scan(b, a0, .reduction_op = op) : nir_exclusive_scan(b, a0, .reduction_op = op);
+        else r.d = quad_scan(b, a0, op, incl, f, mul);
+    }
+    else if (!strncmp(base, "quad_", 5) && reduce_alu(base + 5, f, sgn) != nir_num_opcodes) {
+        /* quad_{sum,product,min,max,and,or,xor}: butterfly over the 4 lanes */
+        const nir_op op = reduce_alu(base + 5, f, sgn);
+        nir_def *v = nir_build_alu2(b, op, a0, nir_shuffle_xor(b, a0, nir_imm_int(b, 1)));
+        r.d = nir_build_alu2(b, op, v, nir_shuffle_xor(b, v, nir_imm_int(b, 2)));
+    }
+    else if (!strcmp(base, "quad_all") || !strcmp(base, "quad_any") || !strcmp(base, "quad_ballot") ||
+             !strcmp(base, "quad_is_first") || !strcmp(base, "quad_broadcast_first") ||
+             !strcmp(base, "quad_active_threads_mask")) {
+        /* the quad's 4 bits of the simdgroup ballots */
+        nir_def *lane = nir_load_subgroup_invocation(b), *qb = nir_iand_imm(b, lane, ~3);
+        nir_def *act = nir_iand_imm(b, nir_ushr(b, nir_ballot(b, 1, 32, nir_imm_true(b)), qb), 0xf);
+        nir_def *bits = NULL;
+        if (!strcmp(base, "quad_all") || !strcmp(base, "quad_any") || !strcmp(base, "quad_ballot"))
+            bits = nir_iand_imm(b, nir_ushr(b, nir_ballot(b, 1, 32, a0->bit_size == 1 ? a0 : nir_ine_imm(b, a0, 0)), qb), 0xf);
+        if (!strcmp(base, "quad_all")) r.d = nir_ieq(b, bits, act);
+        else if (!strcmp(base, "quad_any")) r.d = nir_ine_imm(b, bits, 0);
+        else if (!strcmp(base, "quad_is_first")) r.d = nir_ieq(b, nir_find_lsb(b, act), nir_iand_imm(b, lane, 3));
+        else if (!strcmp(base, "quad_broadcast_first")) r.d = nir_shuffle(b, a0, nir_ior(b, qb, nir_find_lsb(b, act)));
+        else r.d = !strcmp(base, "quad_ballot") ? bits : act;
+        if (r.d->bit_size != 1 && in->type != ~0u && T(c, in->type)->kind == AT_INT && T(c, in->type)->bits != r.d->bit_size)
+            r.d = nir_u2uN(b, r.d, T(c, in->type)->bits);
+    }
+    else if (!strcmp(base, "extract_bits") || !strcmp(base, "insert_bits")) {
+        /* extract_bits(x, offset, bits) / insert_bits(base, insert, offset, bits);
+         * offset and bits are scalars also for a vector x */
+        const int ins = base[0] == 'i';
+        const unsigned bs = a0->bit_size, nc = a0->num_components;
+        if (bs > 32 || na < (ins ? 4u : 3u)) fail(c, "intrinsic %s", name);
+        else {
+            nir_def *off = nir_u2u32(b, ins ? a2 : a1), *cnt = nir_u2u32(b, ins ? arg(c, in, 3) : a2);
+            if (nc > 1) { off = nir_replicate(b, off, nc); cnt = nir_replicate(b, cnt, nc); }
+            nir_def *x = sgn ? nir_i2i32(b, a0) : nir_u2u32(b, a0);
+            nir_def *v = ins ? nir_bitfield_insert(b, x, nir_u2u32(b, a1), off, cnt)
+                       : sgn ? nir_ibitfield_extract(b, x, off, cnt) : nir_ubitfield_extract(b, x, off, cnt);
+            r.d = nir_u2uN(b, v, bs);
+        }
+    }
     else if (!strcmp(base, "quad_shuffle_xor")) r.d = nir_shuffle_xor(b, a0, nir_u2u32(b, a1));
     else if (!strcmp(base, "quad_shuffle"))
         r.d = nir_shuffle(b, a0, nir_ior(b, nir_iand_imm(b, nir_load_subgroup_invocation(b), ~3), nir_iand_imm(b, nir_u2u32(b, a1), 3)));
@@ -2484,7 +2939,18 @@ static void emit_stage_outputs(ctx *c, tval val, uint32_t rett) {
         if (slot < 0) continue;
         nir_def *d = mv.d;
         if (d->bit_size == 1) d = nir_b2i32(&c->b, d);
+        /* The ROP truncates a float colour into a 16-bit float target; Metal rounds to nearest
+         * even. A half output is already rounded, but the inexact widening let the optimizer drop
+         * the f2f16/f2f32 pair (RenderBox jump-flood/glass passes drifted): widen it exactly. A
+         * float output into a target the pipeline marks 16-bit float (f16rt) rounds first. */
+        const int rtn = slot >= FRAG_RESULT_DATA0 && slot < FRAG_RESULT_DATA0 + 8 ? slot - FRAG_RESULT_DATA0 : -1;
+        const bool frag = !integer && c->stage == MESA_SHADER_FRAGMENT && rtn >= 0;
+        const bool round = frag && d->bit_size == 32 && (c->var->f16rt >> rtn & 1);
+        const uint32_t fpm = c->b.fp_math_ctrl;
+        if (frag && (d->bit_size == 16 || round)) c->b.fp_math_ctrl |= nir_fp_exact;
+        if (round) d = nir_f2f16_rtne(&c->b, d);
         if (d->bit_size != 32) d = integer ? nir_u2u32(&c->b, d) : nir_f2f32(&c->b, d);
+        c->b.fp_math_ctrl = fpm;
         if (d->num_components < comps) d = nir_pad_vector_imm_int(&c->b, d, 0, comps);
         if (d->num_components > comps) d = nir_trim_vector(&c->b, d, comps);
         if (!gOutVar[i]) gOutVar[i] = io_var(c, nir_var_shader_out, slot, comps, integer, "out");
@@ -3284,7 +3750,7 @@ static tval linked_call(ctx *c, const air_inst *in, air_module *lm, air_function
     uint8_t *sgu = c->gused;
     int32_t *scs = c->const_samp_slot;
     uint32_t li = 0;
-    while (li < c->var->nlink && li < 16 && c->var->link_mod[li] != lm) ++li;
+    while (li < c->var->nlink && li < 64 && c->var->link_mod[li] != lm) ++li;
     c->m = lm;
     c->global_off = li < 16 ? c->link_goff[li] : NULL;
     c->gused = li < 16 ? c->link_gused[li] : NULL;
@@ -3332,6 +3798,7 @@ nir_shader *air_to_nir(air_module *m, air_function *f, const nir_shader_compiler
     ctx c = {0};
     c.m = m; c.f = f; c.abi = abi; c.var = var; c.err = err; c.errlen = errlen;
     memset(abi, 0, sizeof(*abi));
+    c.smat_mma = !getenv("NAKC_SMAT_APPLE") && smat_layout_free(&c);
     if (f->is_proto || !f->nblocks) { snprintf(err, errlen, "%s has no body", f->name); return NULL; }
     {
         int32_t an = -1, on = -1;

@@ -2,6 +2,7 @@
 """Compile actual auto-channel policy; cached NVRAM must not override reset fallback."""
 from pathlib import Path
 import subprocess
+import os
 import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 source = (ROOT / "drivers/NVGspControl/NVGspControl.cpp").read_text()
@@ -69,5 +70,5 @@ int main() {
 with tempfile.TemporaryDirectory(prefix="nvgsp-reset-policy-") as tmp:
  cpp, exe = Path(tmp)/"check.cpp", Path(tmp)/"check"
  cpp.write_text(mock + methods + main)
- subprocess.run(["clang++", "-std=c++17", "-fsanitize=undefined", str(cpp), "-o", str(exe)], check=True)
+ subprocess.run([os.environ.get('CXX', 'clang++'), "-std=c++17", "-fsanitize=undefined", str(cpp), "-o", str(exe)], check=True)
  subprocess.run([str(exe)], timeout=10, check=True)

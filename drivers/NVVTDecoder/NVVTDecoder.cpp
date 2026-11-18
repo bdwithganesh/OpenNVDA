@@ -15,6 +15,12 @@ extern "C" {
 
 namespace {
 std::atomic<uint64_t> sessions{0}, submitted{0}, emitted{0}, errors{0}, gpuNS{0};
+// NVGspControl clientMemoryForType: 0x1000|handle only encodes 12 bits.
+// Handles above 0xfff need the 0.162.0 wide form, same as NVMTL/NVK.
+static inline uint32_t nvvt_map_type(uint64_t handle) {
+    return handle < 0x1000 ? (0x1000u | static_cast<uint32_t>(handle))
+                          : (0x40000000u | static_cast<uint32_t>(handle));
+}
 struct Buffer { uint64_t handle = 0, va = 0, bytes = 0; uint8_t *cpu = nullptr; };
 struct Decoder {
     std::mutex mutex;
@@ -30,7 +36,7 @@ struct Decoder {
     std::vector<uint8_t> linear;
     Decoder() { nvdec_h264_init(&h264); }
     void release(Buffer &b) {
-        if (b.cpu) IOConnectUnmapMemory64(conn, 0x1000 | (uint32_t)b.handle,
+        if (b.cpu) IOConnectUnmapMemory64(conn, nvvt_map_type(b.handle),
             mach_task_self(), (mach_vm_address_t)b.cpu);
         if (b.handle) IOConnectCallScalarMethod(conn, 23, &b.handle, 1, nullptr, nullptr);
         b = {};
@@ -50,7 +56,7 @@ struct Decoder {
         uint64_t bind[] = {b.handle, va, 0};
         if (IOConnectCallScalarMethod(conn, 24, bind, 3, nullptr, nullptr)) return false;
         mach_vm_address_t address = 0; mach_vm_size_t size = 0;
-        if (IOConnectMapMemory64(conn, 0x1000 | (uint32_t)b.handle, mach_task_self(),
+        if (IOConnectMapMemory64(conn, nvvt_map_type(b.handle), mach_task_self(),
                                 &address, &size, kIOMapAnywhere)) return false;
         b.cpu = reinterpret_cast<uint8_t *>(address);
         if (size < b.bytes) return false;
@@ -141,7 +147,8 @@ OSStatus start(VTVideoDecoderRef instance, VTVideoDecoderSession session,
     size_t nsets = 0, size = 0; const uint8_t *data = nullptr;
     OSStatus err = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, 0, &data,
                                                       &size, &nsets, &d->lengthBytes);
-    if (err || (d->lengthBytes != 1 && d->lengthBytes != 2 && d->lengthBytes != 4))
+    if (err || nsets < 1 || nsets > 32 ||
+        (d->lengthBytes != 1 && d->lengthBytes != 2 && d->lengthBytes != 4))
         return kVTVideoDecoderBadDataErr;
     for (size_t i = 0; i < nsets; ++i) {
         err = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, i, &data, &size, nullptr, nullptr);
@@ -209,6 +216,12 @@ OSStatus decode(VTVideoDecoderRef instance, VTVideoDecoderFrame frame,
         pos += length;
     }
     if (slices.empty()) return fail(kVTVideoDecoderBadDataErr);
+    if (first.pps_id < 0 || first.pps_id >= H264_MAX_PPS ||
+        !d->h264.pps[first.pps_id].valid ||
+        d->h264.pps[first.pps_id].sps_id < 0 ||
+        d->h264.pps[first.pps_id].sps_id >= H264_MAX_SPS ||
+        !d->h264.sps[d->h264.pps[first.pps_id].sps_id].valid)
+        return fail(kVTVideoDecoderBadDataErr);
     const h264_sps &s = d->h264.sps[d->h264.pps[first.pps_id].sps_id];
     if (s.chroma_format_idc != 1 || s.bit_depth_luma != 8 || s.bit_depth_chroma != 8 ||
         s.width > 4096 || s.height > 2304 || s.crop_left < 0 || s.crop_top < 0 ||

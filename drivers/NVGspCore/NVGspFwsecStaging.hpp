@@ -29,10 +29,12 @@ public:
             reset();
             return false;
         }
+        // 0.180.12: FwsecView owns exactly storedSize bytes of image. The DMA
+        // buffer is rounded up to 256 bytes; zero-fill the tail instead of
+        // reading past a caller's exact-size buffer.
         if (dmaImageBytes > view.desc.storedSize)
-            __builtin_memcpy(static_cast<uint8_t *>(image_.bytes()) + view.desc.storedSize,
-                             view.image + view.desc.storedSize,
-                             dmaImageBytes - view.desc.storedSize);
+            bzero(static_cast<uint8_t *>(image_.bytes()) + view.desc.storedSize,
+                  dmaImageBytes - view.desc.storedSize);
         if (!image_.syncToDevice()) {
             failure_ = 5;
             reset();

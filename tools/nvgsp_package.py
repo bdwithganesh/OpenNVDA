@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the pinned 570.144 AD103 GSP staging package."""
+"""Build a bounded AD103 GSP package; v2 includes external 615 ucodes."""
 import argparse, hashlib, json, struct
 from pathlib import Path
 from nvidia_gsp_elf import sections
@@ -7,7 +7,7 @@ from nvidia_bootloader_blob import parse as parse_bootloader
 
 MAGIC = b"NVGSPKG\0"
 TYPES = {"fwimage": 1, "signature": 2, "boot_image": 3,
-         "boot_descriptor": 4, "booter_load": 5}
+         "boot_descriptor": 4, "booter_load": 5, "ucodes": 6}
 
 def align(value: int, amount: int = 4096) -> int:
     return (value + amount - 1) & ~(amount - 1)
@@ -17,6 +17,7 @@ def main() -> None:
     ap.add_argument("--gsp", type=Path, required=True)
     ap.add_argument("--bootloader", type=Path, required=True)
     ap.add_argument("--booter-load", type=Path, required=True)
+    ap.add_argument("--ucodes", type=Path)
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
     elf = args.gsp.read_bytes()
@@ -31,6 +32,11 @@ def main() -> None:
         ("boot_descriptor", boot[parsed["descriptorOffset"]:][:84]),
         ("booter_load", args.booter_load.read_bytes()),
     ]
+    if args.ucodes:
+        ucodes = args.ucodes.read_bytes()
+        if not 4096 <= len(ucodes) <= (96 << 20):
+            raise ValueError("external ucodes must be 4 KiB through 96 MiB")
+        payloads.append(("ucodes", ucodes))
     header_bytes = 32 + 32 * len(payloads)
     cursor = align(header_bytes)
     entries, manifest = [], []
@@ -39,8 +45,10 @@ def main() -> None:
         manifest.append({"name": name, "type": TYPES[name], "offset": cursor,
                          "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
         cursor = align(cursor + len(data))
+    if cursor > 128 << 20:
+        raise ValueError("package exceeds 128 MiB staging capacity")
     out = bytearray(cursor)
-    struct.pack_into("<8sIIQQ", out, 0, MAGIC, 1, len(entries), cursor, 0)
+    struct.pack_into("<8sIIQQ", out, 0, MAGIC, 2 if args.ucodes else 1, len(entries), cursor, 0)
     for i, (entry, (_, data)) in enumerate(zip(entries, payloads)):
         struct.pack_into("<IIQQQ", out, 32 + i * 32, *entry)
         out[entry[2]:entry[2] + len(data)] = data

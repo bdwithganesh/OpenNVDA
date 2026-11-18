@@ -36,6 +36,7 @@
 // Open (once) the NVGspControl user client + staging. Returns false on
 // failure; all other calls then fail too.
 bool nvGspEnsure(void);
+bool nvGspNative615(void);   // 0.9.28: NVMTL_NATIVE615 owned-client backend requested
 bool nvGspValidate(void);  // 0.8.31: generation gate before native encoding
 uint64_t nvGspRecoverySerial(void); // successful resource rebinds in this process
 uint64_t nvGspGeneration(void);
@@ -87,6 +88,10 @@ bool nvGrLaunch(const uint32_t *code, uint32_t codeWords, uint32_t regs, uint32_
 // 0.6.13: one GPU submitter per process (recursive). nvExecuteOps holds it
 // for a whole command buffer.
 void nvGpuLock(void);
+bool nvGr615AsyncOn(void);              // 0.9.51
+void nvGr615SetAsyncTail(bool on);
+uint32_t nvGr615PendingSeq(void);
+bool nvGr615WaitSeq(uint32_t seq);
 void nvGpuUnlock(void);
 // 0.6.13: batched compute. Between Begin/End (takes the GPU lock) nvGrQueue
 // only appends the launch; nvGrFlush (and End, and every other submitting
@@ -166,7 +171,7 @@ typedef struct {
     uint32_t scs[16][4];
     uint32_t layers;                // layered pass: slices of the targets (renderTargetArrayLength), 0 = not layered
     uint32_t passId;                // 0.8.22: render pass (encoder) the draw belongs to, 0 = unknown
-    bool fbFetch;                   // 0.8.40: the fragment stage reads colour attachments ([[color(n)]])
+    bool fbFetch;                   // 0.8.40: the fragment stage reads colour attachments ([[color(n)]]); 0.9.72: or a memory barrier came first
     bool sampleShading;             // fragment requires one invocation per covered sample
     NV3DStage vs, fs;
     // 0.6.0: tessellation (tes.va != 0): generated TCS, the app's

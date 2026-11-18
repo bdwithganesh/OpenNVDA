@@ -2,9 +2,14 @@
  * 7.3 (syntax), 7.4 (semantics, incl. 7.4.8 RPS derivation), Tables 7-5/7-6. */
 #include "hevc_parse.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #define HEVC_RBSP_CAP 8192
+
+static void freeHevcSps(hevc_sps **p) {
+    if (p && *p) { free(*p); *p = NULL; }
+}
 
 static size_t load_rbsp(const uint8_t *nal, size_t size, uint8_t *rbsp) {
     return size > 2 ? h264_unescape(nal + 2, size - 2, rbsp, HEVC_RBSP_CAP) : 0;
@@ -108,15 +113,23 @@ static int parse_scaling(h264_bits *b, hevc_scaling *s) {
 static int parse_st_rps(h264_bits *b, int idx, int num_sets, const hevc_st_rps *sets,
                         hevc_st_rps *out) {
     memset(out, 0, sizeof(*out));
+    if (!b || !sets || !out || idx < 0 || idx > num_sets || num_sets < 0 ||
+        num_sets > 64)
+        return -1;
     if (idx != 0 && h264_u(b, 1)) {   /* inter_ref_pic_set_prediction_flag */
         int delta_idx = 1;
         if (idx == num_sets) delta_idx = (int)h264_ue(b) + 1;
-        if (delta_idx > idx) return -1;
+        if (delta_idx < 1 || delta_idx > idx) return -1;
         const hevc_st_rps *r = &sets[idx - delta_idx];
+        if (r->num_negative < 0 || r->num_negative > 16 ||
+            r->num_positive < 0 || r->num_positive > 16)
+            return -1;
         const int sign = (int)h264_u(b, 1);
         const int abs_delta = (int)h264_ue(b) + 1;
+        if (abs_delta <= 0) return -1;
         const int delta_rps = (1 - 2 * sign) * abs_delta;
         const int nd = r->num_negative + r->num_positive;
+        if (nd < 0 || nd > 32) return -1;
         int used[33], use_delta[33];
         for (int j = 0; j <= nd; ++j) {
             used[j] = (int)h264_u(b, 1);
@@ -203,23 +216,29 @@ static void skip_ptl(h264_bits *b, int max_sub_layers_minus1) {
 }
 
 int hevc_parse_sps(const uint8_t *nal, size_t size, hevc_sps *out) {
-    static uint8_t rbsp[HEVC_RBSP_CAP];
-    static hevc_sps s;
+    if (!nal || !size || !out) return -1;
+    uint8_t rbsp[HEVC_RBSP_CAP];
+    // 0.180.12: hevc_sps is ~18 KiB. It used to live on the stack here (and
+    // in a static before that); both are wrong (stack overflow / cross-thread
+    // corruption). Build it on the heap and publish it only on success.
+    hevc_sps *sp __attribute__((cleanup(freeHevcSps))) = calloc(1, sizeof(*sp));
+    if (!sp) return -1;
+#define s (*sp)
     h264_bits b;
     h264_bits_init(&b, rbsp, load_rbsp(nal, size, rbsp));
-    memset(&s, 0, sizeof(s));
     h264_u(&b, 4);                                  /* sps_video_parameter_set_id */
     const int max_sub_layers_minus1 = (int)h264_u(&b, 3);
     h264_u(&b, 1);
     if (max_sub_layers_minus1 > 6) return -1;
     skip_ptl(&b, max_sub_layers_minus1);
     s.id = (int)h264_ue(&b);
-    if (s.id >= HEVC_MAX_SPS) return -1;
+    if (s.id < 0 || s.id >= HEVC_MAX_SPS) return -1;
     s.chroma_format_idc = (int)h264_ue(&b);
-    if (s.chroma_format_idc > 3) return -1;
+    if (s.chroma_format_idc < 0 || s.chroma_format_idc > 3) return -1;
     if (s.chroma_format_idc == 3) s.separate_colour_plane_flag = (int)h264_u(&b, 1);
     s.width = (int)h264_ue(&b);
     s.height = (int)h264_ue(&b);
+    if (s.width <= 0 || s.height <= 0 || s.width > 65536 || s.height > 65536) return -1;
     if (h264_u(&b, 1)) {
         const int ux = s.chroma_format_idc == 1 || s.chroma_format_idc == 2 ? 2 : 1;
         const int uy = s.chroma_format_idc == 1 ? 2 : 1;
@@ -227,21 +246,33 @@ int hevc_parse_sps(const uint8_t *nal, size_t size, hevc_sps *out) {
         s.conf_right = (int)h264_ue(&b) * ux;
         s.conf_top = (int)h264_ue(&b) * uy;
         s.conf_bottom = (int)h264_ue(&b) * uy;
+        if (s.conf_left < 0 || s.conf_right < 0 || s.conf_top < 0 || s.conf_bottom < 0 ||
+            s.conf_left > s.width || s.conf_right > s.width - s.conf_left ||
+            s.conf_top > s.height || s.conf_bottom > s.height - s.conf_top)
+            return -1;
     }
     s.bit_depth_luma = (int)h264_ue(&b) + 8;
     s.bit_depth_chroma = (int)h264_ue(&b) + 8;
     s.log2_max_poc_lsb = (int)h264_ue(&b) + 4;
-    if (s.log2_max_poc_lsb > 16) return -1;
+    if (s.log2_max_poc_lsb < 4 || s.log2_max_poc_lsb > 16) return -1;
+    if (s.bit_depth_luma < 8 || s.bit_depth_luma > 16 ||
+        s.bit_depth_chroma < 8 || s.bit_depth_chroma > 16) return -1;
     const int ordering_all = (int)h264_u(&b, 1);
     for (int i = ordering_all ? 0 : max_sub_layers_minus1; i <= max_sub_layers_minus1; ++i) {
         s.max_dec_pic_buffering = (int)h264_ue(&b) + 1;
         s.max_num_reorder = (int)h264_ue(&b);
         s.max_latency_increase = (int)h264_ue(&b);
+        if (s.max_dec_pic_buffering < 1 || s.max_dec_pic_buffering > 32 ||
+            s.max_num_reorder < 0 || s.max_latency_increase < 0)
+            return -1;
     }
     s.log2_min_cb = (int)h264_ue(&b) + 3;
     s.log2_max_cb = s.log2_min_cb + (int)h264_ue(&b);
     s.log2_min_tb = (int)h264_ue(&b) + 2;
     s.log2_max_tb = s.log2_min_tb + (int)h264_ue(&b);
+    if (s.log2_min_cb < 3 || s.log2_max_cb < s.log2_min_cb || s.log2_max_cb > 6 ||
+        s.log2_min_tb < 2 || s.log2_max_tb < s.log2_min_tb || s.log2_max_tb > 5)
+        return -1;
     s.max_th_depth_inter = (int)h264_ue(&b);
     s.max_th_depth_intra = (int)h264_ue(&b);
     s.scaling_list_enabled_flag = (int)h264_u(&b, 1);
@@ -258,7 +289,7 @@ int hevc_parse_sps(const uint8_t *nal, size_t size, hevc_sps *out) {
         s.pcm_loop_filter_disabled_flag = (int)h264_u(&b, 1);
     }
     s.num_short_term_ref_pic_sets = (int)h264_ue(&b);
-    if (s.num_short_term_ref_pic_sets > 64) return -1;
+    if (s.num_short_term_ref_pic_sets < 0 || s.num_short_term_ref_pic_sets > 64) return -1;
     for (int i = 0; i < s.num_short_term_ref_pic_sets; ++i)
         if (parse_st_rps(&b, i, s.num_short_term_ref_pic_sets, s.st_rps, &s.st_rps[i])) return -1;
     s.long_term_ref_pics_present_flag = (int)h264_u(&b, 1);
@@ -281,6 +312,7 @@ int hevc_parse_sps(const uint8_t *nal, size_t size, hevc_sps *out) {
     s.ctb_height = (s.height + ctb - 1) / ctb;
     s.valid = 1;
     *out = s;
+#undef s
     return 0;
 }
 
@@ -311,14 +343,17 @@ void hevc_pps_tiles(hevc_pps *p, const hevc_sps *s) {
 }
 
 int hevc_parse_pps(const uint8_t *nal, size_t size, const hevc_sps *sps_table, hevc_pps *out) {
-    static uint8_t rbsp[HEVC_RBSP_CAP];
+    if (!nal || !size || !sps_table || !out) return -1;
+    uint8_t rbsp[HEVC_RBSP_CAP];
     h264_bits b;
     h264_bits_init(&b, rbsp, load_rbsp(nal, size, rbsp));
     hevc_pps p;
     memset(&p, 0, sizeof(p));
     p.id = (int)h264_ue(&b);
     p.sps_id = (int)h264_ue(&b);
-    if (p.id >= HEVC_MAX_PPS || p.sps_id >= HEVC_MAX_SPS || !sps_table[p.sps_id].valid) return -1;
+    if (p.id < 0 || p.id >= HEVC_MAX_PPS || p.sps_id < 0 ||
+        p.sps_id >= HEVC_MAX_SPS || !sps_table || !sps_table[p.sps_id].valid)
+        return -1;
     const hevc_sps *s = &sps_table[p.sps_id];
     p.dependent_slice_segments_enabled_flag = (int)h264_u(&b, 1);
     p.output_flag_present_flag = (int)h264_u(&b, 1);
@@ -343,11 +378,25 @@ int hevc_parse_pps(const uint8_t *nal, size_t size, const hevc_sps *sps_table, h
     if (p.tiles_enabled_flag) {
         p.num_tile_columns = (int)h264_ue(&b) + 1;
         p.num_tile_rows = (int)h264_ue(&b) + 1;
-        if (p.num_tile_columns > 20 || p.num_tile_rows > 22) return -1;
+        if (p.num_tile_columns < 1 || p.num_tile_columns > 20 ||
+            p.num_tile_rows < 1 || p.num_tile_rows > 22)
+            return -1;
         p.uniform_spacing_flag = (int)h264_u(&b, 1);
         if (!p.uniform_spacing_flag) {
-            for (int i = 0; i < p.num_tile_columns - 1; ++i) p.column_width[i] = (int)h264_ue(&b) + 1;
-            for (int i = 0; i < p.num_tile_rows - 1; ++i) p.row_height[i] = (int)h264_ue(&b) + 1;
+            int sum = 0;
+            for (int i = 0; i < p.num_tile_columns - 1; ++i) {
+                p.column_width[i] = (int)h264_ue(&b) + 1;
+                if (p.column_width[i] < 1 || p.column_width[i] > s->ctb_width) return -1;
+                sum += p.column_width[i];
+                if (sum > s->ctb_width) return -1;
+            }
+            sum = 0;
+            for (int i = 0; i < p.num_tile_rows - 1; ++i) {
+                p.row_height[i] = (int)h264_ue(&b) + 1;
+                if (p.row_height[i] < 1 || p.row_height[i] > s->ctb_height) return -1;
+                sum += p.row_height[i];
+                if (sum > s->ctb_height) return -1;
+            }
         }
         p.loop_filter_across_tiles_enabled_flag = (int)h264_u(&b, 1);
     }
@@ -378,7 +427,8 @@ int hevc_parse_pps(const uint8_t *nal, size_t size, const hevc_sps *sps_table, h
 
 int hevc_parse_slice(const uint8_t *nal, size_t size, const hevc_sps *sps_table,
                      const hevc_pps *pps_table, hevc_slice *out) {
-    static uint8_t rbsp[HEVC_RBSP_CAP];
+    if (!nal || size < 2 || !sps_table || !pps_table || !out) return -1;
+    uint8_t rbsp[HEVC_RBSP_CAP];
     h264_bits b;
     const size_t n = size < HEVC_RBSP_CAP ? size : HEVC_RBSP_CAP;
     h264_bits_init(&b, rbsp, load_rbsp(nal, n, rbsp));
@@ -389,13 +439,17 @@ int hevc_parse_slice(const uint8_t *nal, size_t size, const hevc_sps *sps_table,
     sl.first_slice_segment_in_pic_flag = (int)h264_u(&b, 1);
     if (hevc_is_irap(sl.nal_type)) sl.no_output_of_prior_pics_flag = (int)h264_u(&b, 1);
     sl.pps_id = (int)h264_ue(&b);
-    if (sl.pps_id >= HEVC_MAX_PPS || !pps_table[sl.pps_id].valid) return -1;
+    if (sl.pps_id < 0 || sl.pps_id >= HEVC_MAX_PPS || !pps_table[sl.pps_id].valid)
+        return -1;
     const hevc_pps *p = &pps_table[sl.pps_id];
+    if (p->sps_id < 0 || p->sps_id >= HEVC_MAX_SPS) return -1;
     const hevc_sps *s = &sps_table[p->sps_id];
-    if (!s->valid) return -1;
+    if (!s->valid || s->ctb_width <= 0 || s->ctb_height <= 0) return -1;
     if (!sl.first_slice_segment_in_pic_flag) {
         if (p->dependent_slice_segments_enabled_flag) sl.dependent_slice_segment_flag = (int)h264_u(&b, 1);
-        sl.slice_segment_address = (int)h264_u(&b, ceil_log2(s->ctb_width * s->ctb_height));
+        const uint64_t ctbs64 = (uint64_t)s->ctb_width * s->ctb_height;
+        if (ctbs64 == 0 || ctbs64 > 0xffffffffULL) return -1;
+        sl.slice_segment_address = (int)h264_u(&b, ceil_log2((uint32_t)ctbs64));
     }
     sl.pic_output_flag = 1;
     if (sl.dependent_slice_segment_flag) {   /* header copied from the previous segment */

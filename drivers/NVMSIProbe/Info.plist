@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>English</string>
+	<key>CFBundleExecutable</key>
+	<string>NVMSIProbe</string>
+	<key>CFBundleIdentifier</key>
+	<string>org.local.macosdevicelab.NVMSIProbe</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>NVMSIProbe</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>RTX 4080 MSI probe</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>org.local.macosdevicelab.NVMSIProbe</string>
+			<key>IOClass</key>
+			<string>NVMSIProbe</string>
+			<key>IOMatchCategory</key>
+			<string>NVMSIProbe</string>
+			<key>IOPCIMatch</key>
+			<string>0x270410DE</string>
+			<key>IOProbeScore</key>
+			<integer>5000</integer>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+		</dict>
+		<key>RTX 4080 HDAU MSI probe</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>org.local.macosdevicelab.NVMSIProbe</string>
+			<key>IOClass</key>
+			<string>NVMSIProbe</string>
+			<key>IOMatchCategory</key>
+			<string>NVMSIProbe</string>
+			<key>IOPCIMatch</key>
+			<string>0x22BB10DE</string>
+			<key>IOProbeScore</key>
+			<integer>5000</integer>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+		</dict>
+	</dict>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.iokit.IOPCIFamily</key>
+		<string>2.9</string>
+		<key>com.apple.kpi.iokit</key>
+		<string>8.0.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>8.0.0</string>
+	</dict>
+</dict>
+</plist>

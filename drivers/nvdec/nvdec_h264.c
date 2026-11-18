@@ -17,20 +17,28 @@ void nvdec_h264_init(nvdec_h264_dec *d) {
 }
 
 int nvdec_h264_param_nal(nvdec_h264_dec *d, const h264_nal *nal) {
+    if (!d || !nal) return NVDEC_H264_EPARAM;
     if (nal->type == H264_NAL_SPS) {
         h264_sps s;
         if (h264_parse_sps(nal->data, nal->size, &s)) return NVDEC_H264_EPARAM;
+        if (s.id < 0 || s.id >= H264_MAX_SPS) return NVDEC_H264_EPARAM;
         d->sps[s.id] = s;
     } else if (nal->type == H264_NAL_PPS) {
         h264_pps p;
         if (h264_parse_pps(nal->data, nal->size, d->sps, &p)) return NVDEC_H264_EPARAM;
+        if (p.id < 0 || p.id >= H264_MAX_PPS) return NVDEC_H264_EPARAM;
         d->pps[p.id] = p;
     }
     return NVDEC_H264_OK;
 }
 
 int nvdec_h264_new_picture(const nvdec_h264_dec *d, const h264_slice *a, const h264_slice *b) {
-    if (!a) return 1;
+    if (!d || !a || !b) return 1;
+    if (a->pps_id < 0 || a->pps_id >= H264_MAX_PPS ||
+        b->pps_id < 0 || b->pps_id >= H264_MAX_PPS ||
+        d->pps[a->pps_id].sps_id < 0 || d->pps[a->pps_id].sps_id >= H264_MAX_SPS ||
+        d->pps[b->pps_id].sps_id < 0 || d->pps[b->pps_id].sps_id >= H264_MAX_SPS)
+        return 1;
     if (b->first_mb_in_slice == 0) return 1;
     if (a->frame_num != b->frame_num || a->pps_id != b->pps_id ||
         a->field_pic_flag != b->field_pic_flag || a->bottom_field_flag != b->bottom_field_flag ||
@@ -156,6 +164,7 @@ static void unmark_all(nvdec_h264_dec *d) {
 
 /* Activate an SPS: a new sequence (size / DPB change) starts from empty. */
 static void activate(nvdec_h264_dec *d, int sps_id) {
+    if (!d || sps_id < 0 || sps_id >= H264_MAX_SPS) return;
     const h264_sps *s = &d->sps[sps_id];
     if (d->sps_id >= 0) {
         const h264_sps *o = &d->sps[d->sps_id];
@@ -344,9 +353,12 @@ static void fill_setup(const nvdec_h264_dec *d, const h264_sps *s, const h264_pp
 
 int nvdec_h264_begin(nvdec_h264_dec *d, const h264_slice *sl, nvdec_h264_pic_s *setup,
                      int *surface) {
-    if (sl->pps_id >= H264_MAX_PPS || !d->pps[sl->pps_id].valid) return NVDEC_H264_EPARAM;
+    if (!d || !sl || !setup || !surface) return NVDEC_H264_EPARAM;
+    if (sl->pps_id < 0 || sl->pps_id >= H264_MAX_PPS || !d->pps[sl->pps_id].valid)
+        return NVDEC_H264_EPARAM;
     const h264_pps *p = &d->pps[sl->pps_id];
-    if (!d->sps[p->sps_id].valid) return NVDEC_H264_EPARAM;
+    if (p->sps_id < 0 || p->sps_id >= H264_MAX_SPS || !d->sps[p->sps_id].valid)
+        return NVDEC_H264_EPARAM;
     const h264_sps *s = &d->sps[p->sps_id];
     if (sl->field_pic_flag && s->frame_mbs_only_flag) return NVDEC_H264_EFIELD;
     if (s->chroma_format_idc != 1 || s->bit_depth_luma != 8 || s->bit_depth_chroma != 8)
@@ -698,7 +710,19 @@ void nvdec_tile(const uint8_t *src, uint32_t src_pitch, uint8_t *bl, uint32_t bl
 
 int nvdec_surface_nv12_md5(const uint8_t *surface, uint32_t pitch, uint32_t luma_bytes,
                            uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, char hex[33]) {
+    // 0.180.12: malformed SPS crop values used to make this wrap to a tiny
+    // allocation and then memcpy 16 bytes per block. Validate the full span.
+    if (!surface || !hex || !w || !h || x0 > UINT32_MAX - w ||
+        w > UINT32_MAX - 15 || x0 + w + 15 < x0)
+        return -1;
     const uint32_t row_bytes = (x0 + w + 15) & ~15u;
+    if (!row_bytes) return -1;
+    // A block-linear row is addressed through `pitch`; hashing a crop that
+    // rounds past it would read the next tile/row (and the last row past the
+    // plane).
+    if (!pitch || row_bytes > pitch) return -1;
+    if (y0 > UINT32_MAX - h || (uint64_t)y0 + h > (uint64_t)luma_bytes / pitch)
+        return -1;
     uint8_t *row = malloc(row_bytes);
     if (!row) return -1;
     nvdec_md5 m;
@@ -722,6 +746,11 @@ int nvdec_surface_nv12_md5(const uint8_t *surface, uint32_t pitch, uint32_t luma
 
 int nvdec_h264_surface_md5(const uint8_t *surface, const nvdec_h264_layout *l,
                            const h264_sps *s, char hex[33]) {
+    if (!l || !s || s->crop_left < 0 || s->crop_right < 0 ||
+        s->crop_top < 0 || s->crop_bottom < 0 ||
+        (uint64_t)s->crop_left + s->crop_right > l->width ||
+        (uint64_t)s->crop_top + s->crop_bottom > l->height)
+        return -1;
     return nvdec_surface_nv12_md5(surface, l->pitch, l->luma_bytes, (uint32_t)s->crop_left,
                                   (uint32_t)s->crop_top,
                                   l->width - (uint32_t)(s->crop_left + s->crop_right),

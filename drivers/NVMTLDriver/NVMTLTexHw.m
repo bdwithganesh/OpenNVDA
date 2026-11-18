@@ -151,6 +151,10 @@ uint32_t nvTicAlloc(MTLPixelFormat fmt, uint64_t va, uint32_t pitch, uint32_t w,
     const uint32_t idx = ok ? take(gTicUsed, kTicCount) : 0;
     if (idx) memcpy(gPoolCpu + (size_t)idx * kDescBytes, d, kDescBytes);
     os_unfair_lock_unlock(&gPoolLock);
+    if (!idx) {
+        static uint32_t n;
+        if (n++ < 4) NSLog(@"NVMTLCompiler: texture header pool exhausted (%u)", kTicCount);
+    }
     if (swapRB) *swapRB = f->swap;
     return idx;
 }
@@ -199,6 +203,7 @@ bool nvTicRead(uint32_t index, uint32_t d[8]) {
 // format maps R/G/B/A to. RenderBox samples RG8 masks with a swizzle that moves G to alpha; with
 // it ignored alpha read 1 and the App Store icon came out under a full-icon pale overlay.
 void nvTicSwizzle(uint32_t index, MTLPixelFormat fmt, const uint8_t sw[4]) {
+    if (!sw) return;
     const TicFmt *f = NULL;
     for (size_t i = 0; i < sizeof kFmts / sizeof kFmts[0]; ++i)
         if (kFmts[i].f == fmt) { f = &kFmts[i]; break; }
@@ -274,6 +279,10 @@ static uint32_t nvTscAllocAniso(uint32_t minF, uint32_t magF, uint32_t mipF, uin
     const uint32_t idx = ok ? take(gTscUsed, kTscCount) : 0;
     if (idx) memcpy(gPoolCpu + (size_t)(kTicCount + idx) * kDescBytes, d, kDescBytes);
     os_unfair_lock_unlock(&gPoolLock);
+    if (!idx) {
+        static uint32_t n;
+        if (n++ < 4) NSLog(@"NVMTLCompiler: sampler pool exhausted (%u)", kTscCount);
+    }
     return idx;
 }
 
@@ -419,6 +428,10 @@ uint32_t nvTicAllocBL(MTLPixelFormat fmt, uint64_t va, uint32_t type, const NVTe
     const uint32_t idx = ok ? take(gTicUsed, kTicCount) : 0;
     if (idx) memcpy(gPoolCpu + (size_t)idx * kDescBytes, d, kDescBytes);
     os_unfair_lock_unlock(&gPoolLock);
+    if (!idx) {
+        static uint32_t n;
+        if (n++ < 4) NSLog(@"NVMTLCompiler: texture header pool exhausted (%u)", kTicCount);
+    }
     if (swapRB) *swapRB = f->swap;
     return idx;
 }
@@ -437,7 +450,8 @@ uint32_t nvFormatBytes(MTLPixelFormat fmt) {
         case 0x18: case 0x1b: return 2;
         case 0x24: case 0x27: return 8;                                   // BC1, BC4 blocks
         case 0x25: case 0x26: case 0x28: case 0x10: case 0x11: case 0x17: return 16;
-        case 0x03: case 0x04: case 0x05: return 8;
+        case 0x05: return fmt == MTLPixelFormatX32_Stencil8 ? 4 : 8;
+        case 0x03: case 0x04: return 8;
         case 0x01: return 16;
         default: return 4;
         }

@@ -12,8 +12,10 @@
  *
  * Output file (.nak, little endian):
  *   u32 magic 'NAK1', u32 code_bytes, u32 num_gprs, u32 slm_bytes,
- *   u32 smem_bytes, u32 local_size[3], u32 num_barriers, u32 push_bytes,
- *   u32 reserved[6], code[code_bytes]
+ *   u32 smem_bytes, u32 local_size[3], u32 num_barriers, u32 stage,
+ *   u32 sph_dwords, u32 uses_sample_shading, u32 reserved[4],
+ *   optional_sph[sph_dwords], code[code_bytes]
+ * The fixed header is16 dwords/64 bytes. Compute stage5 has no SPH.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -278,15 +280,15 @@ hoist_divergent_derivatives(nir_shader *nir)
  * reaches a derivative or an implicit-LOD texture sample is patched: helper lanes take the value
  * of the first live lane of their quad. Exact when the address is the same across the quad (the
  * usual case: uniforms in a buffer), a neighbour's value otherwise (better than 0). */
-struct helper_walk { nir_instr *v[4096]; unsigned n; };
+struct helper_walk { nir_instr *v[4096]; unsigned n; uint8_t bit; };
 
 static bool
 helper_mark_cb(nir_src *src, void *data)
 {
    struct helper_walk *w = data;
    nir_instr *p = nir_def_instr(src->ssa);
-   if (!p->pass_flags) {
-      p->pass_flags = 1;
+   if (!(p->pass_flags & w->bit)) {
+      p->pass_flags |= w->bit;
       if (w->n < 4096) w->v[w->n++] = p;
    }
    return true;
@@ -319,7 +321,7 @@ fix_helper_loads(nir_shader *nir)
    nir_foreach_block(blk, impl) nir_foreach_instr(in, blk) in->pass_flags = 0;
    /* backward from every derivative and implicit-LOD sample: what feeds them */
    static struct helper_walk w;
-   w.n = 0;
+   w.n = 0; w.bit = 1;
    nir_foreach_block(blk, impl) {
       nir_foreach_instr(in, blk) {
          bool root = is_deriv(in);
@@ -330,15 +332,35 @@ fix_helper_loads(nir_shader *nir)
          if (root) nir_foreach_src(in, helper_mark_cb, &w);
       }
    }
+   /* Branches too: a helper lane that read 0 takes another path and is not there when the
+    * derivative runs (QuartzCore's glass_background_sdf loads its shape mode from a buffer and
+    * branches on it; fwidth went to garbage on every triangle edge = Liquid Glass seams, 18 Nov
+    * 2026, perf/glassrep.m). Only loads at the top level get patched for this: there every lane of
+    * the quad is active, so the shuffle reads a real value. Inside an if or a loop the source lane
+    * may have left, and a garbage loop-exit value hung a RenderBox shader (nakc 84a: GPU runtime
+    * timeout at boot, desktop stuck on the Apple logo). */
+   const bool any_deriv = w.n != 0;
    while (w.n) {
       nir_instr *in = w.v[--w.n];
       nir_foreach_src(in, helper_mark_cb, &w);
+   }
+   if (any_deriv) {
+      w.bit = 2;
+      nir_foreach_block(blk, impl) {
+         nir_if *nif = nir_block_get_following_if(blk);
+         if (nif) helper_mark_cb(&nif->condition, &w);
+      }
+      while (w.n) {
+         nir_instr *in = w.v[--w.n];
+         nir_foreach_src(in, helper_mark_cb, &w);
+      }
    }
    nir_builder b = nir_builder_create(impl);
    unsigned patched = 0;
    nir_foreach_block(blk, impl) {
       nir_foreach_instr_safe(in, blk) {
          if (!in->pass_flags || in->type != nir_instr_type_intrinsic) continue;
+         if (!(in->pass_flags & 1) && blk->cf_node.parent != &impl->cf_node) continue;
          nir_intrinsic_instr *ld = nir_instr_as_intrinsic(in);
          if (ld->intrinsic != nir_intrinsic_load_global && ld->intrinsic != nir_intrinsic_load_global_constant)
             continue;
@@ -466,6 +488,7 @@ int main(int argc, char **argv)
          else if (!strncmp(argv[i], "io=", 3)) var.io = argv[i] + 3;
          else if (sscanf(argv[i], "tspace=%u", &idx) == 1) var.tess_spacing = idx;
          else if (sscanf(argv[i], "tccw=%u", &idx) == 1) var.tess_ccw = idx;
+         else if (sscanf(argv[i], "f16rt=%x", &idx) == 1) var.f16rt = idx;
          else if (!strncmp(argv[i], "si", 2) && argv[i][2] >= '0' && argv[i][2] <= '9') {
             unsigned f, o, bi;
             if (sscanf(argv[i], "si%u=%u,%u,%u", &idx, &f, &o, &bi) == 4 && idx < 31 && bi < 31) {
@@ -478,7 +501,7 @@ int main(int argc, char **argv)
                var.sb_stride[idx] = st; var.sb_step[idx] = (uint8_t)sf; var.sb_rate[idx] = sr;
             }
          }
-         else if (!strncmp(argv[i], "link=", 5) && strchr(argv[i], '@') && var.nlink < 16) {
+         else if (!strncmp(argv[i], "link=", 5) && strchr(argv[i], '@') && var.nlink < 64) {
             /* linked function NAME@PATH (metallib or bare AIR): read further down */
             var.link_name[var.nlink++] = argv[i] + 5;
          }

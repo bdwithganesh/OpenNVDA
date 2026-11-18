@@ -26,6 +26,11 @@ int main(int argc, char **argv) {
     assert(nvgsp::buildAd103WprMeta(fb, desc, wrapper[5], 63541248,
                                     dma, &meta));
     assert(meta.magic == nvgsp::kWprMetaMagic && meta.revision == 1);
+    // Booter copies the complete monitor/manifest/bootloader container.
+    // The descriptor's bootloaderOffset/Size identify the later RISC-V BL,
+    // not the sysmem buffer consumed by SEC2 Booter Load.
+    assert(meta.sysmemAddrOfBootloader == dma.bootloader);
+    assert(meta.sizeOfBootloader == wrapper[5]);
     assert(meta.bootloaderCodeOffset == 18432);
     assert(meta.bootloaderDataOffset == 2048);
     assert(meta.bootloaderManifestOffset == 0);

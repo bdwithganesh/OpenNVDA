@@ -5,7 +5,8 @@ hardware directly, which is exactly why it can be tested on any machine.
 
 Some of the bits:
 
-- `NVGspAbi.hpp`, `NVGspInitAbi.hpp` – GSP-RM r570.144 message and RPC layouts
+- `NVGspAbi.hpp`, `NVGspInitAbi.hpp` – GSP-RM message and RPC layouts
+- `*615.hpp` – the native 615.78.08 runtime: control ABI, MMU and external VA spaces, client GR channels, fault decoding, owned recovery
 - `NVGspBoot*`, `NVGspFwsec*`, `NVGspVbios.hpp`, `NVGspFalcon.hpp` – firmware parsing and staging for the boot chain
 - `NVGspArenaMap.hpp`, `NVGspArenaPages.hpp` – per-client GPU VA arenas (2 MiB and 64 KiB pages)
 - `NVGspVramHeap.hpp`, `NVGspEvict.hpp` – VRAM allocator and eviction

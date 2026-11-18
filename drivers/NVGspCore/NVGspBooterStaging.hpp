@@ -18,7 +18,9 @@ public:
         }
         const uint8_t *signature = signatureForFuse(view, fuseVersion);
         if (!signature) { lastError_ = 2; return false; }
-        const size_t allocation = (view.imageSize + 4095) & ~size_t(4095);
+        // 0.180.12: promote before adding; the old uint32_t expression wrapped
+        // for imageSize near 4 GiB and allocated a short buffer.
+        const size_t allocation = (size_t(view.imageSize) + 4095) & ~size_t(4095);
         if (!image_.allocate(allocation, true, mapper)) {
             lastError_ = 100 + image_.lastError();
             image_.release();

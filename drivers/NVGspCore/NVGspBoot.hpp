@@ -48,14 +48,17 @@ inline bool buildAd103WprMeta(const FbLayout &fb, const BootUcodeDesc &desc,
                               const BootDma &dma, WprMeta *out) {
     if (!out || !validBootUcodeDesc(desc, bootImageBytes) ||
         !dma.radixRoot || !dma.bootloader || !dma.signature ||
-        dma.signatureBytes != 4096 ||
+        dma.signatureBytes != 4096 || !desc.bootloaderSize ||
         (dma.radixRoot & 4095) || (dma.bootloader & 4095) ||
         (dma.signature & 4095) ||
         fb.gspFwOffset < fb.gspFwWprStart ||
         fb.gspFwOffset > fb.bootBinOffset ||
         fwImageBytes > fb.bootBinOffset - fb.gspFwOffset ||
         fb.bootBinOffset > fb.frtsOffset ||
-        bootImageBytes > fb.frtsOffset - fb.bootBinOffset)
+        bootImageBytes > fb.frtsOffset - fb.bootBinOffset ||
+        bootImageBytes > UINT64_MAX - dma.bootloader ||
+        desc.bootloaderOffset > bootImageBytes ||
+        desc.bootloaderSize > bootImageBytes - desc.bootloaderOffset)
         return false;
 
     WprMeta meta{};
@@ -63,6 +66,10 @@ inline bool buildAd103WprMeta(const FbLayout &fb, const BootUcodeDesc &desc,
     meta.revision = kWprMetaRevision;
     meta.sysmemAddrOfRadix3Elf = dma.radixRoot;
     meta.sizeOfRadix3Elf = fwImageBytes;
+    // SEC2 Booter Load copies the complete signed image, including manifest
+    // and security monitor. bootloaderOffset/Size describe a later RISC-V
+    // stage inside that image, not this system-memory input range.
+    // Match kgspPopulateWprMeta_TU102 in NVIDIA's 615.78.08 source.
     meta.sysmemAddrOfBootloader = dma.bootloader;
     meta.sizeOfBootloader = bootImageBytes;
     meta.bootloaderCodeOffset = desc.monitorCodeOffset;

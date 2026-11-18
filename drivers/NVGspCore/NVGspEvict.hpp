@@ -48,13 +48,19 @@ struct EvictCopy {
 // and LAUNCH_DMA. Returns words written, 0 if `max` is too small or a copy
 // is empty / above 49-bit addresses.
 inline uint32_t buildEvictBatch(const EvictCopy *c, uint32_t n, uint32_t *out, uint32_t max) {
-    if (!c || !out || !n || max < 2 + n * kCeCopyWords) return 0;
+    if (!c || !out || !n || n > (UINT32_MAX - 2) / kCeCopyWords ||
+        max < 2 + n * kCeCopyWords)
+        return 0;
     uint32_t w = 0;
     out[w++] = ceMethod(kCeSetObject, 1);
     out[w++] = kCeClassAda;
     for (uint32_t i = 0; i < n; ++i) {
         const EvictCopy &k = c[i];
-        if (!k.bytes || (k.src >> 49) || (k.dst >> 49)) return 0;
+        if (!k.bytes || k.src > UINT64_MAX - k.bytes ||
+            k.dst > UINT64_MAX - k.bytes ||
+            (k.src >> 49) || (k.dst >> 49) ||
+            k.src + k.bytes > (1ULL << 49) || k.dst + k.bytes > (1ULL << 49))
+            return 0;
         out[w++] = ceMethod(kCeSetSrcPhysMode, 2);
         out[w++] = k.srcSys ? kCePhysCoherentSysmem : kCePhysLocalFb;
         out[w++] = k.dstSys ? kCePhysCoherentSysmem : kCePhysLocalFb;
@@ -86,7 +92,10 @@ constexpr uint32_t kCeFillWordsPerLaunch = 12;
 
 inline uint32_t buildPhysFill(uint64_t dst, uint64_t bytes, uint32_t value,
                               uint32_t *out, uint32_t max) {
-    if (!out || !bytes || (bytes & 3) || (dst & 3) || ((dst + bytes) >> 49) || max < 8) return 0;
+    if (!out || !bytes || (bytes & 3) || (dst & 3) ||
+        dst > UINT64_MAX - bytes || (dst >> 49) ||
+        dst + bytes > (1ULL << 49) || max < 8)
+        return 0;
     uint32_t w = 0;
     out[w++] = ceMethod(kCeSetObject, 1);
     out[w++] = kCeClassAda;
@@ -122,7 +131,9 @@ inline uint32_t buildPhysFill(uint64_t dst, uint64_t bytes, uint32_t value,
 
 // Chunks needed to save `bytes` of VRAM (objects are 2 MiB multiples).
 inline uint32_t evictChunks(uint64_t bytes) {
-    return static_cast<uint32_t>((bytes + kEvictChunkBytes - 1) / kEvictChunkBytes);
+    if (!bytes || bytes > UINT64_MAX - (kEvictChunkBytes - 1)) return 0;
+    const uint64_t n = (bytes + kEvictChunkBytes - 1) / kEvictChunkBytes;
+    return n > UINT32_MAX ? 0 : static_cast<uint32_t>(n);
 }
 
 }  // namespace nvgsp

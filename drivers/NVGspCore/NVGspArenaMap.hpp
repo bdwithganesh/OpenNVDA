@@ -104,7 +104,13 @@ public:
     // aligned 2 MiB regions of a 2 MiB-mode region get one 2 MiB PTE.
     bool bind(B &b, uint64_t va, uint64_t bytes, uint64_t phys, uint64_t flags,
               uint16_t owner) {
-        if (!rangeOk(va, bytes) || (phys & (kBigPageBytes - 1)) || !owner) return false;
+        // 0.180.12: reject physical wrap and addresses outside the documented
+        // 49-bit GPU address space; a forged raw bind must not alias MMIO or
+        // a different client's allocation through PTE truncation.
+        if (!rangeOk(va, bytes) || (phys & (kBigPageBytes - 1)) || !owner ||
+            !phys || phys >= kResidencyAddressEnd || bytes > kResidencyAddressEnd - phys ||
+            phys + bytes < phys)
+            return false;
         const uint64_t f = (flags & ~kPteAddrMask) | 1;
         for (uint64_t a = va; a < va + bytes; a += kBigPageBytes)
             if (spt[region(a)]) return false;           // small-page region: use bindPages
@@ -114,6 +120,10 @@ public:
             const uint64_t e = re < va + bytes ? re : va + bytes;
             const uint64_t p = phys + (a - va);
             if (!lpt[r] && a == rs && e == re && !(p & (kArenaPageBytes - 1))) {
+                // A client may deliberately rebind an object over its own
+                // previous mapping; replacing the PTE is the documented
+                // vaBindObject contract. The old object's later free uses its
+                // own tag and cannot clear this newer mapping.
                 if (!writePd0(b, r, (p >> 4) | f)) return false;
                 page[r] = owner;
             } else {
@@ -141,7 +151,9 @@ public:
             if (page[region(a)] || lpt[region(a)]) return false;
         const uint64_t f = (flags & ~kPteAddrMask) | 1;
         for (uint32_t i = 0; i < n; ++i) {
-            if (phys[i] & (kSmallPageBytes - 1)) return false;
+            if (!phys[i] || (phys[i] & (kSmallPageBytes - 1)) ||
+                phys[i] >= kResidencyAddressEnd)
+                return false;
             const uint64_t a = va + uint64_t(i) * kSmallPageBytes;
             const uint32_t r = region(a);
             if (!ensureSpt(b, r)) return false;
@@ -273,12 +285,12 @@ public:
     // 0.158.0: the owner tag mapping va (0 = unmapped), and how: 1 = 2 MiB
     // PTE, 2 = 64 KiB LPT entry, 3 = 4 KiB SPT entry. For naming an MMU fault.
     uint16_t ownerAt(uint64_t va, uint32_t *how) {
-        *how = 0;
+        if (how) *how = 0;
         if (va < kArenaBase || va >= kArenaEnd) return 0;
         const uint32_t r = region(va);
-        if (spt[r]) { *how = 3; return sptOwnerOf(r, sptEntry(va)); }
-        if (lpt[r]) { *how = 2; return ownerOf(r, entry(va)); }
-        if (page[r]) *how = 1;
+        if (spt[r]) { if (how) *how = 3; return sptOwnerOf(r, sptEntry(va)); }
+        if (lpt[r]) { if (how) *how = 2; return ownerOf(r, entry(va)); }
+        if (page[r] && how) *how = 1;
         return page[r];
     }
 

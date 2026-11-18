@@ -1,6 +1,7 @@
 #pragma once
 
-// Nouveau-compatible HS Falcon wrapper emitted by NVIDIA's 570.144 extractor.
+// Nouveau-compatible HS Falcon wrapper emitted by NVIDIA's GSP booter archive
+// (pin the original generated data and pair it with the selected GSP release).
 #include <stddef.h>
 #include <stdint.h>
 
@@ -67,7 +68,8 @@ inline bool parseBooterLoad(const void *data, uint64_t bytes, BooterView *out) {
     __builtin_memcpy(&signatureCount, raw + hs.signatureCountOffset, 4);
     __builtin_memcpy(&layout, raw + hs.headerOffset, sizeof(layout));
     if (patchSignature != 0 || !signatureCount ||
-        hs.signaturesSize % signatureCount || layout.appCount != 1 ||
+        hs.signaturesSize % signatureCount ||
+        hs.signaturesSize / signatureCount != 384 || layout.appCount != 1 ||
         patchLocation < layout.osDataOffset || patchLocation >= wrapper.imageSize ||
         !contained(layout.osCodeOffset, layout.osCodeSize, wrapper.imageSize) ||
         !contained(layout.osDataOffset, layout.osDataSize, wrapper.imageSize) ||

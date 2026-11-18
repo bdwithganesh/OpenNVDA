@@ -121,8 +121,8 @@ void stageGspPackage(IOPCIDevice *pci, const void *bytes, uint64_t packageBytes,
     const bool booterOk = booterParseOk && sec2FuseVersion != UINT32_MAX &&
         booter.stage(booterView, sec2FuseVersion);
     nvgsp::GspInitStaging init;
-    // NVGspCore's stage() now takes the system-info block; this probe
-    // only stages buffers, so an empty block is enough.
+    // 0.3.9: NVGspCore's stage() now takes the system-info block; this
+    // probe only stages buffers, so an empty block is enough.
     const bool initOk = init.stage(nvgsp::GspSystemInfoParameters{});
     pci->setProperty("NVFBProbe-GSP-package-bytes", packageBytes, 64);
     pci->setProperty("NVFBProbe-GSP-package-ok", packageOk);

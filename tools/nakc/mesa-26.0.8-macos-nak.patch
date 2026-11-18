@@ -90,10 +90,9 @@ index 57ec68f..e36e351 100644
  
 --- a/src/compiler/nir/nir_divergence_analysis.c	2026-09-28 10:40:54
 +++ b/src/compiler/nir/nir_divergence_analysis.c	2026-09-28 10:40:48
-@@ -181,6 +181,25 @@
+@@ -181,5 +181,24 @@
     mesa_shader_stage stage = state->stage;
     bool is_divergent = false;
- 
 +   /* macOS NAK: on NVIDIA, helper pixels skip memory loads and read 0, so a
 +    * load from a uniform address in a fragment shader is not uniform once
 +    * helpers share the warp (R2UR could take a helper's zero).

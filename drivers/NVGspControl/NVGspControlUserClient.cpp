@@ -1,4 +1,5 @@
 #include "NVGspControl.hpp"
+#include "../NVGspCore/NVGspComputePacket615.hpp"
 #include <IOKit/IOLib.h>
 
 #define super IOUserClient
@@ -6,12 +7,14 @@ OSDefineMetaClassAndStructors(IOAccelNVGspUserClient, IOUserClient)
 
 bool IOAccelNVGspUserClient::initWithTask(task_t owningTask, void *securityID,
                                           UInt32 type, OSDictionary *properties) {
+    if (!super::initWithTask(owningTask, securityID, type, properties)) return false;
     // 0.150.0: any process may open us (apps on the desktop use the GPU
     // through NVMTLDriver / NVVTDecoder); non-admin clients only get the
     // selectors those need, on objects they own (see externalMethod)
     admin_ = clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) == kIOReturnSuccess;
     task_ = owningTask;                                   // 0.134.0: userMemBind
-    return super::initWithTask(owningTask, securityID, type, properties);
+    if (task_) { task_reference(task_); taskHeld_ = true; }
+    return true;
 }
 
 bool IOAccelNVGspUserClient::start(IOService *provider) {
@@ -40,16 +43,29 @@ bool IOAccelNVGspUserClient::ensurePackage() {
 }
 
 void IOAccelNVGspUserClient::stop(IOService *provider) {
+    // 0.180.12: stop() can be reached on terminate/unload without clientClose.
+    // Do the same teardown or a partial client leaves channels/objects behind.
+    if (driver_) {
+        driver_->clientLive(this, task_, false);
+        driver_->nativeClient615Close(this);   // 0.180.92
+        driver_->clientChannelClose(this);
+        driver_->memFreeAll(this);
+    }
     if (package_) { package_->release(); package_ = nullptr; }
+    if (taskHeld_ && task_) { task_deallocate(task_); taskHeld_ = false; }
+    task_ = nullptr;
     driver_ = nullptr;
     super::stop(provider);
 }
 
 IOReturn IOAccelNVGspUserClient::clientClose() {
     // 0.107.0: owner cleanup; 0.110.0: also hands a presented screen back.
+    // Deregister first: a concurrent reopening client of the same task must
+    // not memAdopt objects while this close is draining the GPU.
+    if (driver_) driver_->clientLive(this, task_, false);   // 0.177.0
+    if (driver_) driver_->nativeClient615Close(this);   // 0.180.92: owned GR client
     if (driver_) driver_->clientChannelClose(this);   // 0.178.0: before its memory goes
     if (driver_) driver_->memFreeAll(this);
-    if (driver_) driver_->clientLive(this, task_, false);   // 0.177.0
     if (!isInactive()) terminate();
     return kIOReturnSuccess;
 }
@@ -67,6 +83,23 @@ IOReturn IOAccelNVGspUserClient::clientMemoryForType(
         IOMemoryDescriptor *d = driver_->memUserDescriptor(this, wide ? type & 0x3fffffff : type & 0xfff, &vram);
         if (!d) return kIOReturnBadArgument;
         *options = kIOMapAnywhere | (vram ? kIOMapWriteCombineCache : 0);
+        *memory = d;
+        return kIOReturnSuccess;
+    }
+    // 0.180.96: the owned native615 client's caller buffer (owner only).
+    // 0.180.97: type 0x80615000 (0x61500000 hit the wide-handle form above).
+    // 0.180.101: 0x80615001 + slot = caller allocation `slot` (owner only).
+    if (type > 0x80615000 && type <= 0x80615020 && driver_ && options && memory) {   // 0.180.118: 32 slots
+        IOMemoryDescriptor *d = driver_->client615AllocMemory(this, type - 0x80615001);
+        if (!d) return kIOReturnNotFound;
+        *options = kIOMapAnywhere;
+        *memory = d;
+        return kIOReturnSuccess;
+    }
+    if (type == 0x80615000 && driver_ && options && memory) {
+        IOMemoryDescriptor *d = driver_->client615UserMemory(this);
+        if (!d) return kIOReturnNotFound;
+        *options = kIOMapAnywhere;
         *memory = d;
         return kIOReturnSuccess;
     }
@@ -91,10 +124,11 @@ IOReturn IOAccelNVGspUserClient::commit(
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
     if (!self || !self->driver_ || !self->package_ || !arguments ||
         arguments->scalarInputCount != 1 ||
-        arguments->scalarInput[0] != kNVGspPackageBytes)
+        arguments->scalarInput[0] < sizeof(nvgsp::PackageHeader) ||
+        arguments->scalarInput[0] > kNVGspPackageBytes)
         return kIOReturnBadArgument;
     return self->driver_->stagePackage(self->package_->getBytesNoCopy(),
-                                       kNVGspPackageBytes);
+                                       static_cast<size_t>(arguments->scalarInput[0]));
 }
 
 IOReturn IOAccelNVGspUserClient::boot(
@@ -207,12 +241,17 @@ IOReturn IOAccelNVGspUserClient::rpc(
         arguments->structureInputSize < 4 || !arguments->structureOutput ||
         arguments->structureOutputSize < 8)
         return kIOReturnBadArgument;
+    if (!self->admin_) return kIOReturnNotPrivileged;
+    if (arguments->structureInputSize > 3904 || arguments->structureOutputSize > 0xffffffffU)
+        return kIOReturnBadArgument;
+    const IOReturn generation = self->generationStatus();
+    if (generation != kIOReturnSuccess) return generation;
     const UInt8 *in = static_cast<const UInt8 *>(arguments->structureInput);
     UInt32 function = 0;
     __builtin_memcpy(&function, in, 4);
     UInt8 *out = static_cast<UInt8 *>(arguments->structureOutput);
     UInt32 replyBytes = arguments->structureOutputSize - 4, result = ~0U;
-    const IOReturn r = self->driver_->userRpc(function, in + 4,
+    const IOReturn r = self->driver_->diagnosticRpc(function, in + 4,
         arguments->structureInputSize - 4, out + 4, &replyBytes, &result);
     __builtin_memcpy(out, &result, 4);
     arguments->structureOutputSize = 4 + replyBytes;
@@ -402,6 +441,16 @@ IOReturn IOAccelNVGspUserClient::externalMethod(
         {memAdopt, 1, 0, 2, 0},                               // 38 (0.177.0)
         {diagnosticChannelKick, 1, 0, 0, 0},                 // 39 (0.177.2), admin only
         {clientChannel, 1, 0, 1, 0},                          // 40 (0.178.0)
+        {diagnosticVramReserve, 1, 0, 3, 0},                  // 41, admin, GPU-epoch reservation
+        {nativeRuntime615, 1, 0, 3, 0},                       // 42, admin, owned native615 bootstrap/query
+        {nativeCompute615, 0, kIOUCVariableStructureSize, 0, sizeof(nvgsp::ComputeResult615)}, // 43, admin diagnostic shader
+        {nativeIsolation615, 1, 0, 3, 0},                    // 44, admin private-VAS COPY0 lifecycle proof
+        {nativeClient615, 1, 0, 3, 0},                       // 45 (0.180.92), admin, process-owned GR client
+        {nativeClientDispatch615, 0, kIOUCVariableStructureSize, 3, 0}, // 46 (0.180.98), admin, owner's NAK dispatch
+        {nativeClientMemory615, kIOUCVariableStructureSize, 0, 3, 0},   // 47 (0.180.101/117), owner's allocations and wraps
+        {nativeClientSubmit615, kIOUCVariableStructureSize, 0, 3, 0},   // 48 (0.180.103/133), owner's pushbuffer, flags
+        {nativeDisplay615, 0, kIOUCVariableStructureSize, 0, kIOUCVariableStructureSize},   // 49 (0.180.135), admin display transport
+        {nativeDiag615, 0, 8, 0, 24},   // 50 (0.180.145), admin read-only diagnostics
     };
     if (selector >= sizeof(methods) / sizeof(methods[0]))
         return kIOReturnUnsupported;
@@ -409,6 +458,7 @@ IOReturn IOAccelNVGspUserClient::externalMethod(
         switch (selector) {
         case 18: case 21: case 22: case 23: case 24: case 25: case 26: case 29:   // fence wait, submit, memory, VA
         case 30: case 31: case 33: case 38: case 40:                              // video engines, user pages, adopt, own GR channel
+        case 45: case 46: case 47: case 48:                                       // 0.180.104: owned native615 client
             break;
         default:
             return kIOReturnNotPrivileged;   // peek/poke, RPC, PRAMIN, modeset, reset, ...
@@ -420,7 +470,7 @@ IOReturn IOAccelNVGspUserClient::externalMethod(
     // Freeing, present-stop and memInfo stay allowed for cleanup.
     switch (selector) {
     case 17: case 18: case 20: case 21: case 22: case 24: case 25: case 27: case 29:
-    case 30: case 31: case 33: case 38: case 39: case 40: {
+    case 30: case 31: case 33: case 38: case 39: case 40: case 41: case 42: case 43: case 44: case 45: case 46: case 47: case 48: {
         // 0.164.0: while a reset runs nobody allocates, binds or submits.
         // A client that reopened in that window bound into tables the reset
         // then dropped (WindowServer's staging gone, CE fault, reset again).
@@ -547,7 +597,7 @@ IOReturn IOAccelNVGspUserClient::memAdopt(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
     if (!self || !self->driver_ || !arguments || arguments->scalarInputCount != 1 ||
-        arguments->scalarOutputCount != 2)
+        arguments->scalarOutputCount != 2 || (arguments->scalarInput[0] >> 32))
         return kIOReturnBadArgument;
     const UInt32 h = static_cast<UInt32>(arguments->scalarInput[0]);
     UInt64 phys = 0;
@@ -560,9 +610,175 @@ IOReturn IOAccelNVGspUserClient::memAdopt(
 IOReturn IOAccelNVGspUserClient::memFree(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
-    if (!self || !self->driver_ || !arguments || arguments->scalarInputCount != 1)
+    if (!self || !self->driver_ || !arguments || arguments->scalarInputCount != 1 ||
+        (arguments->scalarInput[0] >> 32))
         return kIOReturnBadArgument;
     return self->driver_->memFree(self, static_cast<UInt32>(arguments->scalarInput[0]));
+}
+
+IOReturn IOAccelNVGspUserClient::diagnosticVramReserve(
+    OSObject *target, void *, IOExternalMethodArguments *arguments) {
+    auto *self=OSDynamicCast(IOAccelNVGspUserClient,target);
+    if(!self || !self->admin_)return kIOReturnNotPrivileged;
+    if(!self->driver_ || !arguments || arguments->scalarInputCount!=1 ||
+       arguments->scalarOutputCount!=3 || !arguments->scalarOutput)return kIOReturnBadArgument;
+    arguments->scalarOutput[0]=arguments->scalarOutput[1]=arguments->scalarOutput[2]=0;
+    return self->driver_->diagnosticVramReserve(arguments->scalarInput[0],
+        &arguments->scalarOutput[0],&arguments->scalarOutput[1],&arguments->scalarOutput[2]);
+}
+
+IOReturn IOAccelNVGspUserClient::nativeRuntime615(
+    OSObject *target, void *, IOExternalMethodArguments *arguments) {
+    auto *self=OSDynamicCast(IOAccelNVGspUserClient,target);
+    if(!self || !self->admin_)return kIOReturnNotPrivileged;
+    if(!self->driver_ || !arguments || arguments->scalarInputCount!=1 ||
+       arguments->scalarInput[0]>1 || arguments->scalarOutputCount!=3 ||
+       !arguments->scalarOutput)return kIOReturnBadArgument;
+    arguments->scalarOutput[0]=arguments->scalarOutput[1]=arguments->scalarOutput[2]=0;
+    return self->driver_->nativeRuntime615(static_cast<UInt32>(arguments->scalarInput[0]),
+        &arguments->scalarOutput[0],&arguments->scalarOutput[1],&arguments->scalarOutput[2]);
+}
+
+IOReturn IOAccelNVGspUserClient::nativeIsolation615(
+    OSObject *target, void *, IOExternalMethodArguments *arguments) {
+    auto *self=OSDynamicCast(IOAccelNVGspUserClient,target);
+    if(!self || !self->admin_)return kIOReturnNotPrivileged;
+    if(!self->driver_ || !arguments || arguments->scalarInputCount!=1 ||
+       arguments->scalarInput[0]>15 || arguments->scalarOutputCount!=3 ||
+       !arguments->scalarOutput)return kIOReturnBadArgument;
+    arguments->scalarOutput[0]=arguments->scalarOutput[1]=arguments->scalarOutput[2]=0;
+    return self->driver_->nativeIsolation615(static_cast<UInt32>(arguments->scalarInput[0]),
+        &arguments->scalarOutput[0],&arguments->scalarOutput[1],&arguments->scalarOutput[2]);
+}
+
+IOReturn IOAccelNVGspUserClient::nativeClient615(
+    OSObject *target, void *, IOExternalMethodArguments *arguments) {
+    auto *self=OSDynamicCast(IOAccelNVGspUserClient,target);
+    if(!self)return kIOReturnNotPrivileged;
+    if(!self->driver_ || !arguments || arguments->scalarInputCount!=1 ||
+       arguments->scalarInput[0]>3 || arguments->scalarOutputCount!=3 ||
+       !arguments->scalarOutput)return kIOReturnBadArgument;
+    arguments->scalarOutput[0]=arguments->scalarOutput[1]=arguments->scalarOutput[2]=0;
+    return self->driver_->nativeClient615(self,static_cast<UInt32>(arguments->scalarInput[0]),
+        &arguments->scalarOutput[0],&arguments->scalarOutput[1],&arguments->scalarOutput[2]);
+}
+
+IOReturn IOAccelNVGspUserClient::nativeClientMemory615(
+    OSObject *target, void *, IOExternalMethodArguments *arguments) {
+    auto *self=OSDynamicCast(IOAccelNVGspUserClient,target);
+    if(!self)return kIOReturnNotPrivileged;
+    // 0.180.117: {0|1, argument} or {2, address, bytes|kind<<56} or {3, index}
+    if(!self->driver_ || !arguments || arguments->scalarInputCount<2 || arguments->scalarInputCount>3 ||
+       arguments->scalarInput[0]>4 || (arguments->scalarInputCount==3)!=(arguments->scalarInput[0]==2) ||
+       arguments->scalarOutputCount!=3 || !arguments->scalarOutput)return kIOReturnBadArgument;
+    return self->driver_->nativeClientMemory615(self,static_cast<UInt32>(arguments->scalarInput[0]),
+        arguments->scalarInput[1],arguments->scalarOutput,self->task_,
+        arguments->scalarInputCount==3?arguments->scalarInput[2]:0);
+}
+
+IOReturn IOAccelNVGspUserClient::nativeClientSubmit615(
+    OSObject *target, void *, IOExternalMethodArguments *arguments) {
+    auto *self=OSDynamicCast(IOAccelNVGspUserClient,target);
+    if(!self)return kIOReturnNotPrivileged;
+    // 0.180.133: optional third scalar = flags (bit 0 async, bit 1 wait for sequence scalar 0,
+    // bit 2 display connect probe)
+    if(!self->driver_ || !arguments || arguments->scalarInputCount<2 || arguments->scalarInputCount>3 ||
+       arguments->scalarOutputCount!=3 || !arguments->scalarOutput)return kIOReturnBadArgument;
+    const UInt64 flags=arguments->scalarInputCount==3 ? arguments->scalarInput[2] : 0;
+    if(flags&4)return self->driver_->displayProbe615(arguments->scalarOutput);
+    if(flags&8)return self->driver_->displayEdid615(UInt32(arguments->scalarInput[0]),arguments->scalarOutput);   // 0.180.134
+    return self->driver_->nativeClientSubmit615(self,arguments->scalarInput[0],arguments->scalarInput[1],
+        arguments->scalarOutput,flags);
+}
+
+// 0.180.135: admin only (not in the unprivileged list): struct in = op
+// header + payload, struct out = op result + data (see displayTransport615)
+IOReturn IOAccelNVGspUserClient::nativeDisplay615(
+    OSObject *target, void *, IOExternalMethodArguments *arguments) {
+    auto *self=OSDynamicCast(IOAccelNVGspUserClient,target);
+    if(!self)return kIOReturnNotPrivileged;
+    if(!self->admin_)return kIOReturnNotPrivileged;
+    if(!self->driver_ || !arguments || !arguments->structureInput || arguments->structureInputSize<16 ||
+       arguments->structureInputSize>3904 || !arguments->structureOutput || arguments->structureOutputSize<8 ||
+       arguments->structureOutputSize>4096)return kIOReturnBadArgument;
+    UInt32 outBytes=arguments->structureOutputSize;
+    const IOReturn r=self->driver_->displayTransport615(static_cast<const UInt8 *>(arguments->structureInput),
+        arguments->structureInputSize,static_cast<UInt8 *>(arguments->structureOutput),&outBytes);
+    arguments->structureOutputSize=outBytes;
+    return r;
+}
+
+// 0.180.145: admin only (not in the unprivileged list). struct in = u32 op,
+// u32 flags (0); op 1 = GET_SM_ISSUE_RATE (read-only, see smIssueRate615).
+IOReturn IOAccelNVGspUserClient::nativeDiag615(
+    OSObject *target, void *, IOExternalMethodArguments *arguments) {
+    auto *self=OSDynamicCast(IOAccelNVGspUserClient,target);
+    if(!self || !self->admin_)return kIOReturnNotPrivileged;
+    if(!self->driver_ || !arguments || !arguments->structureInput || arguments->structureInputSize!=8 ||
+       !arguments->structureOutput || arguments->structureOutputSize!=24)return kIOReturnBadArgument;
+    UInt32 op=0,flags=0;
+    __builtin_memcpy(&op,arguments->structureInput,4);
+    __builtin_memcpy(&flags,static_cast<const UInt8 *>(arguments->structureInput)+4,4);
+    if(op!=1)return kIOReturnUnsupported;
+    UInt32 outBytes=arguments->structureOutputSize;
+    const IOReturn r=self->driver_->smIssueRate615(flags,static_cast<UInt8 *>(arguments->structureOutput),&outBytes);
+    arguments->structureOutputSize=outBytes;
+    return r;
+}
+
+IOReturn IOAccelNVGspUserClient::nativeClientDispatch615(
+    OSObject *target, void *, IOExternalMethodArguments *arguments) {
+    auto *self=OSDynamicCast(IOAccelNVGspUserClient,target);
+    if(!self)return kIOReturnNotPrivileged;
+    if(!self->driver_ || !arguments || arguments->scalarOutputCount!=3 || !arguments->scalarOutput)
+        return kIOReturnBadArgument;
+    IOMemoryDescriptor *md=arguments->structureInputDescriptor;
+    const UInt64 bytes=md?md->getLength():arguments->structureInputSize;
+    if(bytes && (bytes<16+16+80 || bytes>16+256+32768+64 || (!md && !arguments->structureInput)))return kIOReturnBadArgument;
+    UInt8 *copy=nullptr;
+    IOReturn r=kIOReturnSuccess;
+    if(bytes) {
+        copy=static_cast<UInt8 *>(IOMalloc(bytes));
+        if(!copy)return kIOReturnNoMemory;
+        if(md) {
+            r=md->prepare();
+            if(r==kIOReturnSuccess) {
+                if(md->readBytes(0,copy,bytes)!=bytes)r=kIOReturnIOError;
+                md->complete();
+            }
+        } else __builtin_memcpy(copy,arguments->structureInput,bytes);
+    }
+    if(r==kIOReturnSuccess)
+        r=self->driver_->nativeClientDispatch615(self,copy,static_cast<UInt32>(bytes),arguments->scalarOutput);
+    if(copy)IOFree(copy,bytes);
+    return r;
+}
+
+IOReturn IOAccelNVGspUserClient::nativeCompute615(
+    OSObject *target, void *, IOExternalMethodArguments *arguments) {
+    auto *self=OSDynamicCast(IOAccelNVGspUserClient,target);
+    if(!self || !self->admin_)return kIOReturnNotPrivileged;
+    if(!self->driver_ || !arguments || !arguments->structureOutput ||
+       arguments->structureOutputSize!=sizeof(nvgsp::ComputeResult615))return kIOReturnBadArgument;
+    IOMemoryDescriptor *md=arguments->structureInputDescriptor;
+    const UInt64 bytes=md?md->getLength():arguments->structureInputSize;
+    if(bytes<80 || bytes>32768+64 || (!md && !arguments->structureInput))return kIOReturnBadArgument;
+    auto *copy=static_cast<UInt8 *>(IOMalloc(bytes));
+    if(!copy)return kIOReturnNoMemory;
+    IOReturn r=kIOReturnSuccess;
+    if(md) {
+        r=md->prepare();
+        if(r==kIOReturnSuccess) {
+            if(md->readBytes(0,copy,bytes)!=bytes)r=kIOReturnIOError;
+            md->complete();
+        }
+    } else __builtin_memcpy(copy,arguments->structureInput,bytes);
+    auto *out=static_cast<nvgsp::ComputeResult615 *>(arguments->structureOutput);
+    bzero(out,sizeof(*out));
+    if(r==kIOReturnSuccess)r=self->driver_->nativeCompute615(copy,static_cast<UInt32>(bytes),out);
+    IOFree(copy,bytes);
+    arguments->structureOutputSize=sizeof(*out);
+    return r;
 }
 
 IOReturn IOAccelNVGspUserClient::diagnosticChannelKick(
@@ -578,7 +794,8 @@ IOReturn IOAccelNVGspUserClient::vaBindObject(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self = OSDynamicCast(IOAccelNVGspUserClient, target);
     if (!self || !self->driver_ || !arguments ||
-        (arguments->scalarInputCount != 3 && arguments->scalarInputCount != 5))
+        (arguments->scalarInputCount != 3 && arguments->scalarInputCount != 5) ||
+        (arguments->scalarInput[0] >> 32))
         return kIOReturnBadArgument;
     const bool part = arguments->scalarInputCount == 5;
     return self->driver_->vaBindObject(self, static_cast<UInt32>(arguments->scalarInput[0]),

@@ -97,10 +97,14 @@ inline bool executeFwsecFrts(Io &io, const FwsecView &view,
     // READ, 256B, CTXDMA 0. IMEM is secure level 1; DMEM is non-secure.
     const uint32_t baseCommand = 6U << 8;
     const uint32_t imemCommand = baseCommand | (1U << 4) | (1U << 2);
-    if (stagedBus < view.desc.imemVirtBase ||
-        !falconDmaTransfer(io, view.desc.imemPhysBase, view.desc.imemVirtBase,
-                           stagedBus - view.desc.imemVirtBase,
-                           view.desc.imemLoadSize, imemCommand, &value.dmaTransfers) ||
+    // 0.180.12: imemPhysBase is the IMEM destination; the staging image
+    // starts at offset 0. MemoryOffset is the source offset inside the FB
+    // image, not the IMEM virtual base (which only the boot vector uses).
+    // The old code passed imemVirtBase here, so a non-zero virtual base made
+    // the Falcon read staging+imemVirtBase and skip the first bytes.
+    if (!falconDmaTransfer(io, view.desc.imemPhysBase, 0,
+                           stagedBus, view.desc.imemLoadSize, imemCommand,
+                           &value.dmaTransfers) ||
         !falconDmaTransfer(io, view.desc.dmemPhysBase, 0,
                            stagedBus + view.desc.imemLoadSize,
                            view.desc.dmemLoadSize, baseCommand, &value.dmaTransfers))

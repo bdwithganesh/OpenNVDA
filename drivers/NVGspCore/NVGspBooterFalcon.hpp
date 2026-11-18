@@ -68,50 +68,71 @@ template <typename Io>
 inline bool executeBooterLoad(Io &io, const BooterView &view,
                               uint64_t stagedBus, uint32_t stagedBytes,
                               uint64_t metadataBus,
-                              BooterExecutionResult *result) {
+                              BooterExecutionResult *result,
+                              uint32_t *stageOut = nullptr,
+                              uint32_t expectedMailbox0 = 0) {
+    BooterExecutionResult value{};
+    auto fail = [stageOut, result, &value](uint32_t stage) {
+        if (stageOut) *stageOut = stage;
+        if (result) *result = value;
+        return false;
+    };
     if (!result || !stagedBus || (stagedBus & 255) || !metadataBus ||
         view.imageSize > stagedBytes || (view.layout.appCodeOffset & 255) ||
         (view.layout.appCodeSize & 255) || (view.layout.osDataOffset & 255) ||
-        (view.layout.osDataSize & 255) ||
-        view.patchLocation < view.layout.osDataOffset)
-        return false;
+        (view.layout.osDataSize & 255) || view.patchLocation < view.layout.osDataOffset ||
+        !view.layout.appCodeSize || !view.layout.osDataSize ||
+        view.layout.appCodeOffset > view.imageSize ||
+        view.layout.appCodeSize > view.imageSize - view.layout.appCodeOffset ||
+        view.layout.osDataOffset > view.imageSize ||
+        view.layout.osDataSize > view.imageSize - view.layout.osDataOffset ||
+        view.patchLocation >= view.imageSize)
+        return fail(1);
 
-    BooterExecutionResult value{};
     uint32_t reg = 0;
     if (!io.read(sec2::kFbifCtl, &reg) || reg == sec2::kPriError ||
         !io.write(sec2::kFbifCtl, reg | (1U << 7)) ||
         !io.write(sec2::kDmaCtl, 0) ||
         !io.read(sec2::kFbifTranscfg0, &reg) || reg == sec2::kPriError ||
-        !io.write(sec2::kFbifTranscfg0, (reg & ~7U) | 5U)) return false;
+        !io.write(sec2::kFbifTranscfg0, (reg & ~7U) | 5U)) return fail(2);
 
     const uint32_t baseCommand = 6U << 8;
     const uint32_t imemCommand = baseCommand | (1U << 4) | (1U << 2);
     if (!sec2DmaTransfer(io, 0, view.layout.appCodeOffset,
                          stagedBus, view.layout.appCodeSize, imemCommand,
-                         &value.dmaTransfers) ||
-        !sec2DmaTransfer(io, 0, 0, stagedBus + view.layout.osDataOffset,
+                         &value.dmaTransfers))
+        return fail(3);
+    if (!sec2DmaTransfer(io, 0, 0, stagedBus + view.layout.osDataOffset,
                          view.layout.osDataSize, baseCommand,
-                         &value.dmaTransfers)) return false;
+                         &value.dmaTransfers))
+        return fail(4);
 
     if (!io.write(sec2::kBromParaAddr0,
                   view.patchLocation - view.layout.osDataOffset) ||
         !io.write(sec2::kBromEngineMask, view.engineId) ||
         !io.write(sec2::kBromUcodeId, view.ucodeId) ||
         !io.write(sec2::kBromModSel, 1) ||
+        // HS code has physical IMEM destination 0 but is tagged at the
+        // image's appCodeOffset virtual address by the DMA memory offset.
+        // NVIDIA's boot-from-HS path uses that virtual address for BOOTVEC.
         !io.write(sec2::kBootVec, view.layout.appCodeOffset) ||
         !io.write(sec2::kMailbox0, static_cast<uint32_t>(metadataBus)) ||
         !io.write(sec2::kMailbox1, static_cast<uint32_t>(metadataBus >> 32)) ||
         !io.read(sec2::kCpuCtl, &reg) || reg == sec2::kPriError)
-        return false;
+        return fail(5);
     const uint32_t startReg = (reg & (1U << 6)) ? sec2::kCpuCtlAlias : sec2::kCpuCtl;
     if (!io.write(startReg, 1U << 1) ||
         !sec2Poll(io, sec2::kCpuCtl, 1U << 4, 0, 10000, 10) ||
         !sec2Poll(io, sec2::kCpuCtl, 1U << 4, 1U << 4, 200000, 10) ||
         !io.read(sec2::kCpuCtl, &value.cpuCtl) ||
         !io.read(sec2::kMailbox0, &value.mailbox0) ||
-        !io.read(sec2::kMailbox1, &value.mailbox1)) return false;
+        !io.read(sec2::kMailbox1, &value.mailbox1)) return fail(6);
     *result = value;
-    return value.mailbox0 == 0;
+    // A normal GSP boot leaves mailbox0 clear. The V67 payload deliberately
+    // publishes its completion marker there, so the unlock path passes it.
+    if (value.mailbox0 != expectedMailbox0) return fail(7);
+    if (stageOut) *stageOut = 100;
+    return true;
 }
 
 } // namespace nvgsp
