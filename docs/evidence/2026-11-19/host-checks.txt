@@ -1,0 +1,55 @@
+nvdisplay_edid_check: PASS
+nvgsp_abi_check: PASS
+nvgsp_arena_map_check: PASS
+nvgsp_arena_pages_check: PASS
+nvgsp_boot_check: SKIP (needs NVIDIA firmware)
+nvgsp_booter_check: SKIP (needs NVIDIA firmware)
+nvgsp_booter_falcon_check: SKIP (needs NVIDIA firmware)
+nvgsp_chain_wait_check: PASS
+nvgsp_channel_check: PASS
+nvgsp_client_gr_615_check: PASS
+nvgsp_compute_packet_615_check: PASS
+nvgsp_control_615_check: PASS
+nvgsp_diagnostic_615_check: PASS
+nvgsp_diagnostic_vram_615_check: PASS
+nvgsp_evict_check: PASS
+nvgsp_external_vas_615_check: PASS
+nvgsp_falcon_check: SKIP (needs NVIDIA firmware)
+nvgsp_fault_615_check: PASS
+nvgsp_fb_layout_check: PASS
+nvgsp_fwsec_check: SKIP (needs NVIDIA firmware)
+nvgsp_gmc_config_check: PASS
+nvgsp_gmc_hs_check: PASS
+nvgsp_gmc_init_check: PASS
+nvgsp_gr_blob_615_check: PASS
+nvgsp_gr_context_check: PASS
+nvgsp_init_check: PASS
+nvgsp_isolation_615_check: PASS
+nvgsp_lifecycle_615_check: PASS
+nvgsp_memory_615_check: PASS
+nvgsp_mmu_615_check: PASS
+nvgsp_owned_recovery_615_check: SKIP (needs a read-only fault record capture)
+nvgsp_package_check: SKIP (needs NVIDIA firmware)
+nvgsp_probe_qmd_check: PASS
+nvgsp_recovery_615_check: PASS
+nvgsp_registry_check: PASS
+nvgsp_residency_check: PASS
+nvgsp_rpc_reply_check: PASS
+nvgsp_sm_rate_615_check: PASS
+nvgsp_sysmem_flush_check: PASS
+nvgsp_vbios_fwsec_check: SKIP (needs NVIDIA firmware)
+nvgsp_video_check: PASS
+nvgsp_vram_heap_check: PASS
+nvgsp_window_surface_check: PASS
+test_gpu_kext_versions: PASS
+test_nvaccel_stamp_watchdog: PASS
+test_nvgpu_profiles: PASS
+test_nvgsp_context_clear: PASS
+test_nvgsp_lifecycle_gate: PASS
+test_nvgsp_reset_channel_fallback: PASS
+test_nvgsp_stamp_reuse: PASS
+test_nvk_cts_runner: PASS
+test_nvmtl_dispatch_bounds: PASS
+test_nvmtl_family_gate: PASS
+test_nvmtl_mtl4_contract: PASS
+test_nvmtl_nak_header: PASS

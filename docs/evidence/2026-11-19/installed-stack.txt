@@ -1,0 +1,17 @@
+Thu Nov 19 00:06:15 IST 2026
+ProductName:		macOS
+ProductVersion:		26.7.3
+BuildVersion:		25G342
+MacPro7,1
+8
+org.local.macosdevicelab.NVGspControl (0.180.186) 067373CA-714D-369E-BFF5-483812A53DD3 <20 7 6 3>
+org.local.macosdevicelab.NVDisplayFB6 (1.4.1) 903BF70D-0395-3561-A374-62E4308A9462 <103 20 9 7 6 3 1>
+org.local.macosdevicelab.NVAccelerator15 (0.5.37) 037D32A0-8937-3F8C-AE8F-463A07B22AA9 <127 104 103 76 20 9 7 6 3 1>
+0.9.86
+"NVGspControl-native615-status" = 0
+"NVGspControl-native615-ready" = Yes
+      Chipset Model: NVIDIA GeForce RTX 4080
+      VRAM (Total): 16 GB
+      Metal Support: Metal 4
+          Resolution: 3840 x 2160 (2160p/4K UHD 1 - Ultra High Definition)
+          UI Looks like: 3840 x 2160 @ 60.00Hz

@@ -4,106 +4,128 @@
 
 <br>
 
-![macOS](https://img.shields.io/badge/macOS-Tahoe%2026.7-000000?logo=apple&logoColor=white)
+![macOS](https://img.shields.io/badge/macOS-Tahoe%2026.7.3-000000?logo=apple&logoColor=white)
 ![GPU](https://img.shields.io/badge/GPU-RTX%204080%20(AD103)-76B900?logo=nvidia&logoColor=white)
-![Firmware](https://img.shields.io/badge/GSP--RM-r570.144-76B900)
+![Firmware](https://img.shields.io/badge/GSP--RM-615.78.08-76B900)
+![Metal](https://img.shields.io/badge/System%20Information-Metal%204-555555?logo=apple)
 ![Status](https://img.shields.io/badge/status-experimental-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 [![Stars](https://img.shields.io/github/stars/bdwithganesh/OpenNVDA?style=social)](https://github.com/bdwithganesh/OpenNVDA/stargazers)
 
-**RTX 4080 on macOS Tahoe: GSP-RM, an accelerated desktop, Metal and a lot of unfinished driver work.**
+**An RTX 4080 driving macOS Tahoe through its own GSP firmware: a Metal desktop at 4K60, Liquid Glass and all, plus a long list of things that still don't work.**
 <br>
-Not a framebuffer hack. Not a VM. Bare metal.
+Not a framebuffer hack. Not a translation layer. macOS talks to the real card.
 
-[What works](#-what-works-today) · [Numbers](#-the-numbers) · [How it fits together](#-how-it-fits-together) · [Build](#-building) · [Support](#-want-this-to-become-a-real-driver) · [Credits](#-credits)
+[What works](#-what-works-today) · [Numbers](#-the-numbers) · [What changed](#-since-2-october) · [How it fits together](#-how-it-fits-together) · [Build](#-building) · [Support](#-want-this-to-become-a-real-driver) · [Credits](#-credits)
 
 <a href="https://www.buymeacoffee.com/bdwithganesh"><img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=&slug=bdwithganesh&button_colour=FFDD00&font_colour=000000&font_family=Cookie&outline_colour=000000&coffee_colour=ffffff" alt="Buy me a coffee" height="42"></a>
 
 </div>
 
 > [!NOTE]
-> **Made for fun**, on one PC, by one person with a lot of reboots. It's not a product and it's not ready for your daily machine. If you'd like it to become a real driver, [here's how you can help](#-want-this-to-become-a-real-driver).
+> **Made for fun**, on one PC, by one person and an unreasonable number of reboots. It isn't a product. Please don't put it on a machine you need tomorrow morning. If you'd like it to grow into a real driver, [here's how you can help](#-want-this-to-become-a-real-driver).
 
 ## 🤔 Why this exists
 
-Apple never shipped a driver for any NVIDIA card newer than Kepler. From Mojave onwards there's nothing at all. On a modern Hackintosh an RTX card is dead weight, or at best a dumb framebuffer sitting on the firmware's GOP screen.
+Apple stopped shipping drivers for NVIDIA cards after Kepler. From Mojave on, nothing. A modern RTX card in a Hackintosh just sits there, or at best shows the firmware's boot screen and never gets touched again.
 
-We wanted to see how far one person could actually push it. Turns out, pretty far.
+I wanted to know how far one person could get. Further than I expected, honestly.
 
 ## ✅ What works today
 
-The current test machine runs Tahoe 26.7. This is the 2 October 2026 checkpoint, not a release.
+This is the **19 November 2026** checkpoint. It's a snapshot, not a release.
 
-| Part | Tested setup |
+| | |
 |---|---|
-| **Board** | MSI X870E GAMING PLUS WIFI |
-| **CPU** | AMD Ryzen 9 7950X |
-| **GPU** | NVIDIA GeForce RTX 4080 16 GB (AD103, Ada Lovelace) |
-| **OS / firmware** | macOS Tahoe 26.7 / NVIDIA GSP-RM r570.144 |
-| **Installed stack** | NVGspControl 0.178.27, NVAccelerator 0.5.17, NVMTLDriver 0.8.69, NVDisplay 0.9.6 |
-| **Published control source** | 0.178.30; host checks and kernel SDK build pass, not installed on the test machine yet |
+| **GPU** | NVIDIA GeForce RTX 4080 16 GB (AD103, Ada) |
+| **Host PC** | MSI X870E GAMING PLUS WIFI, Ryzen 9 7950X |
+| **macOS** | Tahoe 26.7.3, as a Hyper-V guest on Windows 11, with the RTX handed over whole (DDA) |
+| **Firmware** | NVIDIA GSP-RM 615.78.08 (you bring your own copy) |
+| **Display** | BenQ PD2705U on the card's DisplayPort, 3840×2160 at 60 Hz |
+| **Installed stack** | NVGspControl 0.180.186 · NVAccelerator 0.5.37 · NVDisplay 1.4.1 · NVMTLDriver 0.9.86 |
+| **This repo** | Same source the installed binaries were built from ([how that was checked](docs/evidence/2026-11-19/README.md#source-matches-whats-installed)) |
+
+About that VM: since October the work happens inside a Hyper-V guest, because rebooting a VM is a lot faster than rebooting a whole PC. The GPU isn't emulated or shared. The guest gets the entire card, boots its GSP firmware and programs the display engine itself. The VM just supplies CPU, RAM and disks. The 2 October numbers were bare metal. This checkpoint hasn't been rerun on bare metal yet.
 
 #### 🟢 Checked on the machine
 
-- **Accelerated desktop at 4K60.** WindowServer stays up; the screenshots below show Finder and Safari frames captured from the real scanout surface.
-- **Focused Metal tests:** 39 different cases pass. The separate depth/stencil test passes all 75 checks. These are useful regression checks, not full Metal conformance.
-- **Output LUT effect:** with one fixed gray-ramp input, identity → half gain → identity changes the raster and DisplayPort CRCs, then returns exactly to the original values. The compositor CRC stays the same. Raw receipts are in [the evidence folder](docs/evidence/2026-10-02/README.md).
+- **System Information says "Metal Support: Metal 4".** The card shows up as an RTX 4080 with 16 GB, and the display runs at 4K 60 Hz.
+- **The whole desktop is composited on our Metal driver at 60 fps,** with the GPU at about 4 % busy and 5.9 ms flip latency. That includes Liquid Glass: Dock, widgets and menus blur properly. The check reads the blurred pixels back out of the scan-out buffer instead of trusting a screenshot.
+- **Colour goes through the hardware.** CoreDisplay's gamma lands in the display head's output LUT, so no shader pass is spent on colour. Scan-out is double-buffered, and flips latch at vblank, so no tearing.
+- **Our Metal contract tests:**
+  - Metal 3 set: 9/9.
+  - Metal 4 set: 16/16.
+  - Broader suite: 83 of 84. The one failure is a legacy-path test that doesn't apply to this runtime.
+  - Mesh shaders, MetalFX spatial upscaling, MPS / MPSGraph matrix multiply and Core Image blur all pass.
+  - These are our tests, not Apple's conformance suite.
+- **A hung or faulting GPU job no longer takes the desktop down.** The bad command buffer ends with `MTLCommandBufferErrorTimeout`, and the same process keeps going on a rebuilt channel. Tested with deliberate hangs and page faults: 0 problems.
 
-#### 🟡 Working, still being checked
+#### 🟡 Works, with an asterisk
 
-- **Metal and WindowServer** run, but app coverage and long-session stability are incomplete.
-- **Shared-channel recovery** passed an earlier 600-second checked workload on control 0.178.25. It has not been repeated on the current display checkpoint.
-- **Cursor programming** can reach the actual enabled hardware state under a controlled normal composition/LUT pipeline. That has not proved that the cursor bitmap reaches the output. Production still uses the software cursor.
-- **NVK, NVDEC and low-level compute** have earlier focused results. This update includes their source; it does not claim a fresh full Vulkan or video qualification run.
+- **The desktop freezes for about 5 s while a hang is being detected.** Compute preemption is CTA-level only; turning on CILP made it worse (~9 s).
+- **Scan-out still involves a CPU copy.** WindowServer's frame is memcpy'd into a system memory aperture, then the copy engine moves it into VRAM. That costs ~18 % of one core while things animate. The plan is copy-engine-only, straight from the IOSurface.
+- **Mission Control and window drags** are mostly smooth now (0 frames over 34 ms across three open/close cycles). Some apps still hitch on their own timers.
 
-#### 🔴 Still blocking a release
+#### 🔴 Not there yet
 
-- **Hardware cursor output:** CRC capture stops completing when the test cursor is enabled. PIO channel setup and point initialization did not fix it. The failed logs are published too.
-- **Private-channel recovery:** a post-reset mixed workload failed with RC109. Shared containment stays in place.
-- **Real app compatibility:** Geekbench 7 Metal Background Blur aborts on an unsupported AIR typed load. The bounded OpenCL run did not finish either; there is no completed score.
-- **Direct scan-out, production gamma controls, calibrated colour, HDR/VRR, sleep/wake, all-day use and installation qualification** remain open. The code and the screenshots do not establish Apple parity.
+- **FP32 through Metal is ~21 TFLOPS,** less than half of what the raw runtime managed. The native runtime's clock boost request fails, so the shader core probably never hits boost clocks. It's next on the list. Details in [the numbers](#-the-numbers).
+- **Metal blits between VRAM buffers are slow** (~45 GB/s). A compute copy does ~298 GB/s on the same buffers.
+- **Missing pieces:**
+  - ray tracing
+  - argument buffers tier 2
+  - more than one display mode
+  - hardware video decode in VideoToolbox
+  - HDMI/DP audio
+  - hardware cursor
+  - sleep/wake
+- **Not proven:** long-session and all-day stability, and app coverage beyond what we test. Geekbench 7 hasn't been rerun since October; back then its Metal Background Blur aborted on an unsupported AIR load.
 
-### A couple of actual frames
+### What it looks like
 
-[![Safari running on the Tahoe target](docs/evidence/2026-10-02/safari-on-tahoe.png)](docs/evidence/2026-10-02/safari-on-tahoe.png)
+[![The Tahoe desktop, read back from the scan-out buffer](docs/evidence/2026-11-19/desktop-scanout-720p.png)](docs/evidence/2026-11-19/desktop-scanout-720p.png)
 
-Safari on the target at 20:50 IST, after the unchanged-driver reboot and the 39-case Metal / 75-check depth tests. It shows the OpenNVDA page as it existed before this push.
-
-[![Desktop after the controlled LUT tests](docs/evidence/2026-10-02/desktop-after-lut.png)](docs/evidence/2026-10-02/desktop-after-lut.png)
-
-Desktop at 18:00 IST after the LUT trials and restoration. Both images are original 3840×2160 framebuffer captures. They show rendered desktop frames and the software pointer; separate hardware cursor and LUT stages are not captured by this method. [Logs, CRC values, hashes and what each result actually proves](docs/evidence/2026-10-02/README.md).
+That's the 4K frame read straight out of the scan-out buffer in VRAM (18 Nov, 21:06 IST), shrunk to 720p for the README. Widgets, the Dock divider and the glass are all rendered by the RTX through NVMTLDriver. The "Memory Modules Misconfigured" warning comes from the Mac Pro SMBIOS the guest uses, not from the driver. The 2 October [Safari](docs/evidence/2026-10-02/safari-on-tahoe.png) and [desktop](docs/evidence/2026-10-02/desktop-after-lut.png) captures are still there for comparison.
 
 ## 📊 The numbers
 
 <div align="center">
-<img src="docs/assets/bench.svg" alt="Memory fill, copy and FP32 on Linux, Windows and macOS with OpenNVDA" width="90%">
+<img src="docs/assets/bench.svg" alt="Memory fill, copy and FP32 on Linux, Windows, the raw macOS runtime and macOS through Metal" width="90%">
 </div>
 
 <br>
 
-| Test | Linux (NVIDIA 570) | Windows (NVIDIA) | **macOS + OpenNVDA** |
-|---|---:|---:|---:|
-| GPU memory fill | 663 GB/s | 649 GB/s | **668.5 GB/s** |
-| GPU copy kernel | 293 GB/s | 290 GB/s | **309.0 GB/s** |
-| FP32 compute | 47.27 TFLOPS | 47.38 TFLOPS | **47.72 TFLOPS** |
-| Host ↔ GPU (pinned / shared) | 26.9 / 26.4 GB/s | 26.8 / 26.4 GB/s | 26 GB/s |
+| Test | Linux (NVIDIA 570) | Windows (NVIDIA) | macOS, raw `nvrun` (Sept) | **macOS through Metal (19 Nov)** |
+|---|---:|---:|---:|---:|
+| GPU memory fill | 663 GB/s | 649 GB/s | 668.5 GB/s | **621-626 GB/s** |
+| GPU copy kernel | 293 GB/s | 290 GB/s | 309.0 GB/s | **297-299 GB/s** |
+| FP32 compute | 47.27 TFLOPS | 47.38 TFLOPS | 47.72 TFLOPS | **20.5-21.0 TFLOPS** |
+| Host → GPU / GPU → host | 26.9 / 26.4 GB/s | 26.8 / 26.4 GB/s | 26 GB/s | **21.4 / 22.5 GB/s** |
+| Metal blit, VRAM → VRAM | n/a | n/a | n/a | **44-49 GB/s** |
 
-These are earlier same-card low-level measurements. They were not rerun for the 2 October Tahoe checkpoint; use them as reference numbers, not a current app-performance claim.
+**How to read this.**
 
-> [!IMPORTANT]
-> These numbers come from our low-level runtime (`nvrun` + NAK shaders), not from Metal apps. Metal on top is much younger. The earlier Metal measurements were about **3.2 TFLOPS** for tiled SGEMM and **50 µs** dispatch latency. App correctness, recovery and the performance gap all still need work.
+- The first three columns are from September: the same PC and card, booted straight into each OS, warmed up. macOS used our own low-level runtime there (`nvrun` + NAK shaders), not Metal.
+- The last column is new. It's an ordinary Metal program ([`tools/bench/mtlbench.m`](tools/bench/mtlbench.m)): 256 MiB buffers, GPU timestamps, best of five after a warm-up. It ran inside the VM.
+- Memory bandwidth through Metal is basically where the raw numbers were.
+- FP32 isn't. Read that as "the clock boost is broken", not "Metal is slow": the boost failure shows up in the driver's own registry properties. Fixing it is the next job.
+- Host↔GPU goes through the hypervisor's IOMMU now, which probably costs a bit.
 
-<details>
-<summary><b>How these were measured</b></summary>
+Raw output: [mtlbench.txt](docs/evidence/2026-11-19/mtlbench.txt).
 
-<br>
+## 🔧 Since 2 October
 
-- **Setup:** same PC, same card, booted into each OS in turn.
-- **Linux and Windows:** NVIDIA's official driver.
-- **macOS:** OpenNVDA with `nvrun` and the gold kernels from `macos-lab-tools` (`nvrun`, `bench`, `nakc/kernels`).
-- **Warm-up:** every run is warmed up so the GPU is at its boost clock. A cold short run on macOS gave 42 TFLOPS, only because the clock hadn't ramped yet.
+The short version: in October the desktop technically ran on our Metal driver at a couple of frames a second. Now it's smooth. Most of the work went into finding out *why* it was slow, one measurement at a time.
 
-</details>
+- **Moved to GSP-RM 615.78.08 with our own runtime on top of it.** Memory management, page tables, channels and recovery are handled by us; RM is asked only for what it has to do.
+- **2 → 45 fps:** the display pipe wasn't getting vblank callbacks.
+- **11 → 55 fps:** GPU page tables marked every system-memory page as volatile, so the GPU's L2 never cached any shared buffer or IOSurface. One 4K pass dropped from 62 ms to 1.7 ms.
+- **55 → 60 fps, and GPU load from ~65 % to ~5 %:** CoreDisplay was running a full-screen colour shader every frame, because we didn't advertise a hardware colour pipe. Now gamma goes into the output LUT.
+- **Liquid Glass seams:** 1 px lines along glass edges. NVIDIA helper lanes read 0 from global memory. When a shader branched on a loaded value right before `fwidth`, the derivative came out wrong. The compiler now patches those loads (top-level branches only; doing it inside loops hung the GPU at boot, so that version was pulled).
+- **App icons borrowing each other's pixels:** render pass descriptors weren't copied at encode time.
+- **A shader cache race:** two processes compiling the same shader could tear the cache file.
+- **Window dragging:** every frame mapped and unmapped the same IOSurfaces, 816 ms of a 6 s drag. Now 103 ms.
+- **Mission Control:** mapping a new 4K surface took 34 ms of page table read-backs. Now 2.8 ms.
+- **Per-process recovery** from GPU hangs and page faults.
 
 ## 🧩 How it fits together
 
@@ -112,20 +134,20 @@ flowchart TB
     subgraph user["User space"]
         WS["WindowServer / apps"]
         MTL["NVMTLDriver<br/>(Metal driver bundle)"]
+        NAKC["nakc<br/>(AIR → NAK shader compiler)"]
         NVK["nvk-macos<br/>(Vulkan)"]
-        VT["VideoToolbox<br/>+ nvdec"]
     end
     subgraph kernel["Kernel (kexts)"]
-        ACC["NVAccelerator<br/>IOAcceleratorFamily2"]
+        ACC["NVAccelerator<br/>IOAcceleratorFamily2 + display pipe"]
         DISP["NVDisplay<br/>IOFramebuffer"]
-        CTRL["NVGspControl<br/>GSP boot · RM · memory · channels · IRQs"]
+        CTRL["NVGspControl<br/>GSP boot · memory · channels · recovery · display engine"]
     end
-    GPU[("RTX 4080<br/>GSP-RM firmware")]
+    GPU[("RTX 4080<br/>GSP-RM 615.78.08")]
 
     WS --> MTL --> ACC --> CTRL
+    MTL --> NAKC
     WS --> DISP --> CTRL
     NVK --> CTRL
-    VT --> CTRL
     CTRL <--> GPU
 ```
 
@@ -136,63 +158,68 @@ flowchart TB
 
 | Folder | What it is |
 |---|---|
-| `drivers/NVGspControl` | The main kext. Boots GSP, owns RM, memory, channels, interrupts, the display engine, sleep/wake |
-| `drivers/NVGspCore` | Header-only core shared by the kexts and the host tests (ABI structs, boot staging, VA arena, heap) |
-| `drivers/NVDisplay` | IOFramebuffer driver on top of NVGspControl, the thing WindowServer talks to |
-| `drivers/NVAccelerator` | IOAcceleratorFamily2 accelerator, the kernel half of Metal |
+| `drivers/NVGspControl` | The main kext. Boots GSP, runs the native 615 runtime (MMU, channels, faults, recovery), drives the display engine |
+| `drivers/NVGspCore` | Header-only core shared by the kexts and the host tests: ABI structs, page tables, fault decoding, recovery rules |
+| `drivers/NVDisplay` | IOFramebuffer on top of NVGspControl, the thing WindowServer talks to |
+| `drivers/NVAccelerator` | IOAcceleratorFamily2 accelerator and display pipe, the kernel half of Metal |
 | `drivers/NVMTLDriver` | Metal driver bundle, the user half of Metal |
-| `drivers/nvdec` | H.264 and HEVC decode on NVDEC |
-| `drivers/nvenc` | NVENC encode, early |
-| `drivers/NVVTDecoder` | VideoToolbox decoder plug-in (parked experiment) |
+| `tools/nakc` | The shader compiler: Apple AIR in, NIR in the middle, Mesa's NAK out |
+| `tools/bench` | `mtlbench.m`, the Metal benchmark behind the numbers above |
+| `drivers/nvdec`, `drivers/nvenc` | H.264 / HEVC decode on NVDEC, early NVENC encode |
+| `drivers/NVVTDecoder` | VideoToolbox decoder plug-in (parked) |
 | `drivers/nvk-macos` | Mesa's NVK Vulkan driver, ported to run on our kext |
-| `drivers/NVFramebuffer` | The first framebuffer kext, only scans out the GOP surface. Kept as a fallback |
-| `drivers/NVFBProbe` | The early probe that measured BARs, console and VBIOS before anything real existed |
-| `research/full-metal-rnd` | Notes and experiments on the road to full Metal |
-| `tools/gen_booter_unload.py` | Makes the one NVIDIA firmware header the kext needs, from your own linux-firmware copy |
+| `drivers/NVMSIProbe` | A tiny probe for MSI interrupt routing (real vblank interrupts are still on the list) |
+| `drivers/NVFramebuffer`, `drivers/NVFBProbe` | Where it all started: the GOP framebuffer kext and the first hardware survey. Kept as fallbacks |
+| `research/full-metal-rnd` | Notes from the road to full Metal |
+| `tools/gen_booter_unload.py` | Builds the one NVIDIA firmware header the kext needs, from your own linux-firmware copy |
 
 </details>
 
 ## 🛠 Building
 
-You need MacKernelSDK and a workspace from `macos-lab/workspace.sh`, which links `drivers/NV*` into the layout the build script expects:
+You need MacKernelSDK. Then, from the repo root:
 
 ```sh
 python3 tools/gen_booter_unload.py /path/to/linux-firmware/nvidia/ad103/gsp/booter_unload-570.144.bin
-# Supply your own firmware inputs to tools/nvgsp_package.py; see --help.
+# The GSP image (gsp_ga10x.bin) and ucodes come from NVIDIA's 615.78.08 Linux driver package;
+# pack them with tools/nvgsp_package.py (see --help).
 sh tools/build_kext.sh NVGspControl /path/to/MacKernelSDK [gsp-package.bin]
 sh tools/build_kext.sh NVDisplay    /path/to/MacKernelSDK
+sh tools/build_kext.sh NVAccelerator /path/to/MacKernelSDK
 ```
 
-> [!CAUTION]
-> **No NVIDIA firmware is in this repo, and none ever will be.** GSP-RM, the booters and the VBIOS belong to NVIDIA. You take them from linux-firmware or your own NVIDIA driver install, and `nvgsp_package.py` packs them for the kext.
+The Metal bundle and the compiler build on the Mac itself: `sh drivers/NVMTLDriver/build.sh`, and `tools/nakc/build_target.sh` against a Mesa 26.0.8 tree with the patches in `tools/nakc`.
 
-Run the hardware-free source checks with `sh tests/run_host_checks.sh`. They exercise the actual driver/probe code against mocks and check the shared core helpers. This does not load a driver. Other tests live next to each part:
-- `drivers/NVGspControl/tests`
-- `drivers/nvdec/tests/*/run.sh`
-- `drivers/nvk-macos/tests/nvkmd_macos/run.sh`
+> [!CAUTION]
+> **There's no NVIDIA firmware in this repo, and there never will be.** GSP-RM, the booters and the VBIOS belong to NVIDIA. Take them from linux-firmware or your own driver install; `nvgsp_package.py` packs them for the kext.
+
+`sh tests/run_host_checks.sh` runs the hardware-free checks: real driver and core code against mocks and recorded GSP replies. Nothing gets loaded. At this checkpoint: 47 pass, 8 skipped (they need firmware files or captures you'd have to supply), 0 fail. Other tests live next to their parts: `drivers/nvdec/tests/*/run.sh`, `tests/nvkmd_macos/run.sh`.
 
 ## ⚠️ Before you try it
 
-- It's written for **one** card (AD103) on **one** board. Other Ada cards might get somewhere; anything older won't.
+- It's written for **one** card (AD103). Other Ada cards might get somewhere. Older ones won't.
 - You need:
-  - our OpenCore setup;
-  - SIP and authenticated root turned off;
-  - a second OS you can boot when a test goes wrong.
-- A bad GPU state can hang the machine until a cold reboot. Back up your data. We're not responsible for what happens to your machine.
-- Not affiliated with NVIDIA or Apple. All trademarks belong to their owners.
+  - an OpenCore setup;
+  - SIP and authenticated root off;
+  - either a VM with whole-device passthrough or a second OS to fall back to when a test goes wrong.
+- A bad GPU state can still need a cold reboot. Back up your stuff. I'm not responsible for what happens to your machine.
+- Not affiliated with NVIDIA or Apple. Trademarks belong to their owners.
 
 ## 🗺 Roadmap
 
 - [x] GSP-RM boot, display, ReBAR, write-combining, power states
 - [x] Compute, copy engines, Vulkan (NVK), NVDEC
 - [x] Metal basics, WindowServer on our GPU
-- [ ] Stable login session on the native Metal path
-- [ ] Direct scan-out flips (no CPU copy)
-- [ ] Metal apps at the same speed as the raw numbers
-- [ ] Hardware cursor output, sleep/wake, private-channel GPU reset recovery
-- [ ] Production gamma controls and calibrated display validation
-- [x] macOS Tahoe 26 basic bring-up and focused Metal checks
-- [ ] Tahoe app coverage and long-session qualification
+- [x] macOS Tahoe 26 bring-up
+- [x] Smooth 4K60 desktop on the native Metal path, Liquid Glass included
+- [x] Gamma through the hardware output LUT, tear-free double-buffered flips
+- [x] Per-process recovery from GPU hangs and page faults
+- [ ] Clock boost on the native runtime (FP32 back to ~47 TFLOPS)
+- [ ] Scan-out without the CPU copy
+- [ ] Fast Metal blits, ray tracing, argument buffers tier 2
+- [ ] Display modes beyond 4K60, real MSI vblank interrupts
+- [ ] Hardware cursor, sleep/wake, HDMI/DP audio, VideoToolbox decode
+- [ ] Long-session qualification, and a bare-metal rerun
 - [ ] PyTorch (MPS), then MLX, on the RTX
 
 ## ☕ Want this to become a real driver?
@@ -209,9 +236,9 @@ Right now it's a hobby: nights and weekends on one PC. To turn it into something
 
 </div>
 
-Backers get their name in this README. If a company or a group wants to fund proper work (more cards, Tahoe support, a stable release), open an issue titled **"Funding"** and let's talk.
+Backers get their name in this README. If a company or a group wants to fund proper work (more cards, a stable release), open an issue titled **"Funding"** and let's talk.
 
-Even a ⭐ or a share helps. It tells us people actually want this.
+Even a ⭐ or a share helps. It tells me people actually want this.
 
 ## 🙏 Credits
 
@@ -220,21 +247,21 @@ Even a ⭐ or a share helps. It tells us people actually want this.
 To be upfront: a lot of the code was written with AI help. The rest was me:
 - the idea, and the stubbornness to keep going;
 - every direction call;
-- the hardware and every test on it: hundreds of reboots, Linux and Windows reference captures, reading logs at 3 am;
+- the hardware and every test on it: hundreds of reboots, reference captures, reading logs at 3 am;
 - deciding what "working" actually means.
 
 This stands on other people's shoulders:
 
-| Project | What we owe them |
+| Project | What I owe them |
 |---|---|
 | **nouveau** | Years of reverse engineering NVIDIA GPUs |
 | **NVIDIA open-gpu-kernel-modules / open-gpu-doc** | Without these, GSP-RM would be a black box |
-| **Mesa (NVK, NAK)** | The Vulkan driver and the shader compiler we build on |
+| **Mesa (NVK, NAK)** | The Vulkan driver and the shader compiler this builds on |
 | **envytools** | Register documentation |
 | **acidanthera** | MacKernelSDK, Lilu, OpenCore |
 | **WebKit** | The VideoToolbox SPI declarations |
 
-Where our code follows one of them closely, the comment right there says so. Full list with licences: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Where the code follows one of them closely, the comment right there says so. Full list with licences: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## 📄 Licence
 
