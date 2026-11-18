@@ -685,6 +685,9 @@ IOReturn IOAccelNVGspUserClient::nativeClientSubmit615(
     if(!self->driver_ || !arguments || arguments->scalarInputCount<2 || arguments->scalarInputCount>3 ||
        arguments->scalarOutputCount!=3 || !arguments->scalarOutput)return kIOReturnBadArgument;
     const UInt64 flags=arguments->scalarInputCount==3 ? arguments->scalarInput[2] : 0;
+    if(flags&~0xfULL)return kIOReturnBadArgument;
+    // 0.180.187: display probe/EDID run display-engine RPCs; this selector is open to Metal clients
+    if((flags&0xc) && !self->admin_)return kIOReturnNotPrivileged;
     if(flags&4)return self->driver_->displayProbe615(arguments->scalarOutput);
     if(flags&8)return self->driver_->displayEdid615(UInt32(arguments->scalarInput[0]),arguments->scalarOutput);   // 0.180.134
     return self->driver_->nativeClientSubmit615(self,arguments->scalarInput[0],arguments->scalarInput[1],

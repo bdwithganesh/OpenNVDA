@@ -13,7 +13,7 @@ int main() {
         const auto &e = kGrContextEntries[i]; const auto *d = p.data() + 48 + i * 32;
         assert(uint64_t(e.offset) + e.bytes <= kGrContextBytes);
         assert(read<uint16_t>(d, 28) == e.id);
-        assert(read<uint64_t>(d, 8) == (e.nonmapped ? 0 : 0x2048000000 + e.offset));
+        assert(read<uint64_t>(d, 8) == (e.nonmapped ? 0ULL : 0x2048000000ULL + e.offset));
         assert(read<uint64_t>(d, 0) == (e.init ? 0x48000000 + e.offset : 0));
         assert(read<uint64_t>(d, 16) == (e.init ? e.bytes : 0));
         assert(d[30] == e.init && d[31] == e.nonmapped);

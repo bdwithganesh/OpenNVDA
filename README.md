@@ -42,7 +42,7 @@ This is the **19 November 2026** checkpoint. It's a snapshot, not a release.
 | **macOS** | Tahoe 26.7.3, as a Hyper-V guest on Windows 11, with the RTX handed over whole (DDA) |
 | **Firmware** | NVIDIA GSP-RM 615.78.08 (you bring your own copy) |
 | **Display** | BenQ PD2705U on the card's DisplayPort, 3840×2160 at 60 Hz |
-| **Installed stack** | NVGspControl 0.180.186 · NVAccelerator 0.5.37 · NVDisplay 1.4.1 · NVMTLDriver 0.9.86 |
+| **Installed stack** | NVGspControl 0.180.187 · NVAccelerator 0.5.37 · NVDisplay 1.4.1 · NVMTLDriver 0.9.86 |
 | **This repo** | Same source the installed binaries were built from ([how that was checked](docs/evidence/2026-11-19/README.md#source-matches-whats-installed)) |
 
 About that VM: since October the work happens inside a Hyper-V guest, because rebooting a VM is a lot faster than rebooting a whole PC. The GPU isn't emulated or shared. The guest gets the entire card, boots its GSP firmware and programs the display engine itself. The VM just supplies CPU, RAM and disks. The 2 October numbers were bare metal. This checkpoint hasn't been rerun on bare metal yet.
@@ -68,7 +68,7 @@ About that VM: since October the work happens inside a Hyper-V guest, because re
 
 #### 🔴 Not there yet
 
-- **FP32 through Metal is ~21 TFLOPS,** less than half of what the raw runtime managed. The native runtime's clock boost request fails, so the shader core probably never hits boost clocks. It's next on the list. Details in [the numbers](#-the-numbers).
+- **FP32 through Metal is ~21 TFLOPS,** less than half of what the raw runtime managed with its hand-tuned kernels. I don't know why yet. Boost requests do reach the firmware, and the GPU reports P0. That leaves the clocks we actually get, or how the shader compiler handles this kernel. It's next on the list. Details in [the numbers](#-the-numbers).
 - **Metal blits between VRAM buffers are slow** (~45 GB/s). A compute copy does ~298 GB/s on the same buffers.
 - **Missing pieces:**
   - ray tracing
@@ -107,7 +107,7 @@ That's the 4K frame read straight out of the scan-out buffer in VRAM (18 Nov, 21
 - The first three columns are from September: the same PC and card, booted straight into each OS, warmed up. macOS used our own low-level runtime there (`nvrun` + NAK shaders), not Metal.
 - The last column is new. It's an ordinary Metal program ([`tools/bench/mtlbench.m`](tools/bench/mtlbench.m)): 256 MiB buffers, GPU timestamps, best of five after a warm-up. It ran inside the VM.
 - Memory bandwidth through Metal is basically where the raw numbers were.
-- FP32 isn't. Read that as "the clock boost is broken", not "Metal is slow": the boost failure shows up in the driver's own registry properties. Fixing it is the next job.
+- FP32 isn't, and the cause isn't pinned down yet. Two suspects: the clock the shader core actually runs at, and the code our compiler emits for this kernel. The September number came from hand-written kernels. Finding out which is the next job.
 - Host↔GPU goes through the hypervisor's IOMMU now, which probably costs a bit.
 
 Raw output: [mtlbench.txt](docs/evidence/2026-11-19/mtlbench.txt).
@@ -214,7 +214,7 @@ The Metal bundle and the compiler build on the Mac itself: `sh drivers/NVMTLDriv
 - [x] Smooth 4K60 desktop on the native Metal path, Liquid Glass included
 - [x] Gamma through the hardware output LUT, tear-free double-buffered flips
 - [x] Per-process recovery from GPU hangs and page faults
-- [ ] Clock boost on the native runtime (FP32 back to ~47 TFLOPS)
+- [ ] FP32 through Metal back near the raw ~47 TFLOPS
 - [ ] Scan-out without the CPU copy
 - [ ] Fast Metal blits, ray tracing, argument buffers tier 2
 - [ ] Display modes beyond 4K60, real MSI vblank interrupts

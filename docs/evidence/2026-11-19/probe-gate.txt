@@ -1,0 +1,14 @@
+# perf/probegate.c on NVGspControl 0.180.187 (UUID D1E45607-FB9D-3E11-963D-796888C85949), 19 Nov 2026
+# opens the accelerator's NVGP connection (the one every Metal process gets) and calls selector 48
+# with flags 4 (display probe), 8 (EDID, display 0x100) and 0x10 (undefined)
+== root
+flag 4 (probe): 0x0
+flag 8 (edid):  0xe00002c7
+flag 0x10:      0xe00002c2
+== user
+flag 4 (probe): 0xe00002c1
+flag 8 (edid):  0xe00002c1
+flag 0x10:      0xe00002c2
+"NVGspControl-native615-ready" = Yes
+# 0xe00002c1 = kIOReturnNotPrivileged, 0xe00002c2 = kIOReturnBadArgument;
+# the root EDID call got past the gate (0xe00002c7 = kIOReturnUnsupported for that display id)

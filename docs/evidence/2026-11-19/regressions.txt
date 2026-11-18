@@ -1,5 +1,6 @@
-# Regression run on NVGspControl 0.180.186 + NVAccelerator15 0.5.37 + NVDisplayFB6 1.4.1 + NVMTLDriver 0.9.86
-# 18 Nov 2026 22:10 IST, after a reboot onto 0.180.186. Summary lines exactly as printed.
+# Regression run on NVGspControl 0.180.187 + NVAccelerator15 0.5.37 + NVDisplayFB6 1.4.1 + NVMTLDriver 0.9.86
+# 19 Nov 2026 ~00:16 IST, after a reboot onto 0.180.187 (0.180.186 the evening before gave the same results).
+# Summary lines as printed.
 === metal_test ===
     status 4 sgemm PASS
 === Metal3 ===
@@ -11,8 +12,8 @@ A..G: PASS (0 step pixels, 0 black pixels)
 H, I: FAIL (rect unchanged)   <- offscreen CARenderer case where Core Animation itself issues a clear-only pass; informational
 === glass_check (Liquid Glass blur read back from the scan-out) ===
 glass_check: PASS
-run 1: 60 fps, GPU util 4 %, flip latency 5940238 ns
-run 2: 60 fps, GPU util 4 %, flip latency 5839759 ns
+run 1: 60 fps, GPU util 3 %, flip latency 6081762 ns
+run 2: 60 fps, GPU util 2 %, flip latency 6088030 ns
 === gpu_hang 2 / gpu_fault 2 (deliberate hang and page fault, per-process recovery) ===
 2 hang(s), 0 problem(s)
 2 hang(s), 0 problem(s)
@@ -21,5 +22,5 @@ run 2: 60 fps, GPU util 4 %, flip latency 5839759 ns
 lodcheck: 3 failing (known, unchanged since 0.9.79)
 cixcheck: tested 192, differing 8 (flaky +1 over the usual 7)
 === suite84 (84 Metal cases) ===
-83/84 rc 0 on kernel 0.180.186 (19 Nov 00:20 IST), same as on 0.180.184. The one failure is metal_native_reject_test, a legacy-path test that does not apply to the native GSP 615 runtime.
+83/84 rc 0 on kernel 0.180.186 (run just after midnight, 19 Nov), same as on 0.180.184. The one failure is metal_native_reject_test, a legacy-path test that does not apply to the native GSP 615 runtime.
 metal_native_reject_test rc=1 1s health=[1 4 0] :: native rejection: injected=0 failing rounds=4: FAIL

@@ -1,4 +1,4 @@
-# tools/bench/mtlbench.m, 18 Nov 2026 ~23:55 IST, NVMTLDriver 0.9.86, NVGspControl 0.180.186
+# tools/bench/mtlbench.m, late on 18 Nov 2026, NVMTLDriver 0.9.86, NVGspControl 0.180.186
 # clang -fobjc-arc -O2 mtlbench.m -framework Metal -framework Foundation -o mtlbench
 # best of 5 timed runs after one warm-up, GPU timestamps (GPUStartTime/GPUEndTime), 256 MiB buffers
 $ ./mtlbench
@@ -22,4 +22,5 @@ FP32 FMA           20.94 TFLOPS (5.85 ms)
 $ ITERS=8192 ./mtlbench | tail -1
 FP32 FMA           21.03 TFLOPS (23.28 ms)
 # afterwards: NVGspControl-native615-ready = Yes
-# same boot: NVGspControl-boost-native-failed = Yes, boost-pstate = 1 (the clock boost request fails on this path)
+# same boot: NVGspControl-activity-boosts = 4162, boost-pstate = 1 (P0), boost-native-failed = Yes (sticky: at least
+# one boost request was refused while the runtime was busy). Why FP32 is ~44 % of peak is not known yet.
