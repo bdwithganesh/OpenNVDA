@@ -91,7 +91,8 @@ public:
     IOReturn nativeIsolation615(UInt32 operation, UInt64 *stage, UInt64 *status, UInt64 *passed, int slot = -1);
     // 0.180.92: a user client owns the external-VAS GR client it created
     // (op 0 create, 1 destroy, 2 query); close/stop of that client tears it down.
-    IOReturn nativeClient615(const void *owner, UInt32 operation, UInt64 *stage, UInt64 *status, UInt64 *passed);
+    IOReturn nativeClient615(const void *owner, UInt32 operation, UInt64 *stage, UInt64 *status, UInt64 *passed,
+                             UInt64 pbVa = 0, UInt64 pbWords = 0);   // 0.180.191: ops 4/5 NVDEC0 open/submit
     void nativeClient615Close(const void *owner);
     IOMemoryDescriptor *client615UserMemory(const void *owner);   // retained, or nullptr
     // 0.180.101: op 0 alloc(bytes) -> {slot, GPU VA, bytes}; op 1 free(slot).
@@ -112,6 +113,7 @@ public:
     bool clientWaitIdle615(UInt32 slot);   // 0.180.133: every async submission finished
     IOReturn displayProbe615(UInt64 out[3]);   // 0.180.133: read-only connect state
     IOReturn smIssueRate615(UInt32 flags, UInt8 *out, UInt32 *outBytes);   // 0.180.145: read-only, selector 50
+    IOReturn falconInfo615(UInt32 flags, UInt8 *out, UInt32 *outBytes);   // 0.180.190: read-only, selector 50 op 2
     IOReturn displayEdid615(UInt32 displayId, UInt64 out[3]);   // 0.180.134: live DDC EDID read
     // 0.180.135: admin display bring-up transport on the paused native runtime
     IOReturn displayTransport615(const UInt8 *in, UInt32 inBytes, UInt8 *out, UInt32 *outBytes);
@@ -472,6 +474,7 @@ private:
     thread_call_t boostCall_ = nullptr;
     volatile UInt64 lastBoostAbs_ = 0;
     UInt32 boostSent_ = 0;
+    UInt32 clkTail615_ = 0;                   // 0.180.188: PMUMON tailIndex handed back on the next call
     UInt32 nvramBoostPinned_ = 0;             // nvram nvgsp-boost=1: old pinned max
     UInt32 boostPinned_ = 0;                  // 0.180.11: nvram nvgsp-boost-pin=1: indefinite BOOST_SET_3X
 public:
@@ -529,6 +532,7 @@ private:
     // too short for three Metal processes starting together)
     // 0.180.164: one RM control on the lifecycle client through the native ABI
     bool nativeControl615(UInt32 object, UInt32 command, void *params, UInt32 bytes);
+    void clockSample615();                    // 0.180.188: PMUMON GPC/DRAM clocks -> properties
     // 0.180.162: cached work-submit token of the native615 maintenance channel
     UInt32 mmuKickToken615_ = 0, mmuKickGeneration615_ = 0;
     UInt64 mmuKickInstance615_ = 0;
@@ -675,6 +679,7 @@ private:
     // 0.41.0: consumed GSP RC_TRIGGERED / MMU_FAULT_QUEUED events.
     UInt32 rcEvents_ = 0;
     UInt32 rcChidLog_[8] = {};   // 0.180.183: chid of the last 8 RC events (index rcEvents_ % 8)
+    bool nvdecFaultAbsorb_ = false;   // 0.180.192: an owned NVDEC channel's RC 31 came before its MMU fault notice
     UInt32 mmuFaultEvents_ = 0;
     UInt32 otherEvents_ = 0;
     // 0.43.0: 2 MiB PTEs mapping VRAM [0,36 MiB) (GOP scanout) at PD0

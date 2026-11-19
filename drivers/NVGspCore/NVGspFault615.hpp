@@ -59,6 +59,18 @@ inline bool nativeShadowFaultRequest615(uint32_t function,const void *payload,si
         h.command==kShadowFaultRegisterCommand615 && h.paramsBytes==sizeof(ShadowFaultRegistration615) &&
         !h.status && !h.rpcFlags && !h.controlFlags && !h.accessRight && !h.reserved;
 }
+// 0.180.188: NV2080_CTRL_CMD_CLK_PMUMON_CLK_DOMAINS_GET_SAMPLES (24-byte super + 250 x 24-byte samples)
+// is the only other control allowed through the large (multi-page) request buffers.
+constexpr uint32_t kClkSamplesCommand615=0x20801037;
+constexpr uint32_t kClkSamplesParams615=24+250*24;
+static_assert(40+kClkSamplesParams615<=kShadowFaultRequestBytes615,"clock samples fit the large request buffer");
+inline bool nativeClkSamplesRequest615(uint32_t function,const void *payload,size_t bytes) {
+    if(!payload || function!=76 || bytes!=40+kClkSamplesParams615)return false;
+    ControlHeader615 h{};__builtin_memcpy(&h,payload,sizeof(h));
+    return h.client==kLifecycleClient615 && h.object==kLifecycleSubdevice615 &&
+        h.command==kClkSamplesCommand615 && h.paramsBytes==kClkSamplesParams615 &&
+        !h.status && !h.rpcFlags && !h.controlFlags && !h.accessRight && !h.reserved;
+}
 template <typename Page>
 inline bool copyRpcReplyPages615(void *out,size_t capacity,uint32_t bytes,
         uint32_t read,uint32_t ringCount,Page page) {

@@ -150,7 +150,11 @@ struct ClientGrState615 {
     uint32_t allocChunk[kClientAllocs615],allocChunks[kClientAllocs615],allocLive;   // allocLive: bit i = slot i mapped
     uint64_t wrapVa[kClientWraps615],wrapBytes[kClientWraps615],wrapLive[kClientWraps615/64],wrapPages;   // 0.180.117, 157: bitmap words
     uint32_t leafCount[kClientLeafChunks615],leafChunks,mappedPages,privilegedPages;
-    uint32_t objects[20],objectCount,freedCount,stage,status,cid,token,vas;
+    uint32_t objects[32],objectCount,freedCount,stage,status,cid,token,vas;   // 0.180.191: 32 (NVDEC0 channel adds 9)
+    // 0.180.191: optional NVDEC0 channel in this client's VAS (runClientGr615 phases 6/7)
+    uint64_t nvdecInstance,nvdecMethod,nvdecUserd,nvdecGpfifo,nvdecCtx,nvdecRingVa,nvdecCtxVa,nvdecPbVa;
+    uint32_t nvdecStage,nvdecStatus,nvdecCid,nvdecToken,nvdecPut,nvdecPbWords,nvdecPromote;
+    bool nvdec,nvdecScheduled,nvdecFaulted;   // 0.180.192: faulted = RC killed the NVDEC channel
     uint32_t copyEngine;   // 0.180.128: NV2080 engine type of the GR channel's copy object, 0 = none
     uint32_t completed;    // 0.180.133: last submission sequence seen finished (async submits)
     uint32_t output[64];

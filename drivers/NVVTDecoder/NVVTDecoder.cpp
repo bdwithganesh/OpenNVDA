@@ -9,18 +9,14 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <unistd.h>
 extern "C" {
 #include "nvdec_h264.h"
+#include "nvdec_hevc.h"
 }
 
 namespace {
 std::atomic<uint64_t> sessions{0}, submitted{0}, emitted{0}, errors{0}, gpuNS{0};
-// NVGspControl clientMemoryForType: 0x1000|handle only encodes 12 bits.
-// Handles above 0xfff need the 0.162.0 wide form, same as NVMTL/NVK.
-static inline uint32_t nvvt_map_type(uint64_t handle) {
-    return handle < 0x1000 ? (0x1000u | static_cast<uint32_t>(handle))
-                          : (0x40000000u | static_cast<uint32_t>(handle));
-}
 struct Buffer { uint64_t handle = 0, va = 0, bytes = 0; uint8_t *cpu = nullptr; };
 struct Decoder {
     std::mutex mutex;
@@ -29,34 +25,44 @@ struct Decoder {
     nvdec_h264_dec h264;
     nvdec_h264_layout layout{};
     nvdec_h264_addrs addrs{};
+    bool hevc = false;   // HEVC Main 8-bit: same buffers and submit as H.264
+    nvdec_hevc_dec hdec;
+    nvdec_hevc_layout hlayout{};
+    nvdec_hevc_addrs haddrs{};
     Buffer input, push, aux, surfaces;
     uint64_t stride = 0;
     int lengthBytes = 0, width = 0, height = 0, x0 = 0, y0 = 0;
     bool failed = false;
     std::vector<uint8_t> linear;
-    Decoder() { nvdec_h264_init(&h264); }
+    Decoder() { nvdec_h264_init(&h264); nvdec_hevc_init(&hdec); }
+    // native615 (NVGspControl >= 0.180.191): an owned user-buffer client (selector 45 op 3),
+    // buffers = selector-47 sysmem allocations at kernel VAs (handle = slot + 1), NVDEC0 open =
+    // 45 op 4, submit = 45 op 5 {va, words}, fence = the engine semaphore the push releases.
+    bool owned = false;
     void release(Buffer &b) {
-        if (b.cpu) IOConnectUnmapMemory64(conn, nvvt_map_type(b.handle),
+        if (b.cpu) IOConnectUnmapMemory64(conn, 0x80615001u + (uint32_t)(b.handle - 1),
             mach_task_self(), (mach_vm_address_t)b.cpu);
-        if (b.handle) IOConnectCallScalarMethod(conn, 23, &b.handle, 1, nullptr, nullptr);
+        if (b.handle) {
+            uint64_t args[] = {1, b.handle - 1}, out[3]; uint32_t count = 3;
+            IOConnectCallScalarMethod(conn, 47, args, 2, out, &count);
+        }
         b = {};
     }
     ~Decoder() {
         if (conn) {
             release(surfaces); release(aux); release(push); release(input);
+            if (owned) { uint64_t op = 1, out[3]; uint32_t count = 3; IOConnectCallScalarMethod(conn, 45, &op, 1, out, &count); }
             IOServiceClose(conn);
         }
     }
-    bool allocate(Buffer &b, uint64_t bytes, uint64_t va) {
-        b.bytes = (bytes + 0x1fffff) & ~0x1fffffull;
-        uint64_t args[] = {b.bytes, 1}, out[2]{};
-        uint32_t count = 2;
-        if (IOConnectCallScalarMethod(conn, 22, args, 2, out, &count) || count != 2) return false;
-        b.handle = out[0]; b.va = va;
-        uint64_t bind[] = {b.handle, va, 0};
-        if (IOConnectCallScalarMethod(conn, 24, bind, 3, nullptr, nullptr)) return false;
+    bool allocate(Buffer &b, uint64_t bytes, uint64_t) {
+        b.bytes = (bytes + 0xffff) & ~0xffffull;
+        uint64_t args[] = {0, b.bytes}, out[3]{};
+        uint32_t count = 3;
+        if (IOConnectCallScalarMethod(conn, 47, args, 2, out, &count) || out[2] != b.bytes) return false;
+        b.handle = out[0] + 1; b.va = out[1];
         mach_vm_address_t address = 0; mach_vm_size_t size = 0;
-        if (IOConnectMapMemory64(conn, nvvt_map_type(b.handle), mach_task_self(),
+        if (IOConnectMapMemory64(conn, 0x80615001u + (uint32_t)out[0], mach_task_self(),
                                 &address, &size, kIOMapAnywhere)) return false;
         b.cpu = reinterpret_cast<uint8_t *>(address);
         if (size < b.bytes) return false;
@@ -78,10 +84,16 @@ struct Decoder {
             IOObjectRelease(service);
         }
         if (kr) return false;
-        uint64_t engine = 0, out[2]{}; uint32_t count = 2;
-        if (IOConnectCallScalarMethod(conn, 30, &engine, 1, out, &count)) return false;
-        return allocate(input, 4ull << 20, 0x2b00000000ull) &&
-               allocate(push, 2ull << 20, 0x2b40000000ull);
+        uint64_t op = 3, out[3]{}; uint32_t count = 3;
+        kr = IOConnectCallScalarMethod(conn, 45, &op, 1, out, &count);
+        for (int i = 0; kr == kIOReturnBusy && i < 500; i++) {   // all client slots taken: wait, like NVMTL
+            usleep(20000); count = 3; kr = IOConnectCallScalarMethod(conn, 45, &op, 1, out, &count);
+        }
+        if (kr) return false;
+        owned = true;
+        if (!allocate(input, 4ull << 20, 0) || !allocate(push, 64ull << 10, 0)) return false;
+        op = 4; count = 3;
+        return IOConnectCallScalarMethod(conn, 45, &op, 1, out, &count) == KERN_SUCCESS;
     }
     bool configure(const h264_sps &s) {
         nvdec_h264_layout_for(&s, &layout);
@@ -99,20 +111,34 @@ struct Decoder {
         linear.resize((size_t)layout.width * layout.height * 3 / 2);
         return true;
     }
-    OSStatus execute(uint32_t words) {
-        struct { uint64_t va; uint32_t words, flags; } segment{push.va, words, 0};
-        uint64_t engine = 2, seq = 0, done = 0; uint32_t count = 1;
+    bool configureHevc(const hevc_sps &s) {
+        nvdec_hevc_layout_for(&s, &hlayout);
+        const uint64_t c = (hlayout.coloc_bytes + 0xffffull) & ~0xffffull;
+        const uint64_t f = (hlayout.filter_bytes + 0xffffull) & ~0xffffull;
+        stride = (hlayout.surface_bytes + 0xffffull) & ~0xffffull;
+        if (!allocate(aux, c + f + NVDEC_HEVC_MISC_BYTES, 0) ||
+            !allocate(surfaces, stride * NVDEC_HEVC_SURFACES, 0)) return false;
+        haddrs.in_va = input.va; haddrs.coloc_va = aux.va; haddrs.filter_va = aux.va + c;
+        haddrs.misc_va = aux.va + c + f; haddrs.subch = 4; haddrs.obj_class = 0xc9b0;
+        for (int i = 0; i < NVDEC_HEVC_SURFACES; ++i) haddrs.surface_va[i] = surfaces.va + stride * i;
+        linear.resize((size_t)hlayout.width * hlayout.height * 3 / 2);
+        return true;
+    }
+    OSStatus execute(uint32_t words, uint32_t want) {
+        uint64_t args[] = {5, push.va, words}, out[3]; uint32_t count = 3;
         const uint64_t start = mach_absolute_time();
-        auto kr = IOConnectCallMethod(conn, 21, &engine, 1, &segment, sizeof(segment),
-                                     &seq, &count, nullptr, nullptr);
+        auto kr = IOConnectCallScalarMethod(conn, 45, args, 3, out, &count);
         if (kr) return kVTVideoDecoderMalfunctionErr;
         ++submitted;
-        uint64_t wait[] = {2, seq, 2000000}; count = 1;
-        kr = IOConnectCallScalarMethod(conn, 31, wait, 3, &done, &count);
         mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+        const volatile uint32_t *fence = (volatile uint32_t *)(input.cpu + NVDEC_IN_SEM);
+        uint64_t ns = 0;
+        while (*fence != want && ns < 2000000000ull) {   // 2 s, as the old kernel wait
+            ns = (mach_absolute_time() - start) * tb.numer / tb.denom;
+            if (ns > 50000) usleep(50);
+        }
         gpuNS += (mach_absolute_time() - start) * tb.numer / tb.denom;
-        if (kr || done != seq || *(volatile uint32_t *)(input.cpu + NVDEC_IN_SEM) != h264.pictures + 1)
-            return kVTVideoDecoderMalfunctionErr;
+        if (*fence != want) return kVTVideoDecoderMalfunctionErr;
         return noErr;
     }
 };
@@ -126,7 +152,7 @@ OSStatus invalidate(CMBaseObjectRef object) {
     return noErr;
 }
 void finalize(CMBaseObjectRef object) { invalidate(object); }
-CFStringRef describe(CMBaseObjectRef) { return CFSTR("NVDEC H.264 on RTX 4080"); }
+CFStringRef describe(CMBaseObjectRef) { return CFSTR("NVDEC H.264/HEVC on RTX 4080"); }
 OSStatus copyProperty(CMBaseObjectRef, CFStringRef key, CFAllocatorRef, void *out) {
     if (!out) return kVTParameterErr;
     if (CFEqual(key, kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder)) {
@@ -139,20 +165,28 @@ OSStatus copyProperty(CMBaseObjectRef, CFStringRef key, CFAllocatorRef, void *ou
 OSStatus start(VTVideoDecoderRef instance, VTVideoDecoderSession session,
                CMVideoFormatDescriptionRef format) {
     Storage *st = storage(reinterpret_cast<CMBaseObjectRef>(instance));
-    if (st->decoder || CMFormatDescriptionGetMediaSubType(format) != kCMVideoCodecType_H264)
+    const FourCharCode codec = CMFormatDescriptionGetMediaSubType(format);
+    if (st->decoder || (codec != kCMVideoCodecType_H264 && codec != kCMVideoCodecType_HEVC))
         return kVTVideoDecoderUnsupportedDataFormatErr;
     Decoder *d = new (std::nothrow) Decoder;
     if (!d) return kVTAllocationFailedErr;
-    st->decoder = d; d->session = session;
+    st->decoder = d; d->session = session; d->hevc = codec == kCMVideoCodecType_HEVC;
+    auto paramSet = [&](size_t i, const uint8_t **p, size_t *n, size_t *count, int *length) {
+        return d->hevc ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(format, i, p, n, count, length)
+                       : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, i, p, n, count, length);
+    };
     size_t nsets = 0, size = 0; const uint8_t *data = nullptr;
-    OSStatus err = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, 0, &data,
-                                                      &size, &nsets, &d->lengthBytes);
+    OSStatus err = paramSet(0, &data, &size, &nsets, &d->lengthBytes);
     if (err || nsets < 1 || nsets > 32 ||
         (d->lengthBytes != 1 && d->lengthBytes != 2 && d->lengthBytes != 4))
         return kVTVideoDecoderBadDataErr;
     for (size_t i = 0; i < nsets; ++i) {
-        err = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, i, &data, &size, nullptr, nullptr);
+        err = paramSet(i, &data, &size, nullptr, nullptr);
         if (err || !size) return kVTVideoDecoderBadDataErr;
+        if (d->hevc) {
+            if (size < 2 || nvdec_hevc_param_nal(&d->hdec, data, size)) return kVTVideoDecoderBadDataErr;
+            continue;
+        }
         h264_nal nal{data, size, data[0] & 31, (data[0] >> 5) & 3};
         if (nvdec_h264_param_nal(&d->h264, &nal)) return kVTVideoDecoderBadDataErr;
     }
@@ -179,6 +213,99 @@ OSStatus start(VTVideoDecoderRef instance, VTVideoDecoderSession session,
     return noErr;
 }
 
+// Block-linear NV12 surface -> pool buffer, cropped at x0/y0 to width x height.
+OSStatus emitSurface(Decoder *d, VTVideoDecoderFrame frame, const uint8_t *base, uint32_t blPitch,
+                     uint32_t codedWidth, uint32_t lumaBytes, uint32_t codedHeight) {
+    CVPixelBufferPoolRef pool = VTDecoderSessionGetPixelBufferPool(d->session);
+    CVPixelBufferRef pixel = nullptr;
+    if (!pool || CVPixelBufferPoolCreatePixelBuffer(nullptr, pool, &pixel)) return kVTAllocationFailedErr;
+    if (CVPixelBufferGetPixelFormatType(pixel) != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+        CVPixelBufferGetWidth(pixel) != (size_t)d->width || CVPixelBufferGetHeight(pixel) != (size_t)d->height ||
+        CVPixelBufferGetPlaneCount(pixel) != 2 || CVPixelBufferLockBaseAddress(pixel, 0)) {
+        CFRelease(pixel); return kVTVideoDecoderMalfunctionErr;
+    }
+    for (int plane = 0; plane < 2; ++plane) {
+        nvdec_detile(base + (plane ? lumaBytes : 0), blPitch, d->linear.data(), codedWidth, codedWidth,
+                     codedHeight >> plane);
+        uint8_t *dst = static_cast<uint8_t *>(CVPixelBufferGetBaseAddressOfPlane(pixel, plane));
+        const size_t pitch = CVPixelBufferGetBytesPerRowOfPlane(pixel, plane);
+        for (int y = 0; y < (d->height >> plane); ++y)
+            memcpy(dst + y * pitch, d->linear.data() + (size_t)(y + (d->y0 >> plane)) * codedWidth + d->x0, d->width);
+    }
+    CVPixelBufferUnlockBaseAddress(pixel, 0);
+    const OSStatus err = VTDecoderSessionEmitDecodedFrame(d->session, frame, noErr, 0, pixel);
+    CFRelease(pixel);
+    if (!err) ++emitted;
+    return err;
+}
+
+// One HEVC access unit (length-prefixed NALs = one picture); emitted in decode order like H.264.
+template <class Fail>
+OSStatus decodeHevc(Decoder *d, VTVideoDecoderFrame frame, std::vector<uint8_t> &data, VTDecodeFrameFlags flags,
+                    Fail fail) {
+    const size_t bytes = data.size();
+    std::vector<h264_nal> slices;
+    hevc_slice first{};
+    for (size_t pos = 0; pos < bytes;) {
+        if (bytes - pos < (size_t)d->lengthBytes) return fail(kVTVideoDecoderBadDataErr);
+        uint32_t length = 0;
+        for (int i = 0; i < d->lengthBytes; ++i) length = (length << 8) | data[pos++];
+        if (length < 2 || length > bytes - pos) return fail(kVTVideoDecoderBadDataErr);
+        const uint8_t *nal = data.data() + pos;
+        const int t = hevc_nal_type(nal);
+        if (hevc_is_slice(t)) {
+            hevc_slice sl;
+            if (hevc_parse_slice(nal, length, d->hdec.sps, d->hdec.pps, &sl)) return fail(kVTVideoDecoderBadDataErr);
+            if (slices.empty() != (bool)sl.first_slice_segment_in_pic_flag) return fail(kVTVideoDecoderBadDataErr);
+            if (slices.empty()) first = sl;
+            slices.push_back(h264_nal{nal, length, t, 0});
+        } else if (t == HEVC_NAL_VPS || t == HEVC_NAL_SPS || t == HEVC_NAL_PPS || t == HEVC_NAL_EOS) {
+            // in-band parameter sets; a changed layout is refused below
+            if (nvdec_hevc_param_nal(&d->hdec, nal, length)) return fail(kVTVideoDecoderBadDataErr);
+        }
+        pos += length;
+    }
+    if (slices.empty()) return fail(kVTVideoDecoderBadDataErr);
+    nvdec_hevc_pic_s setup;
+    int surface = -1;
+    const int r = nvdec_hevc_begin(&d->hdec, &first, d->input.cpu, &setup, &surface);
+    d->hdec.n_out = 0;   // VT owns timestamps
+    if (r == NVDEC_HEVC_SKIP)   // RASL of the CRA decoding starts at: not decodable
+        return VTDecoderSessionEmitDecodedFrame(d->session, frame, noErr, kVTDecodeInfo_FrameDropped, nullptr);
+    if (r) return fail(r == NVDEC_HEVC_EFORMAT ? kVTVideoDecoderUnsupportedDataFormatErr : kVTVideoDecoderBadDataErr);
+    const hevc_sps &s = d->hdec.sps[d->hdec.sps_id];
+    if (s.width > 4096 || s.height > 2304 || s.width - s.conf_left - s.conf_right != d->width ||
+        s.height - s.conf_top - s.conf_bottom != d->height || ((d->width | d->height | s.conf_left | s.conf_top) & 1))
+        return fail(kVTVideoDecoderUnsupportedDataFormatErr);
+    if (!d->surfaces.handle) {
+        d->x0 = s.conf_left; d->y0 = s.conf_top;
+        if (!d->configureHevc(s)) return fail(kVTAllocationFailedErr);
+    } else {
+        nvdec_hevc_layout current; nvdec_hevc_layout_for(&s, &current);
+        if (memcmp(&current, &d->hlayout, sizeof(current)) || d->x0 != s.conf_left || d->y0 != s.conf_top)
+            return fail(kVTVideoDecoderUnsupportedDataFormatErr);
+    }
+    nvdec_h264_stream stream;
+    nvdec_h264_stream_begin(&stream, d->input.cpu, (uint32_t)d->input.bytes);
+    for (const auto &nal : slices)
+        if (nvdec_h264_stream_slice(&stream, &nal)) return fail(kVTVideoDecoderBadDataErr);
+    if (nvdec_hevc_stream_end(&stream, &setup)) return fail(kVTVideoDecoderBadDataErr);
+    const uint32_t want = d->hdec.pictures + 1;
+    const uint32_t words = nvdec_hevc_push(&d->haddrs, &d->hlayout, d->hdec.pictures, want,
+                                           reinterpret_cast<uint32_t *>(d->push.cpu), 1024);
+    if (!words) return fail(kVTVideoDecoderBadDataErr);
+    OSStatus err = d->execute(words, want);
+    if (err) return fail(err);
+    d->hdec.pictures++;
+    const bool shown = d->hdec.cur_output;
+    nvdec_hevc_end(&d->hdec); d->hdec.n_out = 0;
+    if ((flags & kVTDecodeFrame_DoNotOutputFrame) || !shown)
+        return VTDecoderSessionEmitDecodedFrame(d->session, frame, noErr, kVTDecodeInfo_FrameDropped, nullptr);
+    err = emitSurface(d, frame, d->surfaces.cpu + surface * d->stride, d->hlayout.pitch, d->hlayout.width,
+                      d->hlayout.luma_bytes, d->hlayout.height);
+    return err ? fail(err) : noErr;
+}
+
 OSStatus decode(VTVideoDecoderRef instance, VTVideoDecoderFrame frame,
                 CMSampleBufferRef sample, VTDecodeFrameFlags flags, VTDecodeInfoFlags *info) {
     Decoder *d = storage(reinterpret_cast<CMBaseObjectRef>(instance))->decoder;
@@ -194,6 +321,7 @@ OSStatus decode(VTVideoDecoderRef instance, VTVideoDecoderFrame frame,
         return fail(kVTVideoDecoderBadDataErr);
     std::vector<uint8_t> data(bytes);
     if (CMBlockBufferCopyDataBytes(block, 0, bytes, data.data())) return fail(kVTVideoDecoderBadDataErr);
+    if (d->hevc) return decodeHevc(d, frame, data, flags, fail);
     std::vector<h264_nal> slices;
     h264_slice first{}, prev{};
     for (size_t pos = 0; pos < bytes;) {
@@ -249,36 +377,14 @@ OSStatus decode(VTVideoDecoderRef instance, VTVideoDecoderFrame frame,
     const uint32_t words = nvdec_h264_push(&d->addrs, &d->layout, d->h264.pictures,
         d->h264.pictures + 1, reinterpret_cast<uint32_t *>(d->push.cpu), 1024);
     if (!words) return fail(kVTVideoDecoderBadDataErr);
-    OSStatus err = d->execute(words);
+    OSStatus err = d->execute(words, d->h264.pictures + 1);
     if (err) return fail(err);
     nvdec_h264_end(&d->h264); d->h264.n_out = 0;
     if (flags & kVTDecodeFrame_DoNotOutputFrame)
         return VTDecoderSessionEmitDecodedFrame(d->session, frame, noErr, kVTDecodeInfo_FrameDropped, nullptr);
-    CVPixelBufferPoolRef pool = VTDecoderSessionGetPixelBufferPool(d->session);
-    CVPixelBufferRef pixel = nullptr;
-    if (!pool || CVPixelBufferPoolCreatePixelBuffer(nullptr, pool, &pixel)) return fail(kVTAllocationFailedErr);
-    if (CVPixelBufferGetPixelFormatType(pixel) != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
-        CVPixelBufferGetWidth(pixel) != (size_t)d->width || CVPixelBufferGetHeight(pixel) != (size_t)d->height ||
-        CVPixelBufferGetPlaneCount(pixel) != 2 || CVPixelBufferLockBaseAddress(pixel, 0)) {
-        CFRelease(pixel); return fail(kVTVideoDecoderMalfunctionErr);
-    }
-    const uint8_t *base = d->surfaces.cpu + surface * d->stride;
-    for (int plane = 0; plane < 2; ++plane) {
-        const uint32_t rows = d->layout.height >> plane;
-        nvdec_detile(base + (plane ? d->layout.luma_bytes : 0), d->layout.pitch,
-                     d->linear.data(), d->layout.width, d->layout.width, rows);
-        uint8_t *dst = static_cast<uint8_t *>(CVPixelBufferGetBaseAddressOfPlane(pixel, plane));
-        const size_t pitch = CVPixelBufferGetBytesPerRowOfPlane(pixel, plane);
-        for (int y = 0; y < (d->height >> plane); ++y)
-            memcpy(dst + y * pitch, d->linear.data() +
-                   (size_t)(y + (d->y0 >> plane)) * d->layout.width + d->x0, d->width);
-    }
-    CVPixelBufferUnlockBaseAddress(pixel, 0);
-    err = VTDecoderSessionEmitDecodedFrame(d->session, frame, noErr, 0, pixel);
-    CFRelease(pixel);
-    if (err) return fail(err);
-    ++emitted;
-    return noErr;
+    err = emitSurface(d, frame, d->surfaces.cpu + surface * d->stride, d->layout.pitch, d->layout.width,
+                      d->layout.luma_bytes, d->layout.height);
+    return err ? fail(err) : noErr;
 }
 
 static const CMBaseClass baseClass = {
@@ -291,7 +397,7 @@ static const VTVideoDecoderClass decoderClass = {
 };
 static const VTVideoDecoderVTable vtable = {{nullptr, &baseClass}, &decoderClass};
 OSStatus create(FourCharCode codec, CFAllocatorRef allocator, VTVideoDecoderRef *out) {
-    if (!out || codec != kCMVideoCodecType_H264) return kVTParameterErr;
+    if (!out || (codec != kCMVideoCodecType_H264 && codec != kCMVideoCodecType_HEVC)) return kVTParameterErr;
     *out = nullptr;
     return CMDerivedObjectCreate(allocator, &vtable.base, VTVideoDecoderGetClassID(),
                                 reinterpret_cast<CMBaseObjectRef *>(out));
@@ -326,6 +432,22 @@ extern "C" OSStatus NVVTRegisterH264Decoder(void) {
         return s;
     }
     return VTRegisterVideoDecoder(kCMVideoCodecType_H264, create);
+}
+extern "C" OSStatus NVVTRegisterHEVCDecoder(void) {
+    if (!VTRegisterVideoDecoderWithInfo) return VTRegisterVideoDecoder(kCMVideoCodecType_HEVC, create);
+    CFMutableDictionaryRef info = CFDictionaryCreateMutable(nullptr, 0, &kCFTypeDictionaryKeyCallBacks,
+                                                            &kCFTypeDictionaryValueCallBacks);
+    const int rating = 400;
+    CFNumberRef r = CFNumberCreate(nullptr, kCFNumberIntType, &rating);
+    CFDictionarySetValue(info, CFSTR("CMClassImplementationID"), CFSTR("org.local.macosdevicelab.videodecoder.hevc.nvdec"));
+    CFDictionarySetValue(info, CFSTR("VTCodecType"), CFSTR("hvc1"));
+    CFDictionarySetValue(info, CFSTR("VTIsHardwareAccelerated"), kCFBooleanTrue);
+    CFDictionarySetValue(info, CFSTR("VTRating"), r);
+    CFDictionarySetValue(info, CFSTR("VTCodecName"), CFSTR("HEVC"));
+    CFDictionarySetValue(info, CFSTR("VTDecoderName"), CFSTR("NVIDIA NVDEC HEVC"));
+    const OSStatus s = VTRegisterVideoDecoderWithInfo(kCMVideoCodecType_HEVC, info, create);
+    CFRelease(r); CFRelease(info);
+    return s;
 }
 extern "C" void NVVTGetStats(NVVTStats *out) {
     if (out) *out = {sessions.load(), submitted.load(), emitted.load(), errors.load(), gpuNS.load()};

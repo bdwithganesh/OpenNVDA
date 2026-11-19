@@ -445,7 +445,7 @@ IOReturn IOAccelNVGspUserClient::externalMethod(
         {nativeRuntime615, 1, 0, 3, 0},                       // 42, admin, owned native615 bootstrap/query
         {nativeCompute615, 0, kIOUCVariableStructureSize, 0, sizeof(nvgsp::ComputeResult615)}, // 43, admin diagnostic shader
         {nativeIsolation615, 1, 0, 3, 0},                    // 44, admin private-VAS COPY0 lifecycle proof
-        {nativeClient615, 1, 0, 3, 0},                       // 45 (0.180.92), admin, process-owned GR client
+        {nativeClient615, kIOUCVariableStructureSize, 0, 3, 0},   // 45 (0.180.92), process-owned GR client; 0.180.191: 1 or 3 scalars
         {nativeClientDispatch615, 0, kIOUCVariableStructureSize, 3, 0}, // 46 (0.180.98), admin, owner's NAK dispatch
         {nativeClientMemory615, kIOUCVariableStructureSize, 0, 3, 0},   // 47 (0.180.101/117), owner's allocations and wraps
         {nativeClientSubmit615, kIOUCVariableStructureSize, 0, 3, 0},   // 48 (0.180.103/133), owner's pushbuffer, flags
@@ -655,12 +655,16 @@ IOReturn IOAccelNVGspUserClient::nativeClient615(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self=OSDynamicCast(IOAccelNVGspUserClient,target);
     if(!self)return kIOReturnNotPrivileged;
-    if(!self->driver_ || !arguments || arguments->scalarInputCount!=1 ||
-       arguments->scalarInput[0]>3 || arguments->scalarOutputCount!=3 ||
+    // 0.180.191: {op} for 0..4, {5, pushbuffer VA, words} for an NVDEC0 submit
+    if(!self->driver_ || !arguments || !arguments->scalarInput ||
+       arguments->scalarInputCount!=(arguments->scalarInputCount>=1 && arguments->scalarInput[0]==5 ? 3U : 1U) ||
+       arguments->scalarInput[0]>5 || arguments->scalarOutputCount!=3 ||
        !arguments->scalarOutput)return kIOReturnBadArgument;
     arguments->scalarOutput[0]=arguments->scalarOutput[1]=arguments->scalarOutput[2]=0;
+    const bool submit=arguments->scalarInput[0]==5;
     return self->driver_->nativeClient615(self,static_cast<UInt32>(arguments->scalarInput[0]),
-        &arguments->scalarOutput[0],&arguments->scalarOutput[1],&arguments->scalarOutput[2]);
+        &arguments->scalarOutput[0],&arguments->scalarOutput[1],&arguments->scalarOutput[2],
+        submit?arguments->scalarInput[1]:0,submit?arguments->scalarInput[2]:0);
 }
 
 IOReturn IOAccelNVGspUserClient::nativeClientMemory615(
@@ -722,9 +726,10 @@ IOReturn IOAccelNVGspUserClient::nativeDiag615(
     UInt32 op=0,flags=0;
     __builtin_memcpy(&op,arguments->structureInput,4);
     __builtin_memcpy(&flags,static_cast<const UInt8 *>(arguments->structureInput)+4,4);
-    if(op!=1)return kIOReturnUnsupported;
+    if(op!=1 && op!=2)return kIOReturnUnsupported;   // 0.180.190: op 2 = GET_CONSTRUCTED_FALCON_INFO (falconInfo615)
     UInt32 outBytes=arguments->structureOutputSize;
-    const IOReturn r=self->driver_->smIssueRate615(flags,static_cast<UInt8 *>(arguments->structureOutput),&outBytes);
+    UInt8 *o=static_cast<UInt8 *>(arguments->structureOutput);
+    const IOReturn r=op==1 ? self->driver_->smIssueRate615(flags,o,&outBytes) : self->driver_->falconInfo615(flags,o,&outBytes);
     arguments->structureOutputSize=outBytes;
     return r;
 }

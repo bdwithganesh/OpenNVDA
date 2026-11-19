@@ -37,6 +37,7 @@
 // failure; all other calls then fail too.
 bool nvGspEnsure(void);
 bool nvGspNative615(void);   // 0.9.28: NVMTL_NATIVE615 owned-client backend requested
+bool nvGspVramLinear(uint64_t va, uint64_t n);   // 0.9.87: [va, va+n) is pitch VRAM (legacy heap or native615 slab)
 bool nvGspValidate(void);  // 0.8.31: generation gate before native encoding
 uint64_t nvGspRecoverySerial(void); // successful resource rebinds in this process
 uint64_t nvGspGeneration(void);

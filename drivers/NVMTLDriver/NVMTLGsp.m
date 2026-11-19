@@ -938,6 +938,8 @@ typedef struct { uint64_t va, size; } NVRange;
 static NVRange gVFree[2048];
 static unsigned gNVFree;
 static uint64_t gVramVa = NVGSP_VRAM_VA_BASE;
+static NVRange g615VSlab[256];               // 0.9.87/88: native615 kind-0 VRAM slabs (never freed)
+static unsigned g615NVSlab;
 
 // 0.6.12: kext objects, kept so a GPU reset can put them back
 typedef struct { uint64_t va, size; uint32_t handle; } NVChunk;
@@ -1308,7 +1310,19 @@ static bool nv615VramGrowLocked(uint64_t len) {
         return false;
     }
     gVFree[gNVFree++] = (NVRange){out[1], out[2]};
+    if (g615NVSlab < 256) g615VSlab[g615NVSlab++] = (NVRange){out[1], out[2]};
     return true;
+}
+// 0.9.87/88: pitch (kind 0) VRAM, legacy heap or native615 slabs. Native slabs sit
+// below 0x2A00000000, so the compute blit's old range test sent them to the CE.
+bool nvGspVramLinear(uint64_t va, uint64_t n) {
+    if (va >= NVGSP_VRAM_VA_BASE && n <= NVGSP_VRAM_VA_END - va) return true;
+    bool in = false;
+    os_unfair_lock_lock(&gHeapLock);
+    for (unsigned i = 0; i < g615NVSlab && !in; i++)
+        in = va >= g615VSlab[i].va && n <= g615VSlab[i].size && va - g615VSlab[i].va <= g615VSlab[i].size - n;
+    os_unfair_lock_unlock(&gHeapLock);
+    return in;
 }
 static bool nv615VramTexOn(void) {
     static int on = -1;
@@ -1624,6 +1638,15 @@ static bool slmEnsure(uint32_t perLane) {
     const uint64_t tpc = (warp * 48 * 2 + 0x7fff) & ~0x7fffULL;
     const uint64_t size = (tpc * NVSLM_TPCS + 0x1ffff) & ~0x1ffffULL;
     uint64_t va = 0; uint32_t h = 0;
+    // 0.9.90: native615 scratch in VRAM. In sysmem every spill/private-array access crossed PCIe:
+    // MPS cnnConvArray (24 b128 local stores/loads) ran at 0.18 TFLOPS.
+    static bool slmVram;
+    if (gN615 && nv615VramOn() && nv615CeOn() && nvVramAllocRaw(size, &va)) {
+        if (slmVram) nvVramFree(gSlmVa, gSlmSize);
+        slmVram = true;
+        gSlmVa = va; gSlmHandle = 0; gSlmPerWarp = warp; gSlmPerTpc = tpc; gSlmSize = size;
+        return true;
+    }
     if (gN615) {   // 0.9.28: scratch is pinned sysmem from the native615 heap (exact size, at most one slab)
         void *cpu = NULL;
         bool ok = false;
@@ -1681,6 +1704,10 @@ static void qmdShared(uint32_t *qs, uint32_t smem, const uint32_t *block, uint32
     {
         static const uint32_t kb[6] = {0, 8, 16, 32, 64, 100};
         uint32_t sm = (smem + 255) & ~255u;
+        // 0.9.89: MetalFX unified_pass_tile reads 224 B past its threadgroup memory (RC 13 at 19424 of
+        // 19200; a full 1280x720 grid of those wedged GSP). Apple GPUs do not trap: give each CTA 2 KiB slack.
+        const uint32_t kMaxCta = 99u * 1024;
+        if (sm && sm < kMaxCta) sm = sm + 2048 < kMaxCta ? sm + 2048 : kMaxCta;
         uint32_t threads = block[0] * block[1] * block[2];
         uint32_t warps = (threads + 31) / 32, wgs = 48 / (warps ? warps : 1);
         uint32_t fit1 = 100, fitn = 100;
@@ -2274,7 +2301,8 @@ static bool grQueue(bool force, const uint32_t *code, uint32_t codeWords, uint32
 bool nvCeFill(uint64_t dstVa, uint64_t bytes, uint32_t value) {
     NV_GPU_LOCKED;
     if (!gCpu || !bytes) return false;
-    if (gN615 && (!nv615CeOn() || (bytes & 3) || nv615Cpu(dstVa, bytes))) {   // 0.9.27; 0.9.45 CE for VRAM
+    // 0.9.27; 0.9.45 CE for VRAM; 0.9.87/88: odd lengths in VRAM (no CPU view) take the CE + pattern-tail path too
+    if (gN615 && (!nv615CeOn() || nv615Cpu(dstVa, bytes))) {
         if (!nvGrFlush()) return false;
         uint8_t *d = nv615Cpu(dstVa, bytes);
         if (!d) { NSLog(@"NVMTLGsp: native615 fill outside mapped memory"); nvNoteGpuFailure(1); return false; }

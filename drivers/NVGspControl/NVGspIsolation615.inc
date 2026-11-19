@@ -2,7 +2,7 @@
 // every remaining object and invalidates the native runtime until cold stop.
 IOReturn NVGspControl::nativeIsolation615(UInt32 operation,UInt64 *stage,
                                         UInt64 *status,UInt64 *passed,int slot) {
-    if(!lock_ || !stage || !status || !passed || operation>15)return kIOReturnBadArgument;
+    if(!lock_ || !stage || !status || !passed || operation>17)return kIOReturnBadArgument;
     *stage=*status=*passed=0;lk(__LINE__);
     // 0.180.112: an owned transaction waits for the running one; the admin
     // diagnostic paths stay on slot 0.
@@ -124,6 +124,18 @@ IOReturn NVGspControl::nativeIsolation615(UInt32 operation,UInt64 *stage,
         setProperty("NVGspControl-native615-busy",false);
         setProperty("NVGspControl-client615-cancel-status",UInt32(r),32);
         *stage=g.stage;*status=UInt32(r);*passed=r==kIOReturnSuccess;ulk();return r;
+    }
+    if(operation==16 || operation==17) {   // 0.180.191: NVDEC0 open / submit in an owned client
+        auto &g=s->clientGrs[client615Slot_];
+        if(!g.attempted || !g.live || g.tornDown || !native615Ready_ || native615Busy_ || native615Stopping_ ||
+           sleeping_ || resetBusy_ || gmcMmuFaultPending_ || userRpcLatePending_ || userRpcActive_ ||
+           userRpcOutstanding_ || postInitPhase_!=27 || s->generation!=resetGeneration()) {
+            *stage=g.nvdecStage;*status=g.nvdecStatus;*passed=g.nvdecScheduled;ulk();return kIOReturnNotReady;
+        }
+        native615Busy_=true;setProperty("NVGspControl-native615-busy",true);ulk();
+        const IOReturn r=runClientGr615(operation==16?6:7);
+        lk(__LINE__);native615Busy_=false;setProperty("NVGspControl-native615-busy",false);
+        *stage=g.nvdecStage;*status=operation==16?g.nvdecStatus:g.nvdecPut;*passed=g.nvdecScheduled;ulk();return r;
     }
     if(operation==7) {
         auto &g=s->clientGrs[client615Slot_];
@@ -540,13 +552,20 @@ IOReturn NVGspControl::runIsolation615() {
 // only it may destroy the client, and its close/stop tears the client down.
 // One client at a time; a torn-down (stage 13) client slot is reused.
 IOReturn NVGspControl::nativeClient615(const void *owner,UInt32 operation,UInt64 *stage,
-                                       UInt64 *status,UInt64 *passed) {
-    if(!lock_ || !owner || !stage || !status || !passed || operation>3)return kIOReturnBadArgument;
+                                       UInt64 *status,UInt64 *passed,UInt64 pbVa,UInt64 pbWords) {
+    if(!lock_ || !owner || !stage || !status || !passed || operation>5)return kIOReturnBadArgument;
     *stage=*status=*passed=0;lk(__LINE__);
     auto *s=native615_;
     if(!s) {ulk();return kIOReturnNotReady;}
     // 0.180.112: one slot per connection; create takes a free slot.
     int slot=ownedSlot615(owner);
+    // 0.180.191: 4 = open an NVDEC0 channel in the caller's client, 5 = submit {pbVa, words} on it
+    if(operation==4 || operation==5) {
+        if(slot<0 || !s->clientGrs[slot].userBuffer) {ulk();return kIOReturnNotFound;}
+        if(operation==5) {s->clientGrs[slot].nvdecPbVa=pbVa;s->clientGrs[slot].nvdecPbWords=UInt32(pbWords>0x1fffff?0:pbWords);}
+        ulk();
+        return nativeIsolation615(operation==4?16:17,stage,status,passed,slot);
+    }
     if(operation==2) {
         if(slot<0) {ulk();return kIOReturnNotFound;}
         const auto &q=s->clientGrs[slot];
@@ -1143,12 +1162,38 @@ bool NVGspControl::recoverOwnedFault615(UInt32 rcBefore) {
         };
         const UInt32 before=gr();
         setProperty("NVGspControl-client615-hang-gr-before",before,32);
+        // 0.180.189: MetalFX hangs with GR idle and no RC: where does the channel stand?
+        // Read-only: runlist/CHRAM[chid], USERD 0x40..0x8c, the GR PBDMA's first 128 registers.
+        auto snap=[&](const char *suffix) {
+            char key[72]{};size_t pos=0;
+            appendStr(key,sizeof(key),&pos,"NVGspControl-client615-hang-runlist");appendStr(key,sizeof(key),&pos,suffix);key[pos]='\0';
+            UInt32 rl=0;
+            runlistDiagLocked(key,0,0,g.token&0xffff,g.token,&rl,nullptr,nullptr);
+            UInt32 u[20];
+            for(UInt32 &w : u)w=~0U;
+            if(g.userd)praminReadWords(pci_,g.userd+0x40,u,20);
+            pos=0;appendStr(key,sizeof(key),&pos,"NVGspControl-client615-hang-userd");appendStr(key,sizeof(key),&pos,suffix);key[pos]='\0';
+            setProperty(key,u,sizeof(u));
+            UInt32 pb[128];
+            for(UInt32 &w : pb)w=~0U;
+            IOMemoryMap *bm=sharedBar0Map(pci_);
+            if(bm && rl && bm->getLength()>=0x01000000) {
+                Bar0Io io{bm};UInt32 cfg=0;
+                const UInt32 base=io.read(rl+0x10,&cfg) && (cfg&0x80000000) ? (cfg&0x00fffc00) : 0;
+                for(UInt32 i=0;base && i<128;++i)io.read(base+i*4,&pb[i]);
+            }
+            if(bm)bm->release();
+            pos=0;appendStr(key,sizeof(key),&pos,"NVGspControl-client615-hang-pbdma");appendStr(key,sizeof(key),&pos,suffix);key[pos]='\0';
+            setProperty(key,pb,sizeof(pb));
+        };
+        snap("");
         // 0.180.178: rebuild only the channel; the owner keeps its client
         ulk();
         rec=runClientGr615(5);
         lk(__LINE__);
         setProperty("NVGspControl-client615-hang-reset-status",UInt32(rec),32);
         setProperty("NVGspControl-client615-hang-reset-stage",g.stage,32);
+        if(rec!=kIOReturnSuccess)snap("-failed");
         if(rec==kIOReturnSuccess && !gmcMmuFaultPending_) {
             ++hangResets615_;
             setProperty("NVGspControl-client615-hang-resets",hangResets615_,32);
@@ -1479,6 +1524,53 @@ IOReturn NVGspControl::smIssueRate615(UInt32 flags, UInt8 *out, UInt32 *outBytes
     __builtin_memcpy(out,&version,4);__builtin_memcpy(out+4,&status,4);
     bzero(out+8,16);
     if(!r)__builtin_memcpy(out+8,v,sizeof(v));
+    *outBytes=24;
+    return r;
+}
+
+// 0.180.190: selector 50 op 2, read-only GET_CONSTRUCTED_FALCON_INFO (0x208001b0) on the lifecycle
+// subdevice: is NVDEC0/NVENC0/OFA0 constructed in this GSP-RM, and how big is its falcon context
+// (step 1 of an NVDEC channel on native615). One RPC, nothing allocated or written.
+// out: u32 version (2), u32 RM status, u32 falcon count, u32 ctx bytes NVDEC0, NVENC0, OFA0 (~0 = absent).
+IOReturn NVGspControl::falconInfo615(UInt32 flags, UInt8 *out, UInt32 *outBytes) {
+    if(!lock_ || !out || !outBytes || *outBytes<24 || flags)return kIOReturnBadArgument;
+    *outBytes=0;
+    lk(__LINE__);
+    const bool ready=native615_ && native615Ready_ && !native615Busy_ && postInitPhase_==27 && gmcInitReady_ &&
+        !gmcMmuFaultPending_ && !userRpcLatePending_ && !resetBusy_ && !sleeping_ && !native615Stopping_;
+    if(ready) {native615Busy_=true;setProperty("NVGspControl-native615-busy",true);}
+    ulk();
+    if(!ready)return kIOReturnNotReady;
+    constexpr UInt32 C=nvgsp::kLifecycleClient615,S=nvgsp::kLifecycleSubdevice615,P=nvgsp::kFalconInfoBytes;
+    auto *s=native615_;
+    UInt32 status=~0U,count=0,ctx[3]={~0U,~0U,~0U};
+    IOReturn r=kIOReturnBadArgument;
+    if(nvgsp::buildControl615(s->request,sizeof(s->request),C,S,nvgsp::kCmdGetConstructedFalconInfo,P)) {
+        bzero(s->request+40,P);
+        UInt32 bytes=sizeof(s->reply),result=~0U;
+        r=userRpcImpl(76,s->request,40+P,s->reply,&bytes,&result,true,true);
+        nvgsp::ControlReply615 reply{};
+        if(!r && !nvgsp::decodeControlReply615(s->reply,bytes,C,S,nvgsp::kCmdGetConstructedFalconInfo,P,reply))
+            r=kIOReturnBadMessageID;
+        if(!r) {
+            status=result ? result : reply.rpcResult ? reply.rpcResult : reply.privateResult ? reply.privateResult : reply.header.status;
+            if(status || !reply.successful())r=kIOReturnUnsupported;
+        }
+        if(!r) {
+            __builtin_memcpy(&count,reply.params,4);
+            for(UInt32 i=0;i<3;++i)nvgsp::falconCtxBytes(reply.params,P,nvgsp::videoEngine(i)->engDesc,&ctx[i]);
+            UInt32 n=count<nvgsp::kMaxConstructedFalcons?count:nvgsp::kMaxConstructedFalcons;
+            lk(__LINE__);setProperty("native615-falcon-info",const_cast<uint8_t *>(reply.params),4+n*20);ulk();
+        }
+    }
+    lk(__LINE__);
+    native615Busy_=false;setProperty("NVGspControl-native615-busy",false);
+    setProperty("native615-falcon-info-result",UInt32(r),32);
+    setProperty("native615-falcon-info-status",status,32);
+    if(!r)setProperty("native615-falcon-ctx-bytes",ctx,sizeof(ctx));
+    ulk();
+    const UInt32 w[6]={2,status,count,ctx[0],ctx[1],ctx[2]};
+    __builtin_memcpy(out,w,24);
     *outBytes=24;
     return r;
 }

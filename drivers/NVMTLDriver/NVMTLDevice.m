@@ -5188,9 +5188,7 @@ static uint64_t nvBufVa(id<MTLBuffer> b, NSUInteger off, NSUInteger len) {
 // One copy engine tops out near 45 GB/s; VRAM<->VRAM fills and copies of
 // 1 MiB+ run as uvec4 compute kernels instead (grid-stride, 76 SMs x 16
 // groups of 256), which is how CUDA gets ~300 GB/s D2D on this card.
-#define NV_VRAM_LO 0x2A00000000ULL
-#define NV_VRAM_HI 0x2C00000000ULL
-static bool nvIsVram(uint64_t va, uint64_t n) { return va >= NV_VRAM_LO && va + n <= NV_VRAM_HI; }
+static bool nvIsVram(uint64_t va, uint64_t n) { return nvGspVramLinear(va, n); }   // 0.9.87: native615 slabs too
 static NVMTLKernel *nvBlitKernel(BOOL fill) {
     static NVMTLKernel *k[2];
     static dispatch_once_t once;

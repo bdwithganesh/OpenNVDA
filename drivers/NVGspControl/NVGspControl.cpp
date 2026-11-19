@@ -2682,7 +2682,8 @@ IOReturn NVGspControl::userRpcImpl(UInt32 function, const UInt8 *params, UInt32 
     const bool nativeFaultLarge=nativeRuntime && native615_ &&
         params==native615_->faultRequest && reply==native615_->faultReply &&
         capacity==sizeof(native615_->faultReply) &&
-        nvgsp::nativeShadowFaultRequest615(function,params,bytes);
+        (nvgsp::nativeShadowFaultRequest615(function,params,bytes) ||
+         nvgsp::nativeClkSamplesRequest615(function,params,bytes));   // 0.180.188
     if(bytes>3900 && !nativeFaultLarge)return kIOReturnBadArgument;
     lk(__LINE__);
     if(native615Attempted_ && !nativeRuntime) {ulk();return kIOReturnBusy;}
@@ -4504,6 +4505,53 @@ bool NVGspControl::nativeControl615(UInt32 object, UInt32 command, void *params,
     return ok;
 }
 
+// 0.180.188: what GSP's PMU actually ran the clocks at since the last call (20 ms samples).
+// The P-state alone said P0 while a dependent-FMA chain timed out at ~1.37 GHz.
+void NVGspControl::clockSample615() {
+    if (!lock_) return;
+    lk(__LINE__);
+    const bool ready = native615_ && native615Ready_ && !native615Busy_ && gmcInitReady_ && postInitPhase_ == 27 &&
+        !gmcMmuFaultPending_ && !userRpcLatePending_ && !userRpcActive_ && !userRpcOutstanding_ &&
+        !resetBusy_ && !sleeping_ && native615_->sequence >= 3 && native615_->provenNakBytes &&
+        native615_->faultAttempted;   // the large buffers belong to fault registration until it ran
+    if (ready) native615Busy_ = true;
+    ulk();
+    if (!ready) return;
+    constexpr UInt32 C = nvgsp::kLifecycleClient615, SUB = nvgsp::kLifecycleSubdevice615;
+    constexpr UInt32 CMD = nvgsp::kClkSamplesCommand615, P = nvgsp::kClkSamplesParams615;
+    auto *s = native615_;
+    UInt32 out[6] = {~0U, 0, 0, 0, 0, 0};   // status, samples, last gpc, max gpc, last active gpc, last dram (kHz)
+    if (nvgsp::buildControl615(s->faultRequest, 40 + P, C, SUB, CMD, P)) {
+        bzero(s->faultRequest + 40, P);
+        __builtin_memcpy(s->faultRequest + 40, &clkTail615_, 4);   // super.tailIndex; retrievalMode 0 = all samples
+        UInt32 bytes = sizeof(s->faultReply), result = ~0U;
+        const IOReturn r = userRpcImpl(76, s->faultRequest, 40 + P, s->faultReply, &bytes, &result, true, true);
+        nvgsp::ControlReply615 reply{};
+        if (r != kIOReturnSuccess) out[0] = UInt32(r);
+        else if (bytes == 96 + P && nvgsp::decodeControlReply615(s->faultReply, bytes, C, SUB, CMD, P, reply)) {
+            out[0] = result ? result : reply.header.status;
+            if (reply.successful()) {
+                UInt32 n = 0;
+                __builtin_memcpy(&clkTail615_, reply.params, 4);
+                __builtin_memcpy(&n, reply.params + 12, 4);
+                if (n > 250) n = 250;
+                out[1] = n;
+                for (UInt32 i = 0; i < n; ++i) {
+                    const UInt8 *e = reply.params + 24 + i * 24;
+                    UInt32 gpc = 0, dram = 0, active = 0;
+                    __builtin_memcpy(&gpc, e + 8, 4); __builtin_memcpy(&dram, e + 12, 4); __builtin_memcpy(&active, e + 20, 4);
+                    if (gpc != ~0U && gpc > out[3]) out[3] = gpc;
+                    out[2] = gpc; out[4] = active; out[5] = dram;
+                }
+            }
+        } else out[0] = kIOReturnBadMessageID;
+    }
+    lk(__LINE__);
+    native615Busy_ = false;
+    setProperty("NVGspControl-clk615", out, sizeof(out));
+    ulk();
+}
+
 void NVGspControl::boostCallout(thread_call_param_t p, thread_call_param_t) {
     NVGspControl *self = static_cast<NVGspControl *>(p);
     if (self->native615_ && self->postInitPhase_ == 27) {   // 0.180.164
@@ -4523,6 +4571,7 @@ void NVGspControl::boostCallout(thread_call_param_t p, thread_call_param_t) {
         UInt32 pstate = 0;
         if (self->nativeControl615(nvgsp::kLifecycleSubdevice615, 0x20802068u, &pstate, sizeof(pstate)))
             self->setProperty("NVGspControl-boost-pstate", pstate, 32);
+        self->clockSample615();
         return;
     }
     constexpr UInt32 kClientHandle = 0xc0d00001, kSubdevice = 0xc0d02080;
@@ -8330,7 +8379,18 @@ IOReturn NVGspControl::pollStatusLocked() {
                 summary.function = gmc.command; summary.length = gmc.size;
                 summary.result = gmc.statusOrMaxResponse;
             }
-            if (faultNotice) {
+            if (faultNotice && nvdecFaultAbsorb_) {
+                // 0.180.192: the notice of an NVDEC fault already attributed to an owned client's
+                // channel (RC 31 on engine 0x13 came first): RC killed only that channel
+                nvdecFaultAbsorb_=false;++mmuFaultEvents_;
+                setProperty("NVGspControl-gmc-mmu-fault-notice",assembled,assembledBytes);
+                setProperty("NVGspControl-mmu-fault-events",mmuFaultEvents_,32);
+                setProperty("NVGspControl-nvdec615-fault-notice-absorbed",true);
+                auto &summary=records[recordCount++];
+                summary.ringIndex=readPtr;summary.elementCount=elementCount;
+                summary.function=mmuNotice.command;summary.length=mmuNotice.size;
+                summary.result=0;
+            } else if (faultNotice) {
                 gmcMmuFaultPending_=true;++mmuFaultEvents_;
                 setProperty("NVGspControl-gmc-mmu-fault-pending",true);
                 setProperty("NVGspControl-gmc-mmu-fault-serviced",false);
@@ -8496,6 +8556,26 @@ IOReturn NVGspControl::pollStatusLocked() {
             setProperty("NVGspControl-rc-mmu-fault-hi", rc[8], 32);
             setProperty("NVGspControl-rc-mmu-fault-type", rc[9], 32);
             setProperty("NVGspControl-rc-at-phase", postInitPhase_, 32);
+            // 0.180.192: an MMU fault on an owned client's NVDEC0 channel (bad decoder setup: VA 0 for a
+            // buffer method). Without this the pending fault blocked every client's healthy() check, the
+            // owner's teardown stayed NotReady and shutdown wedged GSP (VM power cycle). RC already killed
+            // only that channel, so attribute it and keep everyone else running.
+            // shortcut: a GR fault notice landing between this RC and its own notice would be absorbed
+            // too; acceptable while NVDEC faults come from our own decoder setups only.
+            if (rc[0] == 0x13 && rc[4] == 31 && native615_) {
+                for (UInt32 k = 0; k < nvgsp::kClientSlots615; ++k) {
+                    auto &c = native615_->clientGrs[k];
+                    if (!c.live || !c.nvdecScheduled || (c.nvdecToken & 0xffff) != rc[1]) continue;
+                    c.nvdecFaulted = true;
+                    setProperty("NVGspControl-nvdec615-faulted", k, 32);
+                    if (gmcMmuFaultPending_) {   // its notice came first
+                        gmcMmuFaultPending_ = false;
+                        setProperty("NVGspControl-gmc-mmu-fault-pending", false);
+                        setProperty("NVGspControl-nvdec615-fault-notice-absorbed", true);
+                    } else nvdecFaultAbsorb_ = true;
+                    break;
+                }
+            }
             {   // 0.165.0: when, and whose arena the GPU was in (attribution)
                 UInt64 now = 0, ms = 0;
                 clock_get_uptime(&now);

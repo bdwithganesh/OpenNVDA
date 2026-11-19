@@ -64,7 +64,7 @@ IOReturn NVGspControl::runClientGr615(UInt32 phase) {
         return true;   // callers check health with the next allocation
     };
     // The maintenance context keeps its own ledger (never freed before cold stop).
-    UInt32 *ledger=g.objects,*ledgerCount=&g.objectCount,ledgerMax=20;
+    UInt32 *ledger=g.objects,*ledgerCount=&g.objectCount,ledgerMax=32;
     auto alloc=[&](UInt32 parent,UInt32 object,UInt32 cls,void *params,UInt32 size) {
         if(*ledgerCount>=ledgerMax || !nvgsp::buildAlloc615(s->request,sizeof(s->request),parent,object,cls,params,size))return fail(kIOReturnBadArgument);
         ledger[(*ledgerCount)++]=object;publishLedger(); // pre-enqueue, uncertain handles remain pinned
@@ -487,6 +487,134 @@ IOReturn NVGspControl::runClientGr615(UInt32 phase) {
         setProperty("NVGspControl-client615-token",g.token,32);ulk();
         step(18);return kIOReturnSuccess;
     }
+    // 0.180.191: NVDEC0 channel in this client's VAS (phase 6 open, 7 submit). Its ring and
+    // falcon context sit in the free pages under the client's maintenance ring, mapped in the
+    // owned tree like the client ring (recorded leaf runs are cleared by the normal teardown).
+    constexpr UInt32 NTSG=0x60,NSHARE=0x61,NCH=0x66,NCTX=0x67,NOBJ=0x68;
+    auto nvdecStep=[&](UInt32 v) {
+        lk(__LINE__);g.nvdecStage=v;setProperty("NVGspControl-nvdec615-stage",v,32);ulk();
+    };
+    if(phase==6) {
+        if(!g.live || !g.external || !g.scheduled || !g.userBuffer || g.nvdec || g.negative || g.subcontext || !healthy())
+            return kIOReturnNotReady;
+      auto open=[&]() __attribute__((noinline)) -> IOReturn {   // own frame: the client GR frame stays < 2 KiB
+        const UInt32 savedStatus=g.status;
+        g.nvdec=true;nvdecStep(1);
+        // An RM refusal (NV_STATUS) means the handle was never made: drop it from the ledger so
+        // the client's teardown does not free it.
+        auto mk=[&](UInt32 parent,UInt32 object,UInt32 cls,void *params,UInt32 size) {
+            g.status=0;
+            if(alloc(parent,object,cls,params,size))return true;
+            if(g.status && g.status<0x10000 && g.objectCount && g.objects[g.objectCount-1]==object) {
+                g.objects[--g.objectCount]=0;publishLedger();
+            }
+            return false;
+        };
+        auto done=[&](IOReturn r) {
+            lk(__LINE__);g.nvdecStatus=r==kIOReturnSuccess?0:(g.status?g.status:UInt32(r));g.status=savedStatus;
+            setProperty("NVGspControl-nvdec615-status",g.nvdecStatus,32);ulk();
+            return r;
+        };
+        UInt32 methodBytes=0;
+        if(!ctl(S,0x20802a08,&methodBytes,sizeof(methodBytes)) || !methodBytes || methodBytes>16*1024*1024)
+            return done(kIOReturnBadArgument);
+        const UInt64 mBytes=(UInt64(methodBytes)+4095)&~4095ULL;
+        UInt64 *backings[5]={&g.nvdecInstance,&g.nvdecMethod,&g.nvdecUserd,&g.nvdecGpfifo,&g.nvdecCtx};
+        for(UInt32 i=0;i<5;++i) {
+            nvgsp::MemoryParams615 p{};p.owner=C;p.type=6;p.flags=0x100;p.attr=0x800000;
+            p.size=i==1?mBytes:4096;p.alignment=4096;const UInt64 size=p.size;
+            if(!mk(S,H|(i<4?0x62+i:NCTX),0x40,&p,sizeof(p)))return done(kIOReturnNotReady);
+            if(!nvgsp::memoryProbeRange615(p,gmcConfig_.fbBytes,heapLo,heapHi) || p.size!=size)return done(kIOReturnBadArgument);
+            *backings[i]=p.offset;if(!zero(p.offset,size))return done(kIOReturnIOError);
+        }
+        nvdecStep(2);
+        // 0.180.191 live: the pages under the client ring are outside the owned tree (BadArgument at
+        // stage 2), so take 64 KiB of the user window the way a selector-47 allocation does.
+        const UInt64 base=(g.userNextVa+0xffff)&~0xffffULL;
+        if(base+0x10000>g.userVa+nvgsp::kClientUserWindow615)return done(kIOReturnNoSpace);
+        g.userNextVa=base+0x10000;
+        g.nvdecRingVa=base;g.nvdecCtxVa=base+4096;
+        const UInt64 pageVa[2]={g.nvdecRingVa,g.nvdecCtxVa},pagePhys[2]={g.nvdecGpfifo,g.nvdecCtx};
+        for(UInt32 k=0;k<2;++k) {
+            UInt64 leaf=0,pte=0;
+            if(!nvgsp::externalTreeLeaf615(g.tree,pageVa[k],&leaf) || g.leafChunks>=nvgsp::kClientLeafChunks615 ||
+               !nvgsp::vidPte615(pagePhys[k],false,false,&pte) || !read(leaf,2) || s->readWords[0] || s->readWords[1])
+                return done(kIOReturnBadArgument);
+            const UInt32 w[2]={UInt32(pte),UInt32(pte>>32)};
+            g.leafAddress[g.leafChunks]=leaf;g.leafCount[g.leafChunks++]=1;
+            if(!write(leaf,w,2))return done(kIOReturnIOError);
+        }
+        if(!mmuInvalidate(0x1))return done(kIOReturnTimeout);
+        nvdecStep(3);
+        nvgsp::ChannelGroup615 group{};group.hVASpace=g.vas;group.engineType=nvgsp::kEngineTypeNvdec0;
+        nvgsp::ContextShare615 share{g.vas,0,~0U};
+        if(!mk(D,H|NTSG,0xa06c,&group,sizeof(group)) || !mk(H|NTSG,H|NSHARE,0x9067,&share,sizeof(share)) ||
+           share.hVASpace!=g.vas || share.subctxId==~0U)return done(kIOReturnNotReady);
+        nvgsp::ChannelAlloc615 ch{};
+        ch.gpFifoOffset=g.nvdecRingVa;ch.gpFifoEntries=256;ch.flags=0x004000c0U;
+        ch.hContextShare=H|NSHARE;ch.hUserdMemory[0]=H|0x64;ch.engineType=nvgsp::kEngineTypeNvdec0;
+        ch.instanceMem={g.nvdecInstance,4096,2,1};ch.userdMem={g.nvdecUserd,4096,2,1};
+        ch.ramfcMem={g.nvdecInstance,512,2,1};ch.mthdbufMem={g.nvdecMethod,mBytes,2,0};
+        ch.hPhysChannelGroup=H|NTSG;ch.internalFlags=0x14;
+        if(!mk(H|NTSG,H|NCH,0xc56f,&ch,sizeof(ch)))return done(kIOReturnNotReady);
+        g.nvdecCid=ch.cid;
+        lk(__LINE__);setProperty("NVGspControl-nvdec615-cid",g.nvdecCid,32);ulk();
+        nvdecStep(4);
+        // falcon context: RM's external-VAS layout + VA bind, then GR style, then everything filled
+        static_assert(sizeof(s->clientPromote)>=nvgsp::kPromoteCtxBytes,"promote buffer");
+        UInt8 *const pr=s->clientPromote;
+        UInt32 used=nvgsp::kPromoteVariants,first=0;
+        for(UInt32 v=0;v<nvgsp::kPromoteVariants && used==nvgsp::kPromoteVariants;++v) {
+            g.status=0;
+            if(nvgsp::buildFalconPromote(nvgsp::kEngineTypeNvdec0,C,g.nvdecCid,H|NCH,g.nvdecCtx,g.nvdecCtxVa,4096,
+                                         pr,nvgsp::kPromoteCtxBytes,v) && ctl(S,0x2080012b,pr,nvgsp::kPromoteCtxBytes))used=v;
+            else if(!first)first=g.status?g.status:~0U;
+        }
+        UInt32 vaBind=~0U;
+        if(used==nvgsp::kPromoteRmExternal) {
+            g.status=0;
+            vaBind=nvgsp::buildFalconPromoteVa(nvgsp::kEngineTypeNvdec0,C,H|NCH,g.nvdecCtxVa,pr,nvgsp::kPromoteCtxBytes) &&
+                   ctl(S,0x2080012b,pr,nvgsp::kPromoteCtxBytes) ? 0 : (g.status?g.status:~0U);
+        }
+        g.nvdecPromote=used|first<<8;
+        lk(__LINE__);
+        const UInt32 promoteInfo[3]={used,first,vaBind};
+        setProperty("NVGspControl-nvdec615-promote",(void *)promoteInfo,sizeof(promoteInfo));ulk();
+        if(used==nvgsp::kPromoteVariants || !healthy())return done(kIOReturnNotReady);
+        nvdecStep(5);
+        UInt8 obj[12];nvgsp::buildVideoObjectParams(0,obj);
+        if(!mk(H|NCH,H|NOBJ,0xc9b0,obj,sizeof(obj)))return done(kIOReturnNotReady);
+        nvdecStep(6);
+        UInt32 engine=nvgsp::kEngineTypeNvdec0;UInt8 on[3]={1,0,0};
+        if(!ctl(H|NCH,0xa06f0104,&engine,4) || !ctl(H|NCH,0xc36f0108,&g.nvdecToken,4) || !g.nvdecToken)
+            return done(kIOReturnNotReady);
+        g.nvdecScheduled=true;
+        if(!ctl(H|NCH,0xa06f0103,on,sizeof(on)) || !healthy())return done(kIOReturnNotReady);
+        g.nvdecPut=0;
+        lk(__LINE__);setProperty("NVGspControl-nvdec615-token",g.nvdecToken,32);ulk();
+        nvdecStep(7);return done(kIOReturnSuccess);
+      };
+        return open();
+    }
+    if(phase==7) {
+        // one GPFIFO entry for the caller's pushbuffer (in its own window), GP_PUT, doorbell.
+        if(g.nvdecFaulted)return kIOReturnIOError;   // 0.180.192: RC killed the channel; tear the client down
+        if(!g.live || !g.nvdecScheduled || !g.nvdecToken || !g.nvdecPbWords || g.nvdecPbWords>0x1fffff ||
+           (g.nvdecPbVa&3) || g.nvdecPbVa<g.userVa || g.nvdecPbVa>=g.userNextVa ||
+           UInt64(g.nvdecPbWords)*4>g.userNextVa-g.nvdecPbVa)return kIOReturnBadArgument;
+        const UInt32 at=g.nvdecPut%256,next=(at+1)%256;
+        const UInt32 entry[2]={UInt32(g.nvdecPbVa)&0xfffffffc,(UInt32(g.nvdecPbVa>>32)&0xff)|(g.nvdecPbWords<<10)};
+        if(!write(g.nvdecGpfifo+UInt64(at)*8,entry,2) || !write(g.nvdecUserd+0x8c,&next,1))return kIOReturnIOError;
+        g.nvdecPut=next;
+        lk(__LINE__);
+        IOReturn ret=kIOReturnOffline;
+        if(!resetBusy_ && !sleeping_ && !gmcMmuFaultPending_ && postInitPhase_==27 && gmcInitReady_) {
+            IOMemoryMap *map=sharedBar0Map(pci_);ret=kIOReturnNoMemory;
+            if(map && map->getLength()>=0x00BB0094) {Bar0Io bar0{map};ret=bar0.write(0x00BB0090,g.nvdecToken)?kIOReturnSuccess:kIOReturnIOError;}
+            if(map)map->release();
+        }
+        ulk();return ret;
+    }
     if(phase==3) {
         // After a verified cancel: free the maintenance channel first, then
         // the faulted client through the normal teardown below.
@@ -852,6 +980,18 @@ IOReturn NVGspControl::runClientGr615(UInt32 phase) {
     // then free backing. The client VRAM reservation stays pinned to cold stop.
     // A subcontext channel shares root's TSG; a channel-level schedule-off
     // could stop the whole TSG, so it is freed directly (RM preempts on free).
+    // 0.180.191: the NVDEC0 channel first (schedule off, object, channel); its backings go with
+    // the client's after the PTEs are cleared. Only handles RM made are in the ledger.
+    auto inLedger=[&](UInt32 o) {for(UInt32 i=0;i<g.objectCount;++i)if(g.objects[i]==o)return true;return false;};
+    if(g.nvdec) {
+        UInt8 off[3]={0,0,0};
+        // a faulted channel (RC killed it) is freed without the schedule-off
+        if(g.nvdecScheduled && !g.nvdecFaulted && (!ctl(H|NCH,0xa06f0103,off,sizeof(off)) || !healthy()))
+            return kIOReturnNotReady;
+        g.nvdecScheduled=false;
+        if((inLedger(H|NOBJ) && !release(H|NOBJ)) || (inLedger(H|NCH) && !release(H|NCH)) || !healthy())
+            return kIOReturnNotReady;
+    }
     if(!g.subcontext && phase!=3) {
         UInt8 disable[3]={0,0,0};
         if(!ctl(CHANNEL,0xa06f0103,disable,sizeof(disable)) || !healthy())return kIOReturnNotReady;
@@ -875,6 +1015,11 @@ IOReturn NVGspControl::runClientGr615(UInt32 phase) {
     // (nativeClient615Close); the GPU can no longer reach it from here on.
     if(g.userBuffer)g.allocLive=0;
     step(12);
+    if(g.nvdec) {
+        const UInt32 rest[7]={NCTX,0x65,0x64,0x63,0x62,NSHARE,NTSG};
+        for(UInt32 h:rest)if(inLedger(H|h) && !release(H|h))return kIOReturnNotReady;
+        g.nvdec=false;
+    }
     if(!release(H|0x55) || !release(H|0x54) || !release(H|0x53) || !release(H|0x52) ||
        !release(SHARE) || (!g.subcontext && !release(TSG)) ||
        (g.external ? !release(VAS) : (!release(RING) || !release(WINDOW))) ||

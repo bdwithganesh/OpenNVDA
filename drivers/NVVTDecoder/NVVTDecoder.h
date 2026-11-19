@@ -7,6 +7,7 @@ extern "C" {
 /* Opt-in registration for this process. Requires the Sonoma private decoder
  * ABI and an administrator connection to NVGspControl. No software fallback. */
 OSStatus NVVTRegisterH264Decoder(void);
+OSStatus NVVTRegisterHEVCDecoder(void);   /* HEVC Main, 8-bit 4:2:0 */
 typedef struct {
     uint64_t sessions, submitted, emitted, errors, gpu_nanoseconds;
 } NVVTStats;
