@@ -2428,7 +2428,15 @@ IOReturn NVGspControl::displayCursor615(UInt32 op, void *p1, void *p2) {
             displayCursorY615_=SInt32(reinterpret_cast<intptr_t>(p2));
         } else displayCursorVisible615_=p1!=nullptr;
         const bool native=displayNative615_;
+        const UInt32 n=op==2 ? ++displayCursorMoves615_ : ++displayCursorShows615_;
         ulk();
+        // 0.180.196: proof that WindowServer drives the hardware cursor (moves sampled every 16)
+        if(op==3 || (n&15)==1) {
+            setProperty(op==2 ? "NVGspControl-display615-cursor-moves" : "NVGspControl-display615-cursor-shows",n,32);
+            setProperty("NVGspControl-display615-cursor-state",
+                        (UInt64(UInt32(displayCursorX615_)&0xffff)<<32)|(UInt64(UInt32(displayCursorY615_)&0xffff)<<16)|
+                        (displayCursorVisible615_ ? 1 : 0),64);
+        }
         return native ? displayCursorPosition615() : kIOReturnSuccess;
     }
     if(op!=1 || !p1)return kIOReturnBadArgument;

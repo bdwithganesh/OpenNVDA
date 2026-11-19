@@ -205,6 +205,10 @@ private:
     int fHwCursor = -1;        // -1 unknown, 0 off, 1 on
     bool fCursorVisible = false;
     UInt32 *fCursorBuf = nullptr;
+    // 1.4.3: 256x256 like the head's cursor surface. 64x64 refused WindowServer's 2x (HiDPI) cursors, so
+    // IOFramebuffer marked the hardware cursor inactive and the cursor was drawn into every frame.
+    static constexpr UInt32 kCursorMax = 256;
+    UInt32 fCursorCalls = 0, fCursorRefused = 0;
     IOReturn gspCall(const char *fn, void *a, void *b, void *c);
     void setDpms(bool on);
     // 0.7.0: IONDRVFramebuffer::ndrvSetPowerState port — the subclass must send
@@ -545,7 +549,7 @@ void NVDisplay::free(void) {
         thread_call_free(fVblWatchCall);
         fVblWatchCall = nullptr;
     }
-    if (fCursorBuf) { IOFree(fCursorBuf, 64 * 64 * 4 * 2); fCursorBuf = nullptr; }
+    if (fCursorBuf) { IOFree(fCursorBuf, kCursorMax * kCursorMax * 4 * 2); fCursorBuf = nullptr; }
     if (fEdidLock) {
         IOLockLock(fEdidLock);
         OSData *old = fEdid;
@@ -1427,35 +1431,38 @@ bool NVDisplay::hwCursorAllowed() {
 
 IOReturn NVDisplay::setCursorImage(void *cursorImage) {
     if (!hwCursorAllowed()) return kIOReturnUnsupported;
-    if (!fCursorBuf) fCursorBuf = static_cast<UInt32 *>(IOMalloc(64 * 64 * 4 * 2));
+    if (!fCursorBuf) fCursorBuf = static_cast<UInt32 *>(IOMalloc(kCursorMax * kCursorMax * 4 * 2));
     if (!fCursorBuf) return kIOReturnNoMemory;
     IOHardwareCursorDescriptor desc;
     bzero(&desc, sizeof(desc));
     desc.majorVersion = kHardwareCursorDescriptorMajorVersion;
     desc.minorVersion = kHardwareCursorDescriptorMinorVersion;
-    desc.height = 64;
-    desc.width = 64;
+    desc.height = kCursorMax;
+    desc.width = kCursorMax;
     desc.bitDepth = 32;
     IOHardwareCursorInfo info;
     bzero(&info, sizeof(info));
     info.majorVersion = kHardwareCursorInfoMajorVersion;
     info.minorVersion = kHardwareCursorInfoMinorVersion;
-    UInt32 *raw = fCursorBuf + 64 * 64;
-    bzero(raw, 64 * 64 * 4);
+    UInt32 *raw = fCursorBuf + kCursorMax * kCursorMax;
+    bzero(raw, kCursorMax * kCursorMax * 4);
+    setProperty("NVDisplay-cursor-image-calls", ++fCursorCalls, 32);
     info.hardwareCursorData = reinterpret_cast<UInt8 *>(raw);
     if (!convertCursorImage(cursorImage, &desc, &info)) {
+        setProperty("NVDisplay-cursor-image-refused", ++fCursorRefused, 32);
         gspCall("nvgsp-cursor-show", nullptr, nullptr, nullptr);
         return kIOReturnUnsupported;
     }
-    // Repack (cursorWidth-pitched) into the 64x64 hardware surface.
-    const UInt32 w = info.cursorWidth > 64 ? 64 : info.cursorWidth;
-    const UInt32 h = info.cursorHeight > 64 ? 64 : info.cursorHeight;
-    bzero(fCursorBuf, 64 * 64 * 4);
+    // Repack (cursorWidth-pitched) into a 256-pitched image; the kernel copies only w x h.
+    const UInt32 w = info.cursorWidth > kCursorMax ? kCursorMax : info.cursorWidth;
+    const UInt32 h = info.cursorHeight > kCursorMax ? kCursorMax : info.cursorHeight;
+    if (!w || !h) return kIOReturnUnsupported;
     for (UInt32 y = 0; y < h; ++y)
-        for (UInt32 x = 0; x < w; ++x)
-            fCursorBuf[y * 64 + x] = raw[y * w + x];
+        memcpy(fCursorBuf + y * kCursorMax, raw + y * w, w * 4);
+    setProperty("NVDisplay-cursor-image-size", w | h << 16, 32);
     // macOS positions the image's top-left (setCursorState), so hotspot 0.
-    const IOReturn r = gspCall("nvgsp-cursor-image", fCursorBuf, nullptr, nullptr);
+    const IOReturn r = gspCall("nvgsp-cursor-image", fCursorBuf,
+                               reinterpret_cast<void *>(static_cast<uintptr_t>(w | h << 16)), nullptr);
     setProperty("NVDisplay-cursor-image-result", static_cast<UInt32>(r), 32);
     if (r != kIOReturnSuccess) {
         // The cursor ctxdma is armed but CONTROL_CURSOR was rejected (or the

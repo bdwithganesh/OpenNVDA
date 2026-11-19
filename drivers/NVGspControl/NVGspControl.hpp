@@ -143,6 +143,7 @@ public:
     UInt32 displayCursorUser615_ = 0;
     SInt32 displayCursorX615_ = 0, displayCursorY615_ = 0;
     bool displayCursorVisible615_ = false;
+    UInt32 displayCursorMoves615_ = 0, displayCursorShows615_ = 0;   // 0.180.196
     // 0.180.143: the cursor image (premultiplied 64x64) and position kept
     // until op 10 registers the head cursor, then written to the surface
     // 0.180.169: 256x256 (pitch 256) like the CONTROL_CURSOR W256_H256 surface;

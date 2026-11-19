@@ -1078,6 +1078,16 @@ bool NVGspControl::start(IOService *provider) {
     if (gpuVendor != 0x10de) return false;
     setProperty("NVGspControl-gpu-vendor", gpuVendor, 16);
     setProperty("NVGspControl-gpu-device", gpuDevice, 16);
+    // 0.180.196: AGDC 0x711 sub 0x8000 (cursor) for NVAccelerator: one 64x64 cursor (from reply offset 8:
+    // count, then {flags, AGDC pixel format 0x10000 as the planes, max frames 1, height, width, max height,
+    // max width}). Paravirt's empty entry left CoreDisplay without a hardware cursor.
+    {
+        static const UInt32 cursor[8] = {1, 0, 0x10000, 1, 64, 64, 64, 64};
+        OSDictionary *agdc = OSDictionary::withCapacity(1);
+        OSData *d = OSData::withBytes(cursor, sizeof cursor);
+        if (agdc && d) { agdc->setObject("32768", d); setProperty("NVGspControl-agdc-711", agdc); }
+        OSSafeReleaseNULL(d); OSSafeReleaseNULL(agdc);
+    }
     setProperty("NVGspControl-gpu-family", nvGPUFamilyName(gpuDevice));
     setProperty("NVGspControl-gpu-marketing", nvGPUDeviceName(gpuDevice));
     setProperty("NVGspControl-gpu-profile-supported", nvGPUProfileSupported(gpuDevice));
