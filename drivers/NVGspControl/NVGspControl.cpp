@@ -5311,7 +5311,7 @@ IOReturn NVGspControl::dpSetPower(bool on) {
     const UInt32 hdr[6] = {0xc0d00001, 0xc0d00073, 0x731341, 0, 48, 0};
     __builtin_memcpy(ctrl, hdr, sizeof(hdr));
     UInt8 *pp = ctrl + 24;
-    const UInt32 displayId = 0x200, cmd = 0x8 /* AUX | WRITE */, addr = 0x600, size = 0;
+    const UInt32 displayId = dpDisplay(), cmd = 0x8 /* AUX | WRITE */, addr = 0x600, size = 0;
     __builtin_memcpy(pp + 4, &displayId, 4);
     __builtin_memcpy(pp + 12, &cmd, 4);
     __builtin_memcpy(pp + 16, &addr, 4);
@@ -5650,6 +5650,8 @@ IOReturn NVGspControl::modesetHead0(UInt32 *statusOut, bool lightIfLit) {
     setProperty("NVGspControl-modeset-head0", head0, 32);
     // Attach target: the snapshot SOR when head 0 was lit, else 0x901
     // (modeset3 restore rule — never re-attach to a detached 0x900).
+    // shortcut: this BAR0 modeset/restore path still assumes the panel on display 0x200 via SOR0 (0x901); the
+    // native615 pipe (disp_all.py, dpDisplay()) follows the real port. Generalize it with the sleep/wake work.
     if (sor == 0x901 && head0 == 0x200) attachSor = sor;
     // 0.99.4: cache the lit state; after S3 (engine at reset defaults) re-use it.
     if (sor == 0x901 && head0 == 0x200) {
@@ -6657,10 +6659,10 @@ void NVGspControl::pollDisplayHotplug() {
     // 0.180.152: -mask is the debounced connect state (the replug daemon acts
     // on its edges); it used to be the raw sample, so one failed read made
     // the daemon retrain a connected link. The raw sample is -sample.
-    setProperty("NVGspControl-hotplug-poll-sample", aux ? 0x200 : 0, 32);
+    setProperty("NVGspControl-hotplug-poll-sample", aux ? dpDisplay() : 0, 32);
     if (!hotplugPollSeen_) {
         hotplugPollSeen_ = true;
-        hotplugPollMask_ = aux ? 0x200 : 0;
+        hotplugPollMask_ = aux ? dpDisplay() : 0;
         setProperty("NVGspControl-hotplug-poll-baseline", hotplugPollMask_, 32);
         setProperty("NVGspControl-hotplug-poll-mask", hotplugPollMask_, 32);
         return;
@@ -6677,13 +6679,13 @@ void NVGspControl::pollDisplayHotplug() {
             hotplugPollEdidPending_ = false;
             removeProperty("NVGspControl-edid");
             setProperty("NVGspControl-edid-reread", false);
-            setProperty("NVGspControl-hotplug-poll-last", UInt64(0x200), 64);
-            setProperty("NVGspControl-hotplug-poll-unplug", 0x200, 32);
+            setProperty("NVGspControl-hotplug-poll-last", UInt64(dpDisplay()), 64);
+            setProperty("NVGspControl-hotplug-poll-unplug", dpDisplay(), 32);
             setProperty("NVGspControl-hotplug-poll-plug", UInt32(0), 32);
             setProperty("NVGspControl-hotplug-poll-edid", hotplugPollEdidOk_);
             HotplugFn fn = hotplugFn_;
             void *ref = hotplugRef_;
-            if (fn) fn(ref, 0, 0x200);
+            if (fn) fn(ref, 0, dpDisplay());
         }
         return;
     }
@@ -6691,33 +6693,33 @@ void NVGspControl::pollDisplayHotplug() {
     if (!hotplugPollMask_) {
         // Sink is back. Re-read the EDID over RM's control and tell the
         // display pipe; WindowServer re-probes and setMode retrains the link.
-        hotplugPollMask_ = 0x200;
+        hotplugPollMask_ = dpDisplay();
         hotplugPollRetry_ = 0;
-        setProperty("NVGspControl-hotplug-poll-mask", 0x200, 32);
-        setProperty("NVGspControl-hotplug-poll-last", UInt64(0x200) << 32, 64);
-        setProperty("NVGspControl-hotplug-poll-plug", 0x200, 32);
+        setProperty("NVGspControl-hotplug-poll-mask", dpDisplay(), 32);
+        setProperty("NVGspControl-hotplug-poll-last", UInt64(dpDisplay()) << 32, 64);
+        setProperty("NVGspControl-hotplug-poll-plug", dpDisplay(), 32);
         setProperty("NVGspControl-hotplug-poll-unplug", UInt32(0), 32);
         UInt64 edidOut[3] = {0, 0, 0};
-        hotplugPollEdidOk_ = displayEdid615(0x200, edidOut) == kIOReturnSuccess;
+        hotplugPollEdidOk_ = displayEdid615(dpDisplay(), edidOut) == kIOReturnSuccess;
         hotplugPollEdidPending_ = !hotplugPollEdidOk_;
         setProperty("NVGspControl-hotplug-poll-edid", hotplugPollEdidOk_);
         HotplugFn fn = hotplugFn_;
         void *ref = hotplugRef_;
-        if (fn) fn(ref, 0x200, 0);
+        if (fn) fn(ref, dpDisplay(), 0);
         return;
     }
     // Known-present: retry a failed EDID read about once a second, then notify
     // once more so the display picks up the fresh timings.
     if (hotplugPollEdidPending_ && (++hotplugPollRetry_ % 3) == 0) {
         UInt64 edidOut[3] = {0, 0, 0};
-        hotplugPollEdidOk_ = displayEdid615(0x200, edidOut) == kIOReturnSuccess;
+        hotplugPollEdidOk_ = displayEdid615(dpDisplay(), edidOut) == kIOReturnSuccess;
         setProperty("NVGspControl-hotplug-poll-edid", hotplugPollEdidOk_);
         setProperty("NVGspControl-hotplug-poll-edid-retries", hotplugPollRetry_, 32);
         if (hotplugPollEdidOk_) {
             hotplugPollEdidPending_ = false;
             HotplugFn fn = hotplugFn_;
             void *ref = hotplugRef_;
-            if (fn) fn(ref, 0x200, 0);
+            if (fn) fn(ref, dpDisplay(), 0);
         }
     }
 }
@@ -6744,7 +6746,7 @@ IOReturn NVGspControl::dpAuxRead(UInt32 addr, UInt8 *out, UInt32 bytes) {
         UInt8 req[40 + PARAMS]{};
         IOReturn r = kIOReturnBadArgument;
         if (nvgsp::buildControl615(req, sizeof(req), C, D, CMD, PARAMS)) {
-            UInt32 displayId = 0x200, cmd = 0x9, size = bytes - 1;
+            UInt32 displayId = dpDisplay(), cmd = 0x9, size = bytes - 1;
             __builtin_memcpy(req + 40 + 4, &displayId, 4);
             __builtin_memcpy(req + 40 + 12, &cmd, 4);
             __builtin_memcpy(req + 40 + 16, &addr, 4);
@@ -6779,7 +6781,7 @@ IOReturn NVGspControl::dpAuxRead(UInt32 addr, UInt8 *out, UInt32 bytes) {
     const UInt32 hdr[6] = {0xc0d00001, 0xc0d00073, 0x731341, 0, 48, 0};
     __builtin_memcpy(ctrl, hdr, sizeof(hdr));
     UInt8 *pp = ctrl + 24;
-    const UInt32 displayId = 0x200, cmd = 0x9, size = bytes - 1;
+    const UInt32 displayId = dpDisplay(), cmd = 0x9, size = bytes - 1;
     __builtin_memcpy(pp + 4, &displayId, 4);
     __builtin_memcpy(pp + 12, &cmd, 4);
     __builtin_memcpy(pp + 16, &addr, 4);

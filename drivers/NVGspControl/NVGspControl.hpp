@@ -427,6 +427,9 @@ private:
     // status (reply+92), ~0U on transport failure; optionally copies the
     // echoed params (reply+104) for out-fields like DP_CTRL err.
     UInt32 impCheckHead0();
+    // 0.180.199: DP display ID of the panel (displayProbe615 picks it; 0 = not probed yet -> 0x200)
+    UInt32 dpDisplay615_, dpProtocol615_;
+    UInt32 dpDisplay() const { return dpDisplay615_ ? dpDisplay615_ : 0x200; }
     UInt32 displayCtrl(UInt32 cmd, const UInt8 *params, UInt32 paramBytes,
                        UInt8 *echoOut = nullptr, UInt32 echoBytes = 0);
     bool armInterrupts(const UInt32 *vectors);

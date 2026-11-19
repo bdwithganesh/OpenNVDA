@@ -1686,9 +1686,28 @@ IOReturn NVGspControl::displayProbe615(UInt64 out[3]) {
             }
         }
     }
+    // 0.180.199: the DP port the panel is on (was 0x200 = DP connector 2 everywhere). First connected display ID
+    // whose output protocol is DP (NV0073_CTRL_CMD_SPECIFIC_OR_GET_INFO protocol 8 DP-A / 9 DP-B); kept when
+    // nothing DP is connected, so an unplug does not move it.
+    for(UInt32 bit=0;!r && bit<32 && out[0];++bit) {
+        const UInt32 did=1U<<bit;
+        if(!(UInt32(out[0])&did))continue;
+        UInt8 oi[56]{};__builtin_memcpy(oi+4,&did,4);
+        if(!nvgsp::buildControl615(s->request,sizeof(s->request),C,DISP,0x73028b,sizeof(oi)))break;
+        __builtin_memcpy(s->request+40,oi,sizeof(oi));
+        UInt32 bytes=sizeof(s->reply),result=~0U;
+        nvgsp::ControlReply615 reply{};
+        if(userRpcImpl(76,s->request,40+sizeof(oi),s->reply,&bytes,&result,true,true) || bytes!=96+sizeof(oi) ||
+           !nvgsp::decodeControlReply615(s->reply,bytes,C,DISP,0x73028b,sizeof(oi),reply) || result || reply.header.status)
+            continue;
+        UInt32 proto=0;__builtin_memcpy(&proto,reply.params+16,4);
+        if(proto==8 || proto==9) {dpDisplay615_=did;dpProtocol615_=proto;break;}
+    }
     lk(__LINE__);
     native615Busy_=false;setProperty("NVGspControl-native615-busy",false);
     setProperty("NVGspControl-display615-connect-mask",UInt32(out[0]),32);
+    setProperty("NVGspControl-dp-display",dpDisplay(),32);
+    setProperty("NVGspControl-dp-protocol",dpProtocol615_,32);
     setProperty("NVGspControl-display615-status",UInt32(out[1]),32);
     setProperty("NVGspControl-display615-probe-result",UInt32(r),32);
     ulk();

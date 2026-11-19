@@ -72,6 +72,12 @@ def ctrl(cmd, params):
     return ok(r), bytes.fromhex(r.get('params', ''))
 
 
+def or_protocol(did):
+    # NV0073_CTRL_CMD_SPECIFIC_OR_GET_INFO: protocol 8 = DP-A, 9 = DP-B, 1/2 = TMDS (HDMI/DVI)
+    good, r = ctrl(0x73028b, struct.pack('<II', 0, did) + bytes(48))
+    return struct.unpack_from('<I', r, 16)[0] if good and len(r) >= 20 else None
+
+
 def aux(addr, write=None, size=1):
     p = bytearray(48)
     struct.pack_into('<IIxxxxII', p, 0, 0, DISPLAY, 0x8 if write is not None else 0x9, addr)
@@ -167,6 +173,7 @@ if RESUME:
     if os.path.exists('/Library/NativeDriverLab/display/state/disp615.json'):
         sys.exit('resume: bring-up already complete')
     inst, corepb = partial['inst'], partial['core_pb']
+    DISPLAY = partial.get('display', DISPLAY)
     if not (isinstance(inst, int) and isinstance(corepb, int) and inst > 0 and corepb > 0):
         sys.exit('resume: bad partial state')
     print('resume inst 0x%x core pb 0x%x' % (inst, corepb))
@@ -178,6 +185,13 @@ else:
     # and the later core/window methods wedge the GSP: stop here instead
     if not probe.startswith('{"kr":"0x0"'):
         sys.exit('display probe failed')
+    # 2026-11-19: drive whichever DP port has the sink (was hardcoded 0x200 = DP connector 2)
+    conn = int(json.loads(probe.splitlines()[0]).get('connected_mask', '0x0'), 16)
+    dps = [1 << b for b in range(32) if conn >> b & 1 and or_protocol(1 << b) in (8, 9)]
+    if not dps:
+        sys.exit('no DisplayPort sink connected (connected 0x%x); HDMI bring-up is not implemented yet' % conn)
+    DISPLAY = dps[0]
+    print('display 0x%x (connected 0x%x)' % (DISPLAY, conn))
     print('reserve display VRAM', d615('reserve', 34, FULL))   # FULL (32 MiB) + LUT, 0.180.138
     # 2026-11-19: nvdisp615-boot.sh starts this in parallel with the first Metal client (which builds the
     # maintenance channel the CE frame copy needs). Everything above leaves the panel alone; wait here, before the
@@ -196,12 +210,18 @@ else:
     corepb = vram(H_COREPB, 0x1000, 0x1000)
     channel(CORE, 0xc77d, corepb, 40)
     # 2026-11-17: resumable from here (hotplug-watch.sh runs --resume on plug)
-    json.dump({'inst': inst, 'core_pb': corepb, 'source': source}, open(PARTIAL, 'w'), indent=1)
+    json.dump({'inst': inst, 'core_pb': corepb, 'source': source, 'display': DISPLAY}, open(PARTIAL, 'w'), indent=1)
 # 2. DP link
 print('manual dp', ctrl(0x731365, bytes(4))[0])
 p = bytearray(80); struct.pack_into('<I', p, 4, DISPLAY)
 good, r = ctrl(0x731152, p)
 print('assign sor', good, r[24:28].hex())
+sors = struct.unpack_from('<4I', r, 24) if good and len(r) >= 40 else (0, 0, 0, 0)
+SOR = next((i for i in range(4) if sors[i] & DISPLAY), None)
+PROTO = or_protocol(DISPLAY)
+if SOR is None or PROTO not in (8, 9):
+    sys.exit('no SOR assigned to display 0x%x (%s) or protocol %s' % (DISPLAY, sors, PROTO))
+print('display 0x%x on SOR%d protocol %d' % (DISPLAY, SOR, PROTO))
 print('sink D0', aux(0x600, write=b'\x01') is not None)
 time.sleep(0.05)
 for t in range(3):
@@ -283,8 +303,8 @@ HEAD = [(0x2004, 0xfc000058), (0x200c, 0x1fc8bfd0), (0x2014, 0x11), (0x2020, DIS
         (0x2098, 0), (0x2088, CURS_DMA), (0x208c, CURS_DMA), (0x2090, 0), (0x2094, 0),
         (0x209c, 0x800003cf), (0x20a0, 0x72ff)]
 push(0x680000, corepb, HEAD + END, 'core head 0 (inactive)')
-push(0x680000, corepb, [(0x300, 0x901)] + END, 'core SOR0 attach')
-sor = rd(0x688300)[0]
+push(0x680000, corepb, [(0x300 + 0x20 * SOR, 0x1 | PROTO << 8)] + END, 'core SOR%d attach' % SOR)   # owner head 0
+sor = rd(0x688300 + 0x20 * SOR)[0]
 print('armed SOR 0x%x raster 0x%x cursor 0x%x olut 0x%x' % (sor, rd(0x68a064)[0], rd(0x68a09c)[0], rd(0x68a280)[0]))
 # 2026-11-19: the first desktop frame goes into the scanout surface BEFORE window 0 points at it. VRAM keeps
 # its contents across guest reboots, so arming first showed the previous session's last frame (or garbage) for a
@@ -316,7 +336,7 @@ if source == 'desktop':
 print('register cursor for NVDisplay', d615('native', curs, CURS_USER))   # 0.180.141
 json.dump({'inst': inst, 'core_pb': corepb, 'wnd_pb': wndpb, 'cursor_surface': curs, 'lut': LUT,
            'surface_dma': surf_dma, 'surface_offset': surf_off, 'pitch': pitch, 'source': source,
-           'sor_armed': sor}, open('/Library/NativeDriverLab/display/state/disp615.json', 'w'), indent=1)
+           'sor_armed': sor, 'display': DISPLAY, 'sor': SOR}, open('/Library/NativeDriverLab/display/state/disp615.json', 'w'), indent=1)
 if os.path.exists(PARTIAL):
     os.remove(PARTIAL)
 print('done in %.1f s, source %s' % (time.time() - t0, source))
