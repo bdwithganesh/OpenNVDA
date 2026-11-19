@@ -100,12 +100,23 @@ void nvGspEncodingEnd(void) { if (tEncoding) tEncoding--; }
 uint64_t nvGspRecoverySerial(void) { return atomic_load(&gRecoverySerial); }
 uint64_t nvGspGeneration(void) { return atomic_load(&gGeneration); }
 static uint32_t gPostResetLog;                    // 0.8.27, see nvPostResetNote
+// 0.9.94: WebKit's sandboxes deny NVGspControl property reads; NVGspControl 0.180.198 mirrors the few
+// keys a client needs on its IOPCIDevice provider, which they may read.
+static CFTypeRef nvGspProperty(io_service_t s, CFStringRef key) {
+    CFTypeRef v = IORegistryEntryCreateCFProperty(s, key, kCFAllocatorDefault, 0);
+    io_registry_entry_t pci = 0;
+    if (!v && IORegistryEntryGetParentEntry(s, kIOServicePlane, &pci) == KERN_SUCCESS) {
+        v = IORegistryEntryCreateCFProperty(pci, key, kCFAllocatorDefault, 0);
+        IOObjectRelease(pci);
+    }
+    return v;
+}
 // 0.8.28: is NVGspControl in a reset (its "reset-busy" property)
 static bool nvResetBusy(void) {
     static io_service_t g;
     if (!g) g = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVGspControl"));
     if (!g) return false;
-    CFTypeRef r = IORegistryEntryCreateCFProperty(g, CFSTR("NVGspControl-reset-busy"), kCFAllocatorDefault, 0);
+    CFTypeRef r = nvGspProperty(g, CFSTR("NVGspControl-reset-busy"));
     const bool busy = r == kCFBooleanTrue;
     if (r) CFRelease(r);
     return busy;
@@ -128,7 +139,7 @@ static bool gN615;
 static bool nvN615KernelReady(void) {
     io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVGspControl"));
     if (!s) return false;
-    CFTypeRef p = IORegistryEntryCreateCFProperty(s, CFSTR("NVGspControl-native615-ready"), kCFAllocatorDefault, 0);
+    CFTypeRef p = nvGspProperty(s, CFSTR("NVGspControl-native615-ready"));
     const bool ready = p && CFGetTypeID(p) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)p);
     if (p) CFRelease(p);
     IOObjectRelease(s);
@@ -330,8 +341,7 @@ static uint32_t nvResetCountNow(void) {
     io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVGspControl"));
     if (!s) return 0;
     uint32_t v = 0;
-    CFTypeRef p = IORegistryEntryCreateCFProperty(s, CFSTR("NVGspControl-gpu-reset-count"),
-                                                  kCFAllocatorDefault, 0);
+    CFTypeRef p = nvGspProperty(s, CFSTR("NVGspControl-gpu-reset-count"));
     if (p && CFGetTypeID(p) == CFNumberGetTypeID()) {
         long long n = 0;
         CFNumberGetValue((CFNumberRef)p, kCFNumberSInt64Type, &n);
@@ -1540,7 +1550,7 @@ static bool nv615CeOn(void) {
     const char *e = getenv("NVMTL_N615_CE");
     if ((!e || strcmp(e, "1")) && !nv615VramOn()) return false;
     io_service_t sv = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVGspControl"));
-    CFTypeRef p = sv ? IORegistryEntryCreateCFProperty(sv, CFSTR("NVGspControl-client615-copy-engine"), kCFAllocatorDefault, 0) : NULL;
+    CFTypeRef p = sv ? nvGspProperty(sv, CFSTR("NVGspControl-client615-copy-engine")) : NULL;
     long long ce = 0;
     if (p && CFGetTypeID(p) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)p, kCFNumberSInt64Type, &ce);
     if (p) CFRelease(p);

@@ -92,17 +92,24 @@ IOReturn NVGspControl::initializeNative615() {
     ulk();
     if(!ranges || !heapLo || heapHi<heapLo || !vaLo || !vaBytes || vaBytes>UINT64_MAX-vaLo)
         return kIOReturnNotReady;
+    const UInt64 bootstrapStart=mach_absolute_time();
+    UInt32 stageMs[16]={};
     auto step=[&](UInt32 value) {
+        UInt64 ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-bootstrapStart,&ns);
+        if(value<16)stageMs[value]=UInt32(ns/1000000);
         lk(__LINE__);native615Stage_=value;
-        setProperty("NVGspControl-native615-stage",value,32);ulk();
+        setProperty("NVGspControl-native615-stage",value,32);
+        setProperty("NVGspControl-native615-stage-ms",stageMs,sizeof(stageMs));ulk();   // 0.180.198: ms at each stage
     };
     auto failed=[&](UInt32 value) {
         lk(__LINE__);native615Status_=value;
         setProperty("NVGspControl-native615-status",value,32);ulk();return false;
     };
     auto healthy=[&]() {
-        for(unsigned i=0;i<5;++i) {
-            IOSleep(100);
+        // 0.180.198: two 10 ms polls, as the client path since 0.180.122 (five of 100 ms were
+        // 3 s of the 8 s bootstrap, i.e. of every boot's time to a picture)
+        for(unsigned i=0;i<2;++i) {
+            IOSleep(10);
             if(pollStatus()!=kIOReturnSuccess)return failed(kIOReturnNotReady);
             lk(__LINE__);
             const bool ok=postInitPhase_==27 && gmcInitReady_ && !gmcMmuFaultPending_ &&
@@ -160,9 +167,17 @@ IOReturn NVGspControl::initializeNative615() {
     };
     auto zero=[&](UInt64 base,UInt64 bytes) {
         if(!base || !bytes || ((base|bytes)&4095))return failed(kIOReturnBadArgument);
+        // 0.180.198: one write a page, then its first and last 16 words read back (as the client
+        // path's zero since 0.180.121). The full read-back of all 24 MiB was 4.3 s of every boot.
+        bzero(s->writeWords,sizeof(s->writeWords));
         for(UInt64 page=0;page<bytes;page+=4096) {
-            bzero(s->writeWords,sizeof(s->writeWords));
-            if(!write(base+page,s->writeWords,1024))return false;
+            const IOReturn r=vramAccess(base+page,s->writeWords,1024,true,true);
+            if(r!=kIOReturnSuccess)return failed(static_cast<UInt32>(r));
+            const UInt64 ends[2]={base+page,base+page+4032};
+            for(UInt64 at:ends) {
+                if(!read(at,16))return false;
+                for(unsigned i=0;i<16;++i)if(s->readWords[i])return failed(kIOReturnIOError);
+            }
             s->zeroWords+=1024;
         }
         return true;
@@ -377,8 +392,8 @@ IOReturn NVGspControl::nativeCompute615(const void *nak,UInt32 bytes,
             !__builtin_memcmp(s->writeWords,s->readWords,count*4);
     };
     auto healthy=[&]() {
-        for(unsigned i=0;i<5;++i) {
-            IOSleep(100);
+        for(unsigned i=0;i<2;++i) {   // 0.180.198: as above
+            IOSleep(10);
             if(pollStatus()!=kIOReturnSuccess)return false;
             lk(__LINE__);
             const bool ok=!gmcMmuFaultPending_ && !userRpcLatePending_ && !resetBusy_ && !sleeping_ &&

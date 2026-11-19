@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>BNDL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.9.93</string>
+	<string>0.9.94</string>
 	<key>CFBundleVersion</key>
-	<string>0.9.93</string>
+	<string>0.9.94</string>
 	<key>NSPrincipalClass</key>
 	<string>NVMTLDevice</string>
 </dict>

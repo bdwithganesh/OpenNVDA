@@ -189,6 +189,11 @@ public:
     IOMemoryDescriptor *pipeMd615_[kPipeSlots615] = {};
     UInt32 pipeUse615_[kPipeSlots615] = {}, pipeClock615_ = 0, pipeFlips615_ = 0, pipeFlipFails615_ = 0;
     IOReturn pipeFlip615(NVGspFlipCopy *f);
+    // 0.180.197: the state sandboxed Metal clients (WebKit) read, mirrored on the PCI device: their
+    // sandboxes deny NVGspControl property reads but allow IOPCIDevice ones
+    using IOService::setProperty;
+    bool setProperty(const char *key, bool value) override;
+    bool setProperty(const char *key, unsigned long long value, unsigned int bits) override;
     // 0.180.98: input = 8 constant words + NAK; empty input only returns the
     // caller buffer VA. out: caller VA, dispatch sequence, code bytes.
     IOReturn nativeClientDispatch615(const void *owner, const UInt8 *input, UInt32 bytes, UInt64 out[3]);

@@ -3792,6 +3792,21 @@ void NVGspControl::thawLocked() {
 // lines (surface pages in system RAM -> scan-out in VRAM) on the privileged
 // kernel copy channel, instead of a CPU memcpy of the whole frame. GR work
 // queued so far (the composite that drew the surface) finishes first.
+static bool nvSandboxMirrorKey(const char *k) {
+    static const char *const keys[] = {"NVGspControl-native615-ready", "NVGspControl-gpu-reset-count",
+                                       "NVGspControl-reset-busy", "NVGspControl-client615-copy-engine"};
+    for (const char *m : keys) if (!strcmp(k, m)) return true;
+    return false;
+}
+bool NVGspControl::setProperty(const char *key, bool value) {
+    if (key && pci_ && nvSandboxMirrorKey(key)) pci_->setProperty(key, value);
+    return IOService::setProperty(key, value);
+}
+bool NVGspControl::setProperty(const char *key, unsigned long long value, unsigned int bits) {
+    if (key && pci_ && nvSandboxMirrorKey(key)) pci_->setProperty(key, value, bits);
+    return IOService::setProperty(key, value, bits);
+}
+
 IOReturn NVGspControl::flipCopy(NVGspFlipCopy *f) {
     // 0.180.197: native615 maps the surface into the maintenance VAS (no per-flip property churn)
     if (native615_ && pipeVa615_) return f && f->version == 1 && f->src ? pipeFlip615(f) : kIOReturnBadArgument;
