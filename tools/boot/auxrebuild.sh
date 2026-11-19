@@ -8,8 +8,8 @@ CAND=$(mktemp -d /Library/KernelCollections/.native-kc.XXXXXX)
 kmutil create -z -n aux --allow-missing-kdk -V release \
   -B /System/Library/KernelCollections/BootKernelExtensions.kc \
   -S /System/Library/KernelCollections/SystemKernelExtensions.kc \
-  -A "$CAND/AuxiliaryKernelExtensions.kc" -r /Library/Extensions > /tmp/kmutil-aux.log 2>&1 \
-  || { echo "KMUTIL FAILED"; tail -25 /tmp/kmutil-aux.log; exit 1; }
+  -A "$CAND/AuxiliaryKernelExtensions.kc" -r /Library/Extensions > "$BK/kmutil.log" 2>&1 \
+  || { echo "KMUTIL FAILED"; tail -25 "$BK/kmutil.log"; exit 1; }
 chown root:wheel "$CAND/AuxiliaryKernelExtensions.kc"; chmod 644 "$CAND/AuxiliaryKernelExtensions.kc"
 mv -f "$CAND/AuxiliaryKernelExtensions.kc" /Library/KernelCollections/AuxiliaryKernelExtensions.kc
 rmdir "$CAND"
