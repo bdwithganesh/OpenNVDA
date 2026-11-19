@@ -4,6 +4,8 @@
 #include "NVVTDecoder.h"
 #include <CoreVideo/CoreVideo.h>
 #include <chrono>
+#include <dlfcn.h>
+#include <unistd.h>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -177,6 +179,14 @@ int main(int argc, char **argv) {
               << ", " << input.packets.size() << " access units\n";
     if (argc == 3) { CFRelease(format); std::cout << "parse PASS (no GPU execution)\n"; return 0; }
     // VT_SYSTEM=1: no in-process registration, VT has to find the installed plug-in
+    if (getenv("VT_METAL")) {   // load the Metal driver first (NVMTL 0.9.93 registers the NVDEC decoders)
+        void *m = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_NOW);
+        auto create = m ? (void *(*)())dlsym(m, "MTLCreateSystemDefaultDevice") : nullptr;
+        std::cout << "metal device " << (create && create() ? "ok" : "none") << std::endl;
+        usleep(500000);
+        std::cout << "VTIsHardwareDecodeSupported h264 " << int(VTIsHardwareDecodeSupported(kCMVideoCodecType_H264))
+                  << " hevc " << int(VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)) << std::endl;
+    }
     if (getenv("VT_PRO")) VTRegisterProfessionalVideoWorkflowVideoDecoders();   // lets VT load /Library/Video/Plug-Ins
     if (const char *dir = getenv("VT_BUNDLEDIR")) {   // SPI: a directory of decoder bundles
         CFURLRef u = CFURLCreateFromFileSystemRepresentation(nullptr, (const UInt8 *)dir, strlen(dir), true);
@@ -220,7 +230,7 @@ int main(int argc, char **argv) {
     CFTypeRef hardware = nullptr;
     OSStatus propertyStatus = VTSessionCopyProperty(session,
         kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder, nullptr, &hardware);
-    const bool hwUsed = hardware && CFEqual(hardware, kCFBooleanTrue);
+    bool hwUsed = hardware && CFEqual(hardware, kCFBooleanTrue);
     std::cout << "hardware property status=" << propertyStatus << " value="
               << (hwUsed ? "true" : "false/unavailable") << '\n';
     if (hardware) CFRelease(hardware);
@@ -244,6 +254,9 @@ int main(int argc, char **argv) {
     OSStatus wait = VTDecompressionSessionWaitForAsynchronousFrames(session);
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     NVVTStats stats{}; NVVTGetStats(&stats);
+    // system mode: the decoder runs from the installed bundle (loaded by VT or by NVMTL), read its counters
+    if (void *b = getenv("VT_SYSTEM") ? dlopen("/Library/Video/Plug-Ins/NVVTDecoder.bundle/Contents/MacOS/NVVTDecoder", RTLD_NOLOAD | RTLD_NOW) : nullptr)
+        if (auto get = (void (*)(NVVTStats *))dlsym(b, "NVVTGetStats")) { get(&stats); hwUsed = hwUsed || stats.submitted; }
     VTDecompressionSessionInvalidate(session); CFRelease(session); CFRelease(format);
     const bool sys = getenv("VT_SYSTEM") != nullptr;   // the plug-in keeps its own counters
     const bool frames = !status && !finish && !wait && !output.bad && output.count == input.packets.size();

@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <unistd.h>
+#include <os/log.h>
 extern "C" {
 #include "nvdec_h264.h"
 #include "nvdec_hevc.h"
@@ -190,6 +191,21 @@ OSStatus start(VTVideoDecoderRef instance, VTVideoDecoderSession session,
         h264_nal nal{data, size, data[0] & 31, (data[0] >> 5) & 3};
         if (nvdec_h264_param_nal(&d->h264, &nal)) return kVTVideoDecoderBadDataErr;
     }
+    // 0.3.1: refuse what NVDEC is not set up for (4:2:0 8-bit only) here, at session start, so VT picks
+    // the software decoder. Failing on the first frame instead made QuickTime stall on Main10 HEVC.
+    auto supported = [](const auto *sps, int n) {
+        int valid = 0;
+        for (int i = 0; i < n; ++i) {
+            if (!sps[i].valid) continue;
+            ++valid;
+            if (sps[i].chroma_format_idc != 1 || sps[i].bit_depth_luma != 8 || sps[i].bit_depth_chroma != 8) return false;
+        }
+        return valid > 0;
+    };
+    if (d->hevc ? !supported(d->hdec.sps, HEVC_MAX_SPS) : !supported(d->h264.sps, H264_MAX_SPS)) {
+        os_log(OS_LOG_DEFAULT, "NVVTDecoder: format not supported by NVDEC path (needs 4:2:0 8-bit), software decode");
+        return kVTVideoDecoderUnsupportedDataFormatErr;
+    }
     const auto dim = CMVideoFormatDescriptionGetDimensions(format);
     d->width = dim.width; d->height = dim.height;
     if (d->width <= 0 || d->height <= 0 || d->width > 4096 || d->height > 2304)
@@ -208,8 +224,12 @@ OSStatus start(VTVideoDecoderRef instance, VTVideoDecoderSession session,
     err = VTDecoderSessionSetPixelBufferAttributes(session, attrs);
     CFRelease(attrs); CFRelease(empty); CFRelease(f); CFRelease(h); CFRelease(w);
     if (err) return err;
-    if (!d->open()) return kVTVideoDecoderNotAvailableNowErr;
+    if (!d->open()) {
+        os_log(OS_LOG_DEFAULT, "NVVTDecoder: NVDEC open failed in %{public}s", getprogname());
+        return kVTVideoDecoderNotAvailableNowErr;
+    }
     ++sessions;
+    os_log(OS_LOG_DEFAULT, "NVVTDecoder: NVDEC %{public}s session in %{public}s", d->hevc ? "HEVC" : "H.264", getprogname());
     return noErr;
 }
 
@@ -225,10 +245,14 @@ OSStatus emitSurface(Decoder *d, VTVideoDecoderFrame frame, const uint8_t *base,
         CFRelease(pixel); return kVTVideoDecoderMalfunctionErr;
     }
     for (int plane = 0; plane < 2; ++plane) {
-        nvdec_detile(base + (plane ? lumaBytes : 0), blPitch, d->linear.data(), codedWidth, codedWidth,
-                     codedHeight >> plane);
         uint8_t *dst = static_cast<uint8_t *>(CVPixelBufferGetBaseAddressOfPlane(pixel, plane));
         const size_t pitch = CVPixelBufferGetBytesPerRowOfPlane(pixel, plane);
+        // 0.3.1: straight into the pixel buffer (8 ms -> see LOG); the staged path stays for odd crops
+        if (!nvdec_detile_crop(base + (plane ? lumaBytes : 0), blPitch, dst, (uint32_t)pitch, d->x0, d->y0 >> plane,
+                               d->width, d->height >> plane))
+            continue;
+        nvdec_detile(base + (plane ? lumaBytes : 0), blPitch, d->linear.data(), codedWidth, codedWidth,
+                     codedHeight >> plane);
         for (int y = 0; y < (d->height >> plane); ++y)
             memcpy(dst + y * pitch, d->linear.data() + (size_t)(y + (d->y0 >> plane)) * codedWidth + d->x0, d->width);
     }
@@ -313,7 +337,12 @@ OSStatus decode(VTVideoDecoderRef instance, VTVideoDecoderFrame frame,
     if (!d) return kVTVideoDecoderMalfunctionErr;
     std::lock_guard<std::mutex> guard(d->mutex);
     if (d->failed) return kVTVideoDecoderMalfunctionErr;
-    auto fail = [&](OSStatus e) { ++errors; d->failed = true; return e; };
+    auto fail = [&](OSStatus e) {
+        ++errors; d->failed = true;
+        os_log_error(OS_LOG_DEFAULT, "NVVTDecoder: decode failed %d after %u pictures (%{public}s) in %{public}s", (int)e,
+                     d->hevc ? d->hdec.pictures : 0u, d->hevc ? "HEVC" : "H.264", getprogname());
+        return e;
+    };
     CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sample);
     if (!block || CMSampleBufferGetNumSamples(sample) != 1) return fail(kVTVideoDecoderBadDataErr);
     const size_t bytes = CMBlockBufferGetDataLength(block);

@@ -17,6 +17,7 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <dlfcn.h>
+static void nvVideoRegister(void);   // 0.9.93
 #include <dispatch/dispatch.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
@@ -6060,8 +6061,32 @@ static void nvBufferMakeAliasable(id self, SEL _cmd) {
         // (CIGaussianBlur / CILineOverlay crashed in __NSDictionaryM dealloc).
         _nvKernels = [NSMutableDictionary new]; _nvFrags = [NSMutableDictionary new];
         _nvAirLibs = [NSMutableDictionary new]; _nvSubset = [NSMutableDictionary new];
+        nvVideoRegister();
     }
     return self;
+}
+
+// 0.9.93: CoreMedia loads a decoder bundle from /Library/Video/Plug-Ins only if Apple signed it
+// (figRegistryAddResultItem: "anchor apple ..."; the escape hatch is internal builds only). Every Metal
+// process loads this driver, so register the NVDEC decoders in-process from here. Off: NVMTL_NVVT=0 or
+// /Library/Preferences/nvmtl-nvvt-off. Async, so device creation does not pay for loading VideoToolbox.
+// shortcut: a process that decodes without ever touching Metal keeps software decode; a VT-load hook would cover it.
+static void nvVideoRegister(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *e = getenv("NVMTL_NVVT");
+        if ((e && !strcmp(e, "0")) || !access("/Library/Preferences/nvmtl-nvvt-off", F_OK) ||
+            !strcmp(getprogname(), "WindowServer"))
+            return;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            void *h = dlopen("/Library/Video/Plug-Ins/NVVTDecoder.bundle/Contents/MacOS/NVVTDecoder", RTLD_NOW | RTLD_LOCAL);
+            OSStatus (*h264)(void) = h ? (OSStatus (*)(void))dlsym(h, "NVVTRegisterH264Decoder") : NULL;
+            OSStatus (*hevc)(void) = h ? (OSStatus (*)(void))dlsym(h, "NVVTRegisterHEVCDecoder") : NULL;
+            const int a = h264 ? (int)h264() : -1, b = hevc ? (int)hevc() : -1;
+            NSLog(@"NVMTLDriver: NVDEC VideoToolbox decoders in %s: h264 %d hevc %d %s", getprogname(), a, b,
+                  h ? "" : dlerror());
+        });
+    });
 }
 
 static os_unfair_lock gNvDictLock = OS_UNFAIR_LOCK_INIT;

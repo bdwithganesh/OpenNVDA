@@ -699,6 +699,28 @@ void nvdec_detile(const uint8_t *bl, uint32_t bl_pitch, uint8_t *dst, uint32_t d
         }
 }
 
+/* 0.3.1: detile one plane straight into a (cropped) destination: per row, the four 16 B pieces of
+ * every 64 B block column sit at fixed offsets, so no per-piece address math and no linear staging copy.
+ * x0 must be a multiple of 16; dst_pitch must hold w rounded up to 16 (CVPixelBuffer rows do). */
+int nvdec_detile_crop(const uint8_t *bl, uint32_t bl_pitch, uint8_t *dst, uint32_t dst_pitch,
+                      uint32_t x0, uint32_t y0, uint32_t w, uint32_t h) {
+    const uint32_t w16 = (w + 15) & ~15u;
+    if ((x0 & 15) || (bl_pitch & 63) || dst_pitch < w16 || x0 + w16 > bl_pitch) return -1;
+    static const uint32_t piece[4] = {0, 64, 256, 320};
+    const size_t blocks = bl_pitch >> 6;
+    for (uint32_t y = 0; y < h; ++y) {
+        const uint32_t sy = y + y0;
+        const uint8_t *row = bl + (size_t)(sy >> 4) * blocks * 1024 + ((sy >> 3) & 1) * 512 +
+                             ((sy & 7) >> 2) * 128 + (sy & 3) * 16;
+        uint8_t *out = dst + (size_t)y * dst_pitch;
+        for (uint32_t x = 0; x < w16; x += 16) {
+            const uint32_t sx = x + x0;
+            memcpy(out + x, row + (size_t)(sx >> 6) * 1024 + piece[(sx >> 4) & 3], 16);
+        }
+    }
+    return 0;
+}
+
 void nvdec_tile(const uint8_t *src, uint32_t src_pitch, uint8_t *bl, uint32_t bl_pitch,
                 uint32_t bytes_per_row, uint32_t rows) {
     for (uint32_t y = 0; y < rows; ++y)

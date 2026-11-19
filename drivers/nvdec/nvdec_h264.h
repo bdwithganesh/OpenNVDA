@@ -130,6 +130,8 @@ uint32_t nvdec_h264_push(const nvdec_h264_addrs *a, const nvdec_h264_layout *l,
 
 /* Block-linear (GOB 64x8, 2 GOBs per block) <-> pitch-linear copy of one
  * plane of `rows` rows x `bytes_per_row` bytes; bl_pitch multiple of 64. */
+int nvdec_detile_crop(const uint8_t *bl, uint32_t bl_pitch, uint8_t *dst, uint32_t dst_pitch,
+                      uint32_t x0, uint32_t y0, uint32_t w, uint32_t h);
 void nvdec_detile(const uint8_t *bl, uint32_t bl_pitch, uint8_t *dst, uint32_t dst_pitch,
                   uint32_t bytes_per_row, uint32_t rows);
 /* MD5 of the cropped NV12 picture in a decoded block-linear surface: luma
