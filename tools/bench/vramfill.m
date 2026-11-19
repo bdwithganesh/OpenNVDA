@@ -82,7 +82,10 @@ int main(int argc, char **argv) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                                                                       width:8192 height:8192 mipmapped:NO];
         td.storageMode = MTLStorageModePrivate;
-        printf("after release: new 256 MiB texture %s\n", [dev newTextureWithDescriptor:td] ? "ok" : "nil");
+        id<MTLTexture> again = [dev newTextureWithDescriptor:td];
+        printf("after release: new 256 MiB texture %s\n", again ? "ok" : "nil");
+        again = nil;
+        if (argc > 3) { printf("holding %s s\n", argv[3]); fflush(stdout); sleep((unsigned)atoi(argv[3])); }
         return (nilAt < 0 && !bad && !rebad) ? 0 : 1;
     }
 }

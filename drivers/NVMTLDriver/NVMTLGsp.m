@@ -262,7 +262,8 @@ static unsigned g615NVK[8];
 static bool nv615VramTexOn(void);
 static bool nv615VramKindTake(uint32_t kind, uint64_t len, uint64_t *va);
 static void nv615VramKindGive(uint32_t kind, uint64_t va, uint64_t len);
-static bool nv615VramTrimLocked(void);   // 0.9.91
+static bool nv615VramTrimLocked(uint64_t keep);   // 0.9.91
+static void nv615NoteVramFreedLocked(uint64_t len);
 static NV615Kind g615Kind[2048];
 static unsigned g615NKind;
 static uint32_t g615KindId = 0x615000;
@@ -770,7 +771,7 @@ static bool heapAllocFlags(uint64_t bytes, void **cpu, uint64_t *va, uint32_t fl
             bool got = g615NSlab < NV615_HEAP_SLABS && nv615Alloc(gConn, size, &c, &v, kind | (nvSysCachedOn() ? 0x10u : 0u));
             if (!got && g615NSlab < NV615_HEAP_SLABS) {   // 0.9.91: window full: give free VRAM slabs back, retry
                 os_unfair_lock_lock(&gHeapLock);
-                const bool trimmed = nv615VramTrimLocked();
+                const bool trimmed = nv615VramTrimLocked(0);
                 os_unfair_lock_unlock(&gHeapLock);
                 got = trimmed && nv615Alloc(gConn, size, &c, &v, kind | (nvSysCachedOn() ? 0x10u : 0u));
             }
@@ -982,12 +983,22 @@ static bool nv615SpanCut(NVRange *list, unsigned *n, unsigned cap, uint64_t va, 
     }
     return false;
 }
-// Caller holds gHeapLock (dropped around the kernel calls). True if at least one slab went back.
-static bool nv615VramTrimLocked(void) {
+static bool nv615SpanCovers(const NVRange *list, unsigned n, uint64_t va, uint64_t size) {
+    for (unsigned i = 0; i < n; i++)
+        if (va >= list[i].va && va + size <= list[i].va + list[i].size) return true;
+    return false;
+}
+// Caller holds gHeapLock (dropped around the kernel calls). Up to `keep` bytes of fully free slabs stay
+// with the process (no re-zeroing stall on the next allocation). True if at least one slab went back.
+static bool nv615VramTrimLocked(uint64_t keep) {
     uint32_t slots[64];
     unsigned nfree = 0;
+    uint64_t kept = 0;
     for (unsigned i = 0; i < g615NSlots;) {
         NV615Slot *t = &g615Slots[i];
+        const bool whole = t->kind < 0 ? nv615SpanCovers(gVFree, gNVFree, t->va, t->size)
+                                       : nv615SpanCovers((NVRange *)g615VK[t->kind], g615NVK[t->kind], t->va, t->size);
+        if (whole && kept + t->size <= keep) { kept += t->size; i++; continue; }
         bool cut;
         if (t->kind < 0) cut = nv615SpanCut(gVFree, &gNVFree, 2048, t->va, t->size);
         else cut = nv615SpanCut((NVRange *)g615VK[t->kind], &g615NVK[t->kind], 256, t->va, t->size);
@@ -1008,8 +1019,19 @@ static bool nv615VramTrimLocked(void) {
         else if (g615KernelAllocs) --g615KernelAllocs;
     }
     os_unfair_lock_lock(&gHeapLock);
-    NSLog(@"NVMTLGsp: returned %u free VRAM slab(s) to the kernel", nfree);
+    static unsigned said;
+    if (said++ < 16) NSLog(@"NVMTLGsp: returned %u free VRAM slab(s) to the kernel (kept %llu MiB)", nfree,
+                           (unsigned long long)(kept >> 20));
     return true;
+}
+// 0.9.91: WDDM-like sharing: a process that freed 1 GiB of VRAM since the last trim keeps 256 MiB of
+// free slabs and returns the rest, so other apps get VRAM instead of system memory.
+static uint64_t g615FreedSinceTrim;
+static void nv615NoteVramFreedLocked(uint64_t len) {
+    g615FreedSinceTrim += len;
+    if (g615FreedSinceTrim < (1ull << 30)) return;
+    g615FreedSinceTrim = 0;
+    nv615VramTrimLocked(256ull << 20);
 }
 
 // 0.6.12: kext objects, kept so a GPU reset can put them back
@@ -1376,7 +1398,7 @@ static bool nv615VramGrowLocked(uint64_t len) {
     os_unfair_lock_unlock(&gHeapLock);
     kern_return_t kr = callOn(gConn, 47, in, 2, out, &n, NULL, 0);
     os_unfair_lock_lock(&gHeapLock);
-    if (kr == kIOReturnNoSpace && nv615VramTrimLocked()) {
+    if (kr == kIOReturnNoSpace && nv615VramTrimLocked(0)) {
         n = 3;
         os_unfair_lock_unlock(&gHeapLock);
         kr = callOn(gConn, 47, in, 2, out, &n, NULL, 0);
@@ -1428,7 +1450,7 @@ static bool nv615VramKindTake(uint32_t kind, uint64_t len, uint64_t *va) {
         os_unfair_lock_unlock(&gHeapLock);
         kern_return_t kr = callOn(gConn, 47, in, 2, out, &n, NULL, 0);
         os_unfair_lock_lock(&gHeapLock);
-        if (kr == kIOReturnNoSpace && nv615VramTrimLocked()) {
+        if (kr == kIOReturnNoSpace && nv615VramTrimLocked(0)) {
             n = 3;
             os_unfair_lock_unlock(&gHeapLock);
             kr = callOn(gConn, 47, in, 2, out, &n, NULL, 0);
@@ -1443,6 +1465,7 @@ static bool nv615VramKindTake(uint32_t kind, uint64_t len, uint64_t *va) {
     return false;
 }
 static void nv615VramKindGive(uint32_t kind, uint64_t va, uint64_t len) {
+    const uint64_t freed = len;
     os_unfair_lock_lock(&gHeapLock);
     for (unsigned i = 0; i < g615NVK[kind]; i++) {
         NV615VSpan *f = &g615VK[kind][i];
@@ -1450,6 +1473,7 @@ static void nv615VramKindGive(uint32_t kind, uint64_t va, uint64_t len) {
         else if (va + len == f->va) { len += f->size; *f = g615VK[kind][--g615NVK[kind]]; i = (unsigned)-1; }
     }
     if (g615NVK[kind] < 256) g615VK[kind][g615NVK[kind]++] = (NV615VSpan){va, len};
+    nv615NoteVramFreedLocked(freed);
     os_unfair_lock_unlock(&gHeapLock);
 }
 static bool nvVramAllocRaw(uint64_t bytes, uint64_t *va) {
@@ -1493,7 +1517,9 @@ void nvVramFree(uint64_t va, uint64_t bytes) {
             gVFree[i] = gVFree[--gNVFree]; i = (unsigned)-1;
         }
     }
+    const uint64_t freed = (bytes + 0xffff) & ~0xffffULL;
     if (gNVFree < 2048) gVFree[gNVFree++] = (NVRange){va, len};
+    if (gN615) nv615NoteVramFreedLocked(freed);
     os_unfair_lock_unlock(&gHeapLock);
 }
 

@@ -4,6 +4,7 @@
 #include "NVVTDecoder.h"
 #include <CoreVideo/CoreVideo.h>
 #include <chrono>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -16,6 +17,8 @@ extern "C" {
 #include "nvdec_md5.h"
 }
 
+extern "C" void VTRegisterVideoDecoderBundleDirectory(CFURLRef) __attribute__((weak_import));   // SPI
+extern "C" OSStatus VTCopyVideoDecoderList(CFDictionaryRef, CFArrayRef *) __attribute__((weak_import));   // SPI
 struct Input {
     std::vector<uint8_t> vps, sps, pps;   // vps only for HEVC
     bool hevc = false;
@@ -175,6 +178,25 @@ int main(int argc, char **argv) {
     if (argc == 3) { CFRelease(format); std::cout << "parse PASS (no GPU execution)\n"; return 0; }
     // VT_SYSTEM=1: no in-process registration, VT has to find the installed plug-in
     if (getenv("VT_PRO")) VTRegisterProfessionalVideoWorkflowVideoDecoders();   // lets VT load /Library/Video/Plug-Ins
+    if (const char *dir = getenv("VT_BUNDLEDIR")) {   // SPI: a directory of decoder bundles
+        CFURLRef u = CFURLCreateFromFileSystemRepresentation(nullptr, (const UInt8 *)dir, strlen(dir), true);
+        if (VTRegisterVideoDecoderBundleDirectory) VTRegisterVideoDecoderBundleDirectory(u);
+        CFRelease(u);
+    }
+    if (getenv("VT_LIST") && VTCopyVideoDecoderList) {   // which decoders VT knows
+        CFArrayRef list = nullptr;
+        if (!VTCopyVideoDecoderList(nullptr, &list) && list) {
+            for (CFIndex i = 0; i < CFArrayGetCount(list); ++i) {
+                CFStringRef d = CFCopyDescription(CFArrayGetValueAtIndex(list, i));
+                char b[2048] = "";
+                CFStringGetCString(d, b, sizeof b, kCFStringEncodingUTF8);
+                for (char *c = b; *c; ++c) if (*c == '\n') *c = ' ';
+                std::cout << "decoder " << b << '\n';
+                CFRelease(d);
+            }
+            CFRelease(list);
+        }
+    }
     status = getenv("VT_SYSTEM") ? noErr : input.hevc ? NVVTRegisterHEVCDecoder() : NVVTRegisterH264Decoder();
     if (status) { std::cerr << "register status=" << status << '\n'; CFRelease(format); return 1; }
     Output output(input);
