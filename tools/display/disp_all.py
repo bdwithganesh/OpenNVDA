@@ -8,8 +8,8 @@
 #     surface at ~60 Hz; sysfb = direct PCI scan-out (refused by the hardware, 0x1d)
 #   --resume  2026-11-17: continue a bring-up that stopped at the DP link (no
 #     monitor at boot): reuse the display root, instance memory and core
-#     channel from /tmp/disp615-partial.json and run the DP link onwards.
-# State goes to /tmp/disp615.json for later tools.
+#     channel from /Library/NativeDriverLab/display/state/disp615-partial.json and run the DP link onwards.
+# State goes to /Library/NativeDriverLab/display/state/disp615.json for later tools.
 import array, json, os, struct, subprocess, sys, time
 
 D = '/Users/dhruveen/nvbuild/d615/d615'
@@ -26,7 +26,7 @@ CURS_USER = 0x690000 + 72 * 0x1000
 args = [a for a in sys.argv[1:] if not a.startswith('--')]
 source = args[0] if args else 'vram'
 RESUME = '--resume' in sys.argv
-PARTIAL = '/tmp/disp615-partial.json'
+PARTIAL = '/Library/NativeDriverLab/display/state/disp615-partial.json'
 # One-shot test hook: pretend no sink answered the DP step (no-monitor boot).
 FAKE_NODP = '/Library/NativeDriverLab/display/fake-nodp'
 
@@ -164,9 +164,11 @@ if RESUME:
         partial = json.load(open(PARTIAL))
     except (OSError, ValueError):
         sys.exit('resume: no partial bring-up state')
-    if os.path.exists('/tmp/disp615.json'):
+    if os.path.exists('/Library/NativeDriverLab/display/state/disp615.json'):
         sys.exit('resume: bring-up already complete')
     inst, corepb = partial['inst'], partial['core_pb']
+    if not (isinstance(inst, int) and isinstance(corepb, int) and inst > 0 and corepb > 0):
+        sys.exit('resume: bad partial state')
     print('resume inst 0x%x core pb 0x%x' % (inst, corepb))
 else:
     # 1. display objects and memory
@@ -188,8 +190,8 @@ else:
     need(d615('alloc', DEV, ROOT, 0xc770), 'display root')
     inst = vram(H_INST, 0x10000, 0x10000)
     d615('vfile', inst, '/dev/null')
-    open('/tmp/zero.bin', 'wb').write(bytes(0x10000))
-    d615('vfile', inst, '/tmp/zero.bin')
+    open('/Library/NativeDriverLab/display/state/zero.bin', 'wb').write(bytes(0x10000))
+    d615('vfile', inst, '/Library/NativeDriverLab/display/state/zero.bin')
     need(d615('ictrl', 0x20800a49, struct.pack('<QQII', inst, 0x10000, 2, 2).hex()), 'write inst mem')
     corepb = vram(H_COREPB, 0x1000, 0x1000)
     channel(CORE, 0xc77d, corepb, 40)
@@ -222,8 +224,8 @@ if not RESUME and os.path.exists(FAKE_NODP):
 if not (good and streamed):
     sys.exit('DP link not up (train %s, stream %s)' % (good, streamed))
 # 3. surfaces and context DMAs
-open('/tmp/lut.bin', 'wb').write(lut_surface())
-d615('vfile', LUT, '/tmp/lut.bin')
+open('/Library/NativeDriverLab/display/state/lut.bin', 'wb').write(lut_surface())
+d615('vfile', LUT, '/Library/NativeDriverLab/display/state/lut.bin')
 curs = vram(H_CURSURF, 256 * 256 * 4, 0x10000)
 img = array.array('I', [0] * (256 * 256))
 for y in range(64):
@@ -231,8 +233,8 @@ for y in range(64):
         if x <= y * 0.62 and y < 56 or (abs(x - y * 0.35 - 6) < 4 and 30 < y < 64):
             edge = x == 0 or x >= y * 0.62 - 1.5 or y >= 55
             img[y * 256 + x] = 0xff000000 if edge else 0xffffffff
-open('/tmp/cursor.bin', 'wb').write(img.tobytes())
-d615('vfile', curs, '/tmp/cursor.bin')
+open('/Library/NativeDriverLab/display/state/cursor.bin', 'wb').write(img.tobytes())
+d615('vfile', curs, '/Library/NativeDriverLab/display/state/cursor.bin')
 ctxdma(inst, ISO, 0x2000, 1, 0, 0x3ffffffff)
 ctxdma(inst, CURS_DMA, 0x2020, 0, curs, curs + 0x3ffff)
 ctxdma(inst, OLUT_DMA, 0x20c0, 0, LUT, LUT + LUT_LIMIT)
@@ -253,7 +255,7 @@ elif source == 'sysfb':
     surf_dma, surf_off = SYS_DMA, 0
 else:
     row = array.array('I', [0] * W)
-    with open('/tmp/full.bin', 'wb') as f:
+    with open('/Library/NativeDriverLab/display/state/full.bin', 'wb') as f:
         for y in range(H):
             for x in range(W):
                 r_, g_ = x * 255 // W, y * 255 // H
@@ -264,7 +266,7 @@ else:
                     r_ = g_ = b_ = 255
                 row[x] = 0xff000000 | r_ << 16 | g_ << 8 | b_
             f.write(row.tobytes())
-    d615('vfile', FULL, '/tmp/full.bin')
+    d615('vfile', FULL, '/Library/NativeDriverLab/display/state/full.bin')
 # 4. core: window owners, then head 0 state while inactive, then the SOR
 init = []
 for i in range(8):
@@ -314,7 +316,7 @@ if source == 'desktop':
 print('register cursor for NVDisplay', d615('native', curs, CURS_USER))   # 0.180.141
 json.dump({'inst': inst, 'core_pb': corepb, 'wnd_pb': wndpb, 'cursor_surface': curs, 'lut': LUT,
            'surface_dma': surf_dma, 'surface_offset': surf_off, 'pitch': pitch, 'source': source,
-           'sor_armed': sor}, open('/tmp/disp615.json', 'w'), indent=1)
+           'sor_armed': sor}, open('/Library/NativeDriverLab/display/state/disp615.json', 'w'), indent=1)
 if os.path.exists(PARTIAL):
     os.remove(PARTIAL)
 print('done in %.1f s, source %s' % (time.time() - t0, source))
