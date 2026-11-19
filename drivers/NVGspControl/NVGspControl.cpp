@@ -8381,7 +8381,7 @@ IOReturn NVGspControl::pollStatusLocked() {
             }
             UInt64 noticeNow = 0;
             if (faultNotice) clock_get_uptime(&noticeNow);
-            if (faultNotice && nvdecRcUnpaired_ && noticeNow <= nvdecAbsorbUntil_) {
+            if (faultNotice && nvdecRcUnpaired_ && !otherMmuFault_ && noticeNow <= nvdecAbsorbUntil_) {
                 // 0.180.192: the notice of an NVDEC fault already attributed to an owned client's
                 // channel (RC 31 on engine 0x13 came first): RC killed only that channel
                 --nvdecRcUnpaired_;++mmuFaultEvents_;
@@ -8572,8 +8572,14 @@ IOReturn NVGspControl::pollStatusLocked() {
                     if (c.live && c.nvdecScheduled && (c.nvdecToken & 0xffff) == rc[1]) owner = int(k);
                 }
                 if (owner < 0) {
-                    otherMmuFault_ = true;
+                    // fail closed: any other fault in the epoch re-asserts pending (even after an absorb)
+                    // and cancels an outstanding NVDEC absorb credit
+                    otherMmuFault_ = true; nvdecRcUnpaired_ = 0;
                     if (mmuNoticesUnpaired_) --mmuNoticesUnpaired_;
+                    if (!gmcMmuFaultPending_) {
+                        gmcMmuFaultPending_ = true;
+                        setProperty("NVGspControl-gmc-mmu-fault-pending", true);
+                    }
                 } else {
                     native615_->clientGrs[owner].nvdecFaulted = true;
                     setProperty("NVGspControl-nvdec615-faulted", UInt32(owner), 32);
@@ -8583,11 +8589,11 @@ IOReturn NVGspControl::pollStatusLocked() {
                             setProperty("NVGspControl-gmc-mmu-fault-pending", false);
                             setProperty("NVGspControl-nvdec615-fault-notice-absorbed", true);
                         }
-                    } else {
+                    } else if (!nvdecRcUnpaired_ && !otherMmuFault_) {   // one credit, never extended
                         UInt64 now = 0, window = 0;
                         clock_get_uptime(&now);
                         nanoseconds_to_absolutetime(2000000000ULL, &window);
-                        ++nvdecRcUnpaired_; nvdecAbsorbUntil_ = now + window;
+                        nvdecRcUnpaired_ = 1; nvdecAbsorbUntil_ = now + window;
                     }
                 }
             }
