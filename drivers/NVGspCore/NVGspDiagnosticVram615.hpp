@@ -3,8 +3,10 @@
 
 namespace nvgsp {
 constexpr uint64_t kDiagnosticVramAlignment615 = 2ULL << 20;
-constexpr uint64_t kDiagnosticVramMaxRequest615 = 64ULL << 20;
-constexpr uint64_t kDiagnosticVramBudget615 = 640ULL << 20;   // 0.180.126: 16 clients x (2 + 4) MiB; 168: x (2 + 32) MiB = 544
+constexpr uint64_t kDiagnosticVramMaxRequest615 = 128ULL << 20;   // 0.180.193: client + 72 MiB tree
+constexpr uint64_t kDiagnosticVramBudget615 = 1280ULL << 20;   // 0.180.126: 16 clients x (2 + 4) MiB; 168: x (2 + 32) MiB = 544; 193: x (2 + 72) = 1184
+// shortcut: every client tree covers its whole 28 GiB span up front (~57 MiB of VRAM); allocate the
+// 4 KiB tables on first use when many clients make that reserve matter.
 constexpr uint32_t kDiagnosticVramSlots615 = 40;   // 0.180.125
 
 inline bool diagnosticVramSize615(uint64_t requested,uint64_t used,uint32_t slots,

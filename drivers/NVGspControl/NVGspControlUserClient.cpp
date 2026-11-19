@@ -1,5 +1,6 @@
 #include "NVGspControl.hpp"
 #include "../NVGspCore/NVGspComputePacket615.hpp"
+#include "../NVGspCore/NVGspClientGr615.hpp"
 #include <IOKit/IOLib.h>
 
 #define super IOUserClient
@@ -89,7 +90,7 @@ IOReturn IOAccelNVGspUserClient::clientMemoryForType(
     // 0.180.96: the owned native615 client's caller buffer (owner only).
     // 0.180.97: type 0x80615000 (0x61500000 hit the wide-handle form above).
     // 0.180.101: 0x80615001 + slot = caller allocation `slot` (owner only).
-    if (type > 0x80615000 && type <= 0x80615020 && driver_ && options && memory) {   // 0.180.118: 32 slots
+    if (type > 0x80615000 && type <= 0x80615000 + nvgsp::kClientAllocs615 && driver_ && options && memory) {   // 0.180.118: 32 slots, 193: 64
         IOMemoryDescriptor *d = driver_->client615AllocMemory(this, type - 0x80615001);
         if (!d) return kIOReturnNotFound;
         *options = kIOMapAnywhere;

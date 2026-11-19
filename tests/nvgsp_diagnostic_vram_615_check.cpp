@@ -24,7 +24,7 @@ int main(int argc,char **argv) {
     assert(!heap.insert(at+4096,4096));
     assert(second+size<=end);
     assert(nvgsp::diagnosticVramSize615(4096,0,0,&size) && size==(2ULL<<20));
-    for(uint64_t bad:{0ULL,1ULL,4095ULL,67112960ULL,~0ULL})
+    for(uint64_t bad:{0ULL,1ULL,4095ULL,134221824ULL,~0ULL})
         assert(!nvgsp::diagnosticVramSize615(bad,0,0,&size));
     assert(!nvgsp::diagnosticVramSize615(4096,nvgsp::kDiagnosticVramBudget615,0,&size));
     assert(!nvgsp::diagnosticVramSize615(4096,~0ULL,0,&size));

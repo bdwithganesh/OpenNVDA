@@ -8337,7 +8337,7 @@ IOReturn NVGspControl::pollStatusLocked() {
                     // a fresh fault/late-reply epoch; no old call becomes success.
                     if (gmcMmuFaultPending_)
                         setProperty("NVGspControl-gmc-mmu-fault-cleared-by-boot",true);
-                    gmcMmuFaultPending_=false;
+                    gmcMmuFaultPending_=false;mmuNoticesUnpaired_=0;nvdecRcUnpaired_=0;otherMmuFault_=false;
                     setProperty("NVGspControl-gmc-mmu-fault-pending",false);
                     if (userRpcLatePending_)
                         setProperty("NVGspControl-user-rpc-late-cancelled-by-reset",true);
@@ -8379,10 +8379,12 @@ IOReturn NVGspControl::pollStatusLocked() {
                 summary.function = gmc.command; summary.length = gmc.size;
                 summary.result = gmc.statusOrMaxResponse;
             }
-            if (faultNotice && nvdecFaultAbsorb_) {
+            UInt64 noticeNow = 0;
+            if (faultNotice) clock_get_uptime(&noticeNow);
+            if (faultNotice && nvdecRcUnpaired_ && noticeNow <= nvdecAbsorbUntil_) {
                 // 0.180.192: the notice of an NVDEC fault already attributed to an owned client's
                 // channel (RC 31 on engine 0x13 came first): RC killed only that channel
-                nvdecFaultAbsorb_=false;++mmuFaultEvents_;
+                --nvdecRcUnpaired_;++mmuFaultEvents_;
                 setProperty("NVGspControl-gmc-mmu-fault-notice",assembled,assembledBytes);
                 setProperty("NVGspControl-mmu-fault-events",mmuFaultEvents_,32);
                 setProperty("NVGspControl-nvdec615-fault-notice-absorbed",true);
@@ -8391,6 +8393,7 @@ IOReturn NVGspControl::pollStatusLocked() {
                 summary.function=mmuNotice.command;summary.length=mmuNotice.size;
                 summary.result=0;
             } else if (faultNotice) {
+                nvdecRcUnpaired_=0;++mmuNoticesUnpaired_;   // a stale NVDEC RC never absorbs a later notice
                 gmcMmuFaultPending_=true;++mmuFaultEvents_;
                 setProperty("NVGspControl-gmc-mmu-fault-pending",true);
                 setProperty("NVGspControl-gmc-mmu-fault-serviced",false);
@@ -8560,20 +8563,32 @@ IOReturn NVGspControl::pollStatusLocked() {
             // buffer method). Without this the pending fault blocked every client's healthy() check, the
             // owner's teardown stayed NotReady and shutdown wedged GSP (VM power cycle). RC already killed
             // only that channel, so attribute it and keep everyone else running.
-            // shortcut: a GR fault notice landing between this RC and its own notice would be absorbed
-            // too; acceptable while NVDEC faults come from our own decoder setups only.
-            if (rc[0] == 0x13 && rc[4] == 31 && native615_) {
-                for (UInt32 k = 0; k < nvgsp::kClientSlots615; ++k) {
+            // 0.180.193: paired with notices by count (see mmuNoticesUnpaired_), never clears another
+            // engine's fault.
+            if (rc[4] == 31) {
+                int owner = -1;
+                for (UInt32 k = 0; native615_ && rc[0] == 0x13 && k < nvgsp::kClientSlots615 && owner < 0; ++k) {
                     auto &c = native615_->clientGrs[k];
-                    if (!c.live || !c.nvdecScheduled || (c.nvdecToken & 0xffff) != rc[1]) continue;
-                    c.nvdecFaulted = true;
-                    setProperty("NVGspControl-nvdec615-faulted", k, 32);
-                    if (gmcMmuFaultPending_) {   // its notice came first
-                        gmcMmuFaultPending_ = false;
-                        setProperty("NVGspControl-gmc-mmu-fault-pending", false);
-                        setProperty("NVGspControl-nvdec615-fault-notice-absorbed", true);
-                    } else nvdecFaultAbsorb_ = true;
-                    break;
+                    if (c.live && c.nvdecScheduled && (c.nvdecToken & 0xffff) == rc[1]) owner = int(k);
+                }
+                if (owner < 0) {
+                    otherMmuFault_ = true;
+                    if (mmuNoticesUnpaired_) --mmuNoticesUnpaired_;
+                } else {
+                    native615_->clientGrs[owner].nvdecFaulted = true;
+                    setProperty("NVGspControl-nvdec615-faulted", UInt32(owner), 32);
+                    if (mmuNoticesUnpaired_) {   // its notice came first
+                        if (!--mmuNoticesUnpaired_ && !otherMmuFault_ && gmcMmuFaultPending_) {
+                            gmcMmuFaultPending_ = false;
+                            setProperty("NVGspControl-gmc-mmu-fault-pending", false);
+                            setProperty("NVGspControl-nvdec615-fault-notice-absorbed", true);
+                        }
+                    } else {
+                        UInt64 now = 0, window = 0;
+                        clock_get_uptime(&now);
+                        nanoseconds_to_absolutetime(2000000000ULL, &window);
+                        ++nvdecRcUnpaired_; nvdecAbsorbUntil_ = now + window;
+                    }
                 }
             }
             {   // 0.165.0: when, and whose arena the GPU was in (attribution)

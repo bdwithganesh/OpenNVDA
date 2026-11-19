@@ -86,7 +86,7 @@ IOReturn NVGspControl::nativeIsolation615(UInt32 operation,UInt64 *stage,
             *stage=g.stage;*status=g.status;*passed=false;ulk();return kIOReturnNotReady;
         }
         if(gmcMmuFaultPending_) {
-            gmcMmuFaultPending_=false;
+            gmcMmuFaultPending_=false;mmuNoticesUnpaired_=0;nvdecRcUnpaired_=0;otherMmuFault_=false;
             setProperty("NVGspControl-gmc-mmu-fault-pending",false);
             setProperty("NVGspControl-client615-recover-cleared-attributed-notice",true);
         }
@@ -881,7 +881,18 @@ IOReturn NVGspControl::nativeClientMemory615(const void *owner,UInt32 operation,
         if(kind>7) {ulk();return kIOReturnBadArgument;}
         if(!argument || bytes>nvgsp::kClientAllocMax615) {ulk();return kIOReturnBadArgument;}
         while(slot<nvgsp::kClientAllocs615 && (g.allocLive>>slot&1))++slot;
-        va=(g.userNextVa+0xffff)&~0xffffULL;
+        // 0.180.193: first fit over the live slots (and the NVDEC ring page), 64 KiB aligned; freed
+        // ranges are reused, so a process that keeps opening and closing decoders never runs out
+        const UInt64 rounded=vram ? (bytes+0x1fffff)&~0x1fffffULL : (bytes+0xffff)&~0xffffULL;   // VRAM: 2 MiB below
+        va=(g.userVa+nvgsp::kClientUserBytes615+0xffff)&~0xffffULL;
+        for(bool moved=true;moved && va+rounded<=g.userVa+nvgsp::kClientUserWindow615;) {
+            moved=false;
+            for(UInt32 k=0;k<nvgsp::kClientAllocs615;++k)
+                if((g.allocLive>>k&1) && va<g.allocVa[k]+g.allocBytes[k] && g.allocVa[k]<va+rounded) {
+                    va=(g.allocVa[k]+g.allocBytes[k]+0xffff)&~0xffffULL;moved=true;
+                }
+            if(g.nvdecRingVa && va<g.nvdecRingVa+0x10000 && g.nvdecRingVa<va+rounded) {va=g.nvdecRingVa+0x10000;moved=true;}
+        }
         if(slot==nvgsp::kClientAllocs615 || g.leafChunks+UInt32(bytes>>21)+2>nvgsp::kClientLeafChunks615 ||
            va+bytes>g.userVa+nvgsp::kClientUserWindow615) {ulk();return kIOReturnNoSpace;}
         if(vram) {
@@ -941,7 +952,8 @@ IOReturn NVGspControl::nativeClientMemory615(const void *owner,UInt32 operation,
             return mmuSubmit615(0x1)?kIOReturnSuccess:kIOReturnTimeout;
         }();
         if(r==kIOReturnSuccess) {
-            g.allocVa[slot]=va;g.allocBytes[slot]=bytes;g.allocLive|=1U<<slot;g.userNextVa=va+bytes;
+            g.allocVa[slot]=va;g.allocBytes[slot]=bytes;g.allocLive|=1ULL<<slot;
+            if(va+bytes>g.userNextVa)g.userNextVa=va+bytes;   // high water: bump users (NVDEC ring) stay clear
             out[0]=slot;out[1]=va;out[2]=bytes;
         } else if(vram && !g.allocChunks[slot]) {   // nothing mapped: the range goes back
             lk(__LINE__);vramHeap_.remove(vphys);nativeVram_[client615Slot_][slot]={0,0};ulk();
@@ -957,7 +969,15 @@ IOReturn NVGspControl::nativeClientMemory615(const void *owner,UInt32 operation,
         }();
         if(r==kIOReturnSuccess) {
             // No translation reaches these pages now; a CPU mapping keeps them alive.
-            buffer.release();g.allocLive&=~(1U<<slot);
+            buffer.release();g.allocLive&=~(1ULL<<slot);
+            // 0.180.193: drop the slot's (now zero) leaf records so the next allocation can use them
+            const UInt32 first=g.allocChunk[slot],n=g.allocChunks[slot];
+            if(n && first+n<=g.leafChunks) {
+                for(UInt32 i=first;i+n<g.leafChunks;++i) {g.leafAddress[i]=g.leafAddress[i+n];g.leafCount[i]=g.leafCount[i+n];}
+                g.leafChunks-=n;
+                for(UInt32 k=0;k<nvgsp::kClientAllocs615;++k)if((g.allocLive>>k&1) && g.allocChunk[k]>first)g.allocChunk[k]-=n;
+            }
+            g.allocChunks[slot]=0;
             auto &v=nativeVram_[client615Slot_][slot];   // 0.180.131
             if(v.bytes) {lk(__LINE__);vramHeap_.remove(v.phys);v={0,0};ulk();}
             out[0]=slot;out[1]=g.allocVa[slot];out[2]=g.allocBytes[slot];
@@ -971,7 +991,8 @@ IOReturn NVGspControl::nativeClientMemory615(const void *owner,UInt32 operation,
     }
     native615Busy_=false;
     setProperty("NVGspControl-native615-busy",false);
-    setProperty("NVGspControl-client615-alloc-live",g.allocLive,32);
+    setProperty("NVGspControl-client615-alloc-live",g.allocLive,64);
+    setProperty("NVGspControl-client615-leaf-chunks",g.leafChunks,32);
     setProperty("NVGspControl-client615-alloc-status",UInt32(r),32);
     ulk();return r;
 }
@@ -1242,7 +1263,7 @@ bool NVGspControl::recoverOwnedFault615(UInt32 rcBefore) {
     setProperty("NVGspControl-client615-owned-fault-drains",drains,32);
     setProperty("NVGspControl-client615-owned-fault-attributed",attributed);
     if(attributed) {
-        gmcMmuFaultPending_=false;
+        gmcMmuFaultPending_=false;mmuNoticesUnpaired_=0;nvdecRcUnpaired_=0;otherMmuFault_=false;
         setProperty("NVGspControl-gmc-mmu-fault-pending",false);
         // 0.180.183: RC killed only the faulted channel; rebuild it like after
         // a hang (VAS and allocations kept) so the owner's later work runs.

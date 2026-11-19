@@ -1,5 +1,6 @@
 #include "../drivers/NVGspCore/NVGspExternalVas615.hpp"
 #include "../drivers/NVGspCore/NVGspClientGr615.hpp"
+#include "../drivers/NVGspCore/NVGspDiagnosticVram615.hpp"
 #include <cassert>
 #include <cstdio>
 #include <initializer_list>
@@ -82,7 +83,7 @@ int main() {
   // 0.180.168: 32 PD1 slots; seventeen are accepted now, thirty-three are not
   assert(nvgsp::externalTreeTables615(0x100000000ULL,0x100000000ULL+(4ULL<<30)+4096)==2049);
   assert(nvgsp::externalTreeTables615(0x100000000ULL,0x100000000ULL+(8ULL<<30)+4096)==4097);
-  assert(!nvgsp::externalTreeTables615(0x100000000ULL,0x100000000ULL+(16ULL<<30)+4096));
+  assert(!nvgsp::externalTreeTables615(0x100000000ULL,0x100000000ULL+(32ULL<<30)+4096));   // 64 PD1 slots (0.180.193)
   // the live 0.180.163 client: ring below GR at 0x104000000, 2.5 GiB user +
   // 4 GiB wrap windows (0.180.156 measured lo 0x103ffe000, hi 0x1c5800000
   // with the 512 MiB wrap window)
@@ -104,6 +105,15 @@ int main() {
    assert(nvgsp::externalTreeLeaf615(*p,phi-4096,&leaf) && leaf==p->tableBase+(p->tables-1)*4096+511*8);
    assert(p->upperAddress[2+29]==root+8192+(((plo>>29)+29)&511)*8);
    assert(!nvgsp::externalTreeLeaf615(*p,phi,&leaf));
+   delete p;
+  }
+  // 0.180.193: 16 GiB allocation window + 12 GiB wrap window
+  {
+   const uint64_t plo=0x103ffe000ULL,phi=0x105800000ULL+nvgsp::kClientUserWindow615+nvgsp::kClientWrapWindow615;
+   nvgsp::ExternalTree615 *p=new nvgsp::ExternalTree615();
+   assert(nvgsp::externalTreePlan615(root,plo,phi,p) && p->slots==57 && p->tables==14349);
+   assert(p->treeBytes<=nvgsp::kClientTreeReserve615 && p->treeBytes+(2ULL<<20)<=nvgsp::kDiagnosticVramMaxRequest615);
+   assert(nvgsp::externalTreeLeaf615(*p,phi-4096,&leaf) && leaf==p->tableBase+(p->tables-1)*4096+511*8);
    delete p;
   }
   assert(!nvgsp::externalTreeTables615(0x7fffe00000ULL,0x8000200000ULL));   // crosses a PD2 entry

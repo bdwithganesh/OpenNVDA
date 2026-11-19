@@ -39,7 +39,8 @@ inline bool externalSmallTree615(uint64_t tree,uint64_t va,ExternalSmallTree615 
 // layout is the old one (tables at tree+16 KiB).
 // 0.180.157: 16 PD1 slots (8 GiB of 2 MiB tables) for the 2 GiB wrap window
 // 0.180.168: 32 PD1 slots (16 GiB) for the 12 GiB wrap window (30 slots)
-constexpr uint32_t kExternalTreeMaxSlots615=32,kExternalTreeMaxTables615=256*kExternalTreeMaxSlots615;
+// 0.180.193: 64 PD1 slots (32 GiB) for the 16 GiB allocation window
+constexpr uint32_t kExternalTreeMaxSlots615=64,kExternalTreeMaxTables615=256*kExternalTreeMaxSlots615;
 struct ExternalTree615 {
     uint64_t tree,lo,hi,treeBytes,tableBase;
     uint32_t tables,firstChunk,slots,upperCount;

@@ -153,7 +153,7 @@ IOReturn NVGspControl::recoverOwnedFault615() {
     if(verified) {
         // Software admission follows physical cancellation/teardown, never the
         // fault notice alone. Fresh hardware work must still prove recovery.
-        r.teardownVerified=true;gmcMmuFaultPending_=false;native615Ready_=true;native615Status_=0;
+        r.teardownVerified=true;gmcMmuFaultPending_=false;mmuNoticesUnpaired_=0;nvdecRcUnpaired_=0;otherMmuFault_=false;native615Ready_=true;native615Status_=0;
         setProperty("NVGspControl-recovery615-teardown-verified",true);
         setProperty("NVGspControl-gmc-mmu-fault-pending",false);
         setProperty("NVGspControl-gmc-mmu-fault-serviced",true);

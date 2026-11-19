@@ -113,8 +113,10 @@ constexpr uint64_t kClientUserBytes615=64*1024;
 // 0.180.118: 1 GiB window, 512 MiB allocations, 32 slots (8K render targets,
 // big IOSurfaces); the tree now spans several PD1 slots.
 // 0.180.132: 2.5 GiB window (apps with more than 1 GiB of buffers and textures)
-constexpr uint64_t kClientUserWindow615=2560ULL<<20,kClientAllocMax615=512ULL<<20;
-constexpr uint32_t kClientAllocs615=32,kClientLeafChunks615=2304;
+// 0.180.193: 16 GiB window, 64 slots, first-fit VA reuse: one app can fill the 16 GiB of VRAM and
+// go on in system memory (Metal driver fallback) instead of getting nil textures at 2.5 GiB.
+constexpr uint64_t kClientUserWindow615=16384ULL<<20,kClientAllocMax615=512ULL<<20;
+constexpr uint32_t kClientAllocs615=64,kClientLeafChunks615=10240;
 // 0.180.112: owned clients alive at once (one per process); slot k uses RM
 // handles 0xc0d00300|k<<16 and its own VAS, buffers and GR reservation.
 // 0.180.123 tried 16: the second client then failed at stage 1 (status 81,
@@ -122,7 +124,7 @@ constexpr uint32_t kClientAllocs615=32,kClientLeafChunks615=2304;
 // failing RM call recorded (client615-fail-alloc / -fail-control).
 constexpr uint32_t kClientSlots615=16;
 // 0.180.126: VRAM after the client reservation for its owned page tree
-constexpr uint64_t kClientTreeReserve615=32ULL<<20;   // 0.180.132 (was 4 MiB), 157: 12 MiB, 163: 4 GiB wrap window tree ~13.75 MiB, 168: 12 GiB ~29.2 MiB
+constexpr uint64_t kClientTreeReserve615=72ULL<<20;   // 0.180.132 (was 4 MiB), 157: 12 MiB, 163: 4 GiB wrap window tree ~13.75 MiB, 168: 12 GiB ~29.2 MiB, 193: 16+12 GiB ~57 MiB
 // 0.180.117: caller pages (IOSurfaces, NoCopy buffers) wired and mapped into
 // a window above the allocation window; first fit, leaves found from the VA.
 // 0.180.157: 2 GiB. CoreAnimation keeps ~500 MiB of IOSurface-backed
@@ -147,7 +149,8 @@ struct ClientGrState615 {
     uint64_t scratchVa,scratchPhysical;     // 0.180.98: caller dispatch reuses the scratch window
     uint32_t put,fence,dispatches;          // ring position and last HOST fence after setup
     uint64_t userNextVa,allocVa[kClientAllocs615],allocBytes[kClientAllocs615];
-    uint32_t allocChunk[kClientAllocs615],allocChunks[kClientAllocs615],allocLive;   // allocLive: bit i = slot i mapped
+    uint32_t allocChunk[kClientAllocs615],allocChunks[kClientAllocs615];
+    uint64_t allocLive;   // bit i = slot i mapped (0.180.193: 64 slots)
     uint64_t wrapVa[kClientWraps615],wrapBytes[kClientWraps615],wrapLive[kClientWraps615/64],wrapPages;   // 0.180.117, 157: bitmap words
     uint32_t leafCount[kClientLeafChunks615],leafChunks,mappedPages,privilegedPages;
     uint32_t objects[32],objectCount,freedCount,stage,status,cid,token,vas;   // 0.180.191: 32 (NVDEC0 channel adds 9)

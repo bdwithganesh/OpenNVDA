@@ -592,12 +592,12 @@ private:
     nvgsp::DmaBuffer sysmemFlush_;
     nvgsp::DmaBuffer nativeFaultQueue_, nativeFaultData_, nativeReplayData_;
     nvgsp::DmaBuffer nativeUserDatas_[kClientSlots615_];        // 0.180.96/112: per slot
-    nvgsp::DmaBuffer nativeAllocDatas_[kClientSlots615_][32];   // 0.180.101/107/112, 32 slots 0.180.118
+    nvgsp::DmaBuffer nativeAllocDatas_[kClientSlots615_][64];   // 0.180.193: 64   // 0.180.101/107/112, 32 slots 0.180.118
     // 0.180.131: VRAM-backed caller allocations (selector 47 op 4), kept
     // outside the client state (that is cleared at teardown) so the owner's
     // close returns them to vramHeap_ only after the client's PTEs are gone
     struct NativeVram615 { UInt64 phys, bytes; };
-    NativeVram615 nativeVram_[kClientSlots615_][32] = {};
+    NativeVram615 nativeVram_[kClientSlots615_][64] = {};
     bool displayCommon615_ = false;   // 0.180.133: 0xc0d00073 made by displayProbe615
     bool mmuZero615(UInt64 phys, UInt64 bytes);
     void releaseVram615(UInt32 slot);
@@ -679,7 +679,12 @@ private:
     // 0.41.0: consumed GSP RC_TRIGGERED / MMU_FAULT_QUEUED events.
     UInt32 rcEvents_ = 0;
     UInt32 rcChidLog_[8] = {};   // 0.180.183: chid of the last 8 RC events (index rcEvents_ % 8)
-    bool nvdecFaultAbsorb_ = false;   // 0.180.192: an owned NVDEC channel's RC 31 came before its MMU fault notice
+    // 0.180.193: MMU fault notices carry no engine, so they are paired with RC 31 events by count.
+    // An owned NVDEC channel's fault clears the pending state only when it is the sole unpaired
+    // notice and no other engine faulted in this epoch (fail closed otherwise).
+    UInt32 mmuNoticesUnpaired_ = 0, nvdecRcUnpaired_ = 0;
+    UInt64 nvdecAbsorbUntil_ = 0;   // abs time: an NVDEC RC 31 waits this long for its notice
+    bool otherMmuFault_ = false;
     UInt32 mmuFaultEvents_ = 0;
     UInt32 otherEvents_ = 0;
     // 0.43.0: 2 MiB PTEs mapping VRAM [0,36 MiB) (GOP scanout) at PD0
