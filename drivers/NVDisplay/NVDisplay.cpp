@@ -17,6 +17,12 @@
 // real refresh rate, the native flag and full detailed timing
 // (getTimingInfoForDisplayMode), so IODisplay/WindowServer see real timing.
 //
+// 1.5.0 (bundle NVDisplayFB9; 1.5.1 = NVDisplayFB10, built-in scaled modes): scaled modes on native615. NVGspControl 0.180.200 drives the head's postcomp
+// scaler (nvgsp-scaled-mode), so IOFBScalerInfo is published (downsampling only) and the OS-installed detailed
+// timings with horizontalScaled/verticalScaled above the native raster become modes: WindowServer renders e.g.
+// 5120x2880 ("looks like 2560x1440" HiDPI on the 4K panel) and the head scales it to 3840x2160. The text below
+// is the pre-1.5.0 reasoning, kept for the legacy (non-native615) path.
+//
 // HiDPI / scaled modes -- why no IOFBScalerInfo (kIOFBScalerInfoKey):
 // IOFBScalerInfo tells the OS that the framebuffer has a *hardware* scaler.
 // WindowServer then installs detailed timings with horizontalScaled /
@@ -157,6 +163,9 @@ public:
     IOReturn setGammaTable(UInt32 channelCount, UInt32 dataCount, UInt32 dataWidth, void *data,
                            bool syncToVBL) override;
     bool hasDDCConnect(IOIndex connectIndex) override;
+    // 1.5.0: OS-programmed scaled timings (IOFBScalerInfo path)
+    IOReturn validateDetailedTiming(void *description, IOByteCount descripSize) override;
+    IOReturn setDetailedTimings(OSArray *array) override;
     IOReturn getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IOSelect blockType,
                          IOOptionBits options, UInt8 *data, IOByteCount *length) override;
 
@@ -196,6 +205,18 @@ private:
     // sysmem copied to the VRAM scan-out surface); one fixed mode
     bool fNative615 = false;
     bool nativeFramebuffer615();
+    // 1.5.0: scaled modes installed by setDetailedTimings; mode id = the OS's detailedTimingModeID (__reservedA[0])
+    static constexpr UInt32 kNVMaxScaled = 16;
+    struct ScaledMode {
+        IODisplayModeID id;
+        IODetailedTimingInformationV2 t;
+    };
+    ScaledMode fScaled[kNVMaxScaled] = {};
+    UInt32 fScaledCount = 0, fScaledBuiltin = 0;   // [0, fScaledBuiltin) are ours, the rest the OS installed
+    void addBuiltinScaled();
+    UInt64 fApertureBytes = 0;
+    bool scaledOK(const IODetailedTimingInformationV2 &t);
+    bool scaledForMode(IODisplayModeID mode, IODetailedTimingInformationV2 *out);
     OSData *fEdid = nullptr;
     IOLock *fEdidLock = nullptr;
     // 0.4.0: hardware cursor through NVGspControl (C67A PIO + core
@@ -333,8 +354,10 @@ bool NVDisplay::nativeFramebuffer615() {
     const UInt64 rb = num("NVGspControl-display615-fb-rowbytes");
     OSSafeReleaseNULL(gsp);
     if (!phys || !w || !h || rb < w * 4 || rb * h > bytes || w > 8192 || h > 8192) return false;
-    fAperture = IODeviceMemory::withRange(static_cast<IOPhysicalAddress>(phys), static_cast<IOByteCount>(rb * h));
+    // 1.5.0: the whole buffer (64 MiB from NVGspControl 0.180.200), so scaled modes up to 5120x2880 fit
+    fAperture = IODeviceMemory::withRange(static_cast<IOPhysicalAddress>(phys), static_cast<IOByteCount>(bytes));
     if (!fAperture) return false;
+    fApertureBytes = bytes;
     fWidth = fBootW = static_cast<UInt32>(w);
     fHeight = fBootH = static_cast<UInt32>(h);
     fRowBytes = static_cast<UInt32>(rb);
@@ -436,6 +459,17 @@ haveAperture:
     IOLog("NVDisplay: %ux%u rowBytes %u %s %u Hz\n", fWidth, fHeight, fRowBytes,
           fNative615 ? "native615" : "console", fRefresh);
     setProperty("IOFBGammaWidth", kGammaWidth, 32);          // 0.9.4, read by IOFramebuffer::open
+    // 1.5.0: the head scales a larger scan-out down to the native raster; scaledOK has the real limits
+    if (fNative615 && fApertureBytes >= UInt64(fBootW) * fBootH * 4 * 2) {
+        IODisplayScalerInformation si{};
+        si.scalerFeatures = kIOScaleCanDownSamplePixels;
+        si.maxHorizontalPixels = fBootW * 2;
+        si.maxVerticalPixels = fBootH * 2;
+        if (OSData *d = OSData::withBytes(&si, sizeof(si))) {
+            setProperty(kIOFBScalerInfoKey, d);
+            d->release();
+        }
+    }
     setProperty("IOFBGammaCount", kGammaCount, 32);
     setProperty("IOFBGammaHeaderSize", 0ULL, 32);
     // 0.9.7 candidate: set before IOFramebuffer::start registers the service;
@@ -450,6 +484,7 @@ haveAperture:
         OSSafeReleaseNULL(fAperture);
         return false;
     }
+    addBuiltinScaled();
     // 1.3.0: WindowServer starts about a second after boot and binds each GPU
     // once, with whatever accelerator exists at that moment. Ours only appears
     // after the GSP runtime is up (~40 s), so every boot registered this
@@ -725,6 +760,8 @@ const nvedid::Timing *NVDisplay::nativeTimingLocked() {
 }
 
 static constexpr IODisplayModeID kNVExtraModeBase = 0x100;
+// 1.5.0: built-in scaled ("looks like") modes, ids kNVScaledModeBase + i
+static constexpr IODisplayModeID kNVScaledModeBase = 0x200;
 // 0.180.13: the scan-out allocator in NVGspControl can take 8K surfaces.
 // 30 bpp on 4-lane HBR3 tops out near 864 MHz; DSC modes above that are not
 // advertised until the DSC path is validated.
@@ -1181,7 +1218,13 @@ void NVDisplay::pickDefaultModeLocked() {
 
 IOItemCount NVDisplay::getDisplayModeCount(void) {
     IOItemCount n = 1;
-    if (!fEdidLock || fNative615) return n;   // 0.10.0: native615 runs one mode
+    if (!fEdidLock) return n;
+    if (fNative615) {   // 0.10.0: native615 runs the native raster; 1.5.0: plus the installed scaled modes
+        IOLockLock(fEdidLock);
+        fModeCount = n += fScaledCount;
+        IOLockUnlock(fEdidLock);
+        return n;
+    }
     IOLockLock(fEdidLock);
     nvedid::Info *info = fEdidInfo;
     for (uint32_t i = 0; info && i < info->count; ++i) n += extraModeOKLocked(i);
@@ -1193,11 +1236,12 @@ IOItemCount NVDisplay::getDisplayModeCount(void) {
 IOReturn NVDisplay::getDisplayModes(IODisplayModeID *allDisplayModes) {
     if (!allDisplayModes || !fEdidLock) return kIOReturnBadArgument;
     IOLockLock(fEdidLock);
-    const IOItemCount cap = fNative615 ? 1 : (fModeCount ? fModeCount : 1);
+    const IOItemCount cap = fModeCount ? fModeCount : 1;
     IOItemCount n = 0;
     allDisplayModes[n++] = kNVDisplayMode;
+    for (UInt32 i = 0; fNative615 && i < fScaledCount && n < cap; ++i) allDisplayModes[n++] = fScaled[i].id;
     nvedid::Info *info = fEdidInfo;
-    for (uint32_t i = 0; info && i < info->count && n < cap; ++i)
+    for (uint32_t i = 0; !fNative615 && info && i < info->count && n < cap; ++i)
         if (extraModeOKLocked(i)) allDisplayModes[n++] = kNVExtraModeBase + static_cast<IODisplayModeID>(i);
     IOLockUnlock(fEdidLock);
     return kIOReturnSuccess;
@@ -1207,6 +1251,17 @@ IOReturn NVDisplay::getInformationForDisplayMode(IODisplayModeID displayMode,
                                                  IODisplayModeInformation *info) {
     if (!info) return kIOReturnBadArgument;
     nvedid::Timing t{};
+    IODetailedTimingInformationV2 st{};
+    if (scaledForMode(displayMode, &st)) {   // 1.5.0
+        bzero(info, sizeof(*info));
+        info->nominalWidth = st.horizontalScaled;
+        info->nominalHeight = st.verticalScaled;
+        info->refreshRate = (timingForMode(kNVDisplayMode, &t) && !fRefreshOverride) ? nvedid::refreshFixed16(t)
+                                                                                       : (fRefresh << 16);
+        info->maxDepthIndex = 0;
+        info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag;
+        return kIOReturnSuccess;
+    }
     const bool haveTiming = timingForMode(displayMode, &t);
     if (!nvModeOK(displayMode)) {
         if (!haveTiming) return kIOReturnBadArgument;
@@ -1234,6 +1289,23 @@ IOReturn NVDisplay::getTimingInfoForDisplayMode(IODisplayModeID displayMode,
                                                 IOTimingInformation *info) {
     if (!info) return kIOReturnBadArgument;
     nvedid::Timing t{};
+    IODetailedTimingInformationV2 st{};
+    if (scaledForMode(displayMode, &st)) {   // 1.5.0: the installed timing as the OS gave it
+        if (displayMode >= kNVScaledModeBase && displayMode < kNVScaledModeBase + 0x100) {
+            // ours: the native timing, scanned out from the larger surface
+            const IOReturn r = getTimingInfoForDisplayMode(kNVDisplayMode, info);
+            if (r != kIOReturnSuccess) return r;
+            info->detailedInfo.v2.horizontalScaled = st.horizontalScaled;
+            info->detailedInfo.v2.verticalScaled = st.verticalScaled;
+            if (info->flags & kIODetailedTimingValid) info->flags |= kIOScalingInfoValid;
+            return kIOReturnSuccess;
+        }
+        bzero(info, sizeof(*info));
+        info->appleTimingID = kIOTimingIDInvalid;
+        info->detailedInfo.v2 = st;
+        info->flags = kIODetailedTimingValid | kIOScalingInfoValid;
+        return kIOReturnSuccess;
+    }
     const bool haveTiming = timingForMode(displayMode, &t);
     if (!nvModeOK(displayMode) && !haveTiming) return kIOReturnBadArgument;
     bzero(info, sizeof(*info));
@@ -1264,7 +1336,13 @@ UInt64 NVDisplay::getPixelFormatsForDisplayMode(IODisplayModeID, IOIndex) { retu
 IOReturn NVDisplay::getPixelInformation(IODisplayModeID displayMode, IOIndex depth,
                                         IOPixelAperture aperture, IOPixelInformation *pixelInfo) {
     nvedid::Timing mt{};
-    const bool haveTiming = nvModeOK(displayMode) ? false : timingForMode(displayMode, &mt);
+    IODetailedTimingInformationV2 st{};
+    bool haveTiming = nvModeOK(displayMode) ? false : timingForMode(displayMode, &mt);
+    if (!haveTiming && scaledForMode(displayMode, &st)) {   // 1.5.0: WindowServer draws the scaled size
+        mt.hActive = st.horizontalScaled;
+        mt.vActive = st.verticalScaled;
+        haveTiming = true;
+    }
     if ((!nvModeOK(displayMode) && !haveTiming) || depth != 0 ||
         aperture != kIOFBSystemAperture || !pixelInfo)
         return kIOReturnBadArgument;
@@ -1300,6 +1378,23 @@ IOReturn NVDisplay::getCurrentDisplayMode(IODisplayModeID *displayMode, IOIndex 
 // Mode 0/1 back to the firmware timing uses the same path once we left it.
 IOReturn NVDisplay::setDisplayMode(IODisplayModeID displayMode, IOIndex depth) {
     if (depth != 0) return kIOReturnUnsupported;
+    IODetailedTimingInformationV2 st{};
+    const bool scaled = scaledForMode(displayMode, &st);
+    if (fNative615 && (scaled || nvModeOK(displayMode))) {   // 1.5.0: scan-out size through the head scaler
+        UInt32 wh[2] = {scaled ? st.horizontalScaled : fBootW, scaled ? st.verticalScaled : fBootH};
+        if (wh[0] != fWidth || wh[1] != fHeight) {
+            const IOReturn r = gspCall("nvgsp-scaled-mode", wh, nullptr, nullptr);
+            setProperty("NVDisplay-scaled-result", static_cast<UInt32>(r), 32);
+            IOLog("NVDisplay: mode 0x%x scan-out %ux%u -> 0x%x\n", static_cast<unsigned>(displayMode), wh[0], wh[1], r);
+            if (r != kIOReturnSuccess) return kIOReturnIOError;
+            fWidth = wh[0];
+            fHeight = wh[1];
+            setProperty("NVDisplay-mode", (UInt64(fWidth) << 32) | fHeight, 64);
+        }
+        fCurMode = displayMode;
+        fCurDepth = depth;
+        return kIOReturnSuccess;
+    }
     nvedid::Timing t{};
     const bool haveTiming = timingForMode(displayMode, &t);
     if (!nvModeOK(displayMode) && !haveTiming) return kIOReturnUnsupported;
@@ -1325,6 +1420,87 @@ IOReturn NVDisplay::setDisplayMode(IODisplayModeID displayMode, IOIndex depth) {
     }
     fCurMode = displayMode;
     fCurDepth = depth;
+    return kIOReturnSuccess;
+}
+
+// 1.5.0: Mac-style HiDPI sizes for the native raster, as 2x backing stores ("looks like" W/2 x H/2): 2560x1440
+// and 2304x1296 on a 4K panel. Larger ones (3008x1692 = 6016x3384) do not fit the 64 MiB framebuffer.
+void NVDisplay::addBuiltinScaled() {
+    static const UInt16 kLooksLike[][2] = {{2560, 1440}, {2304, 1296}};
+    UInt32 n = 0;
+    for (const auto &l : kLooksLike) {
+        IODetailedTimingInformationV2 t{};
+        t.horizontalActive = fBootW;
+        t.verticalActive = fBootH;
+        // same aspect as the panel: the height follows the width
+        t.horizontalScaled = UInt32(l[0]) * 2 * fBootW / 3840;
+        t.verticalScaled = UInt32(l[1]) * 2 * fBootH / 2160;
+        if (n < kNVMaxScaled && scaledOK(t) && t.horizontalScaled > fBootW) {
+            fScaled[n] = {kNVScaledModeBase + static_cast<IODisplayModeID>(n), t};
+            ++n;
+        }
+    }
+    fScaledBuiltin = fScaledCount = n;
+    setProperty("NVDisplay-scaled-modes", n, 32);
+}
+
+// 1.5.0: what NVGspControl 0.180.200 can scan out: the native timing (scaled to it by the head), a scan-out
+// at least the native raster and at most twice it per axis, width a multiple of 16, inside the aperture.
+bool NVDisplay::scaledOK(const IODetailedTimingInformationV2 &t) {
+    const UInt32 w = t.horizontalScaled, h = t.verticalScaled;
+    return fNative615 && w && h && t.horizontalActive == fBootW && t.verticalActive == fBootH && w >= fBootW &&
+           h >= fBootH && w <= 2 * fBootW && h <= 2 * fBootH && !(w & 15) && UInt64(w) * h * 4 <= fApertureBytes &&
+           !t.horizontalScaledInset && !t.verticalScaledInset && !(t.scalerFlags & kIOScaleRotateFlags);
+}
+
+bool NVDisplay::scaledForMode(IODisplayModeID mode, IODetailedTimingInformationV2 *out) {
+    if (!fEdidLock || !fNative615 || nvModeOK(mode)) return false;
+    bool found = false;
+    IOLockLock(fEdidLock);
+    for (UInt32 i = 0; i < fScaledCount && !found; ++i)
+        if (fScaled[i].id == mode) {
+            if (out) *out = fScaled[i].t;
+            found = true;
+        }
+    IOLockUnlock(fEdidLock);
+    return found;
+}
+
+IOReturn NVDisplay::validateDetailedTiming(void *description, IOByteCount descripSize) {
+    if (!fNative615) return IOFramebuffer::validateDetailedTiming(description, descripSize);
+    IODetailedTimingInformationV2 *t = nullptr;
+    if (description && descripSize == sizeof(IODetailedTimingInformationV2))
+        t = static_cast<IODetailedTimingInformationV2 *>(description);
+    else if (description && descripSize == sizeof(IOFBDisplayModeDescription))
+        t = &static_cast<IOFBDisplayModeDescription *>(description)->timingInfo.detailedInfo.v2;
+    if (!t) return kIOReturnBadArgument;
+    const bool ok = scaledOK(*t);
+    IOLog("NVDisplay: validate %ux%u on %ux%u -> %s\n", t->horizontalScaled, t->verticalScaled,
+          t->horizontalActive, t->verticalActive, ok ? "ok" : "unsupported");
+    return ok ? kIOReturnSuccess : kIOReturnUnsupportedMode;
+}
+
+IOReturn NVDisplay::setDetailedTimings(OSArray *array) {
+    if (!fNative615) return IOFramebuffer::setDetailedTimings(array);
+    if (!array || !fEdidLock) return kIOReturnBadArgument;
+    ScaledMode keep[kNVMaxScaled] = {};
+    UInt32 n = 0;
+    for (unsigned i = 0; i < array->getCount() && n < kNVMaxScaled; ++i) {
+        OSData *d = OSDynamicCast(OSData, array->getObject(i));
+        if (!d || d->getLength() < sizeof(IODetailedTimingInformationV2)) continue;
+        IODetailedTimingInformationV2 t{};
+        __builtin_memcpy(&t, d->getBytesNoCopy(), sizeof(t));
+        const IODisplayModeID id = static_cast<IODisplayModeID>(t.__reservedA[0]);   // detailedTimingModeID
+        const bool clash = nvModeOK(id) || (id >= kNVExtraModeBase && id < kNVScaledModeBase + 0x100);
+        if (!clash && scaledOK(t)) keep[n++] = {id, t};
+    }
+    IOLockLock(fEdidLock);
+    UInt32 total = fScaledBuiltin;
+    for (UInt32 i = 0; i < n && total < kNVMaxScaled; ++i) fScaled[total++] = keep[i];
+    fScaledCount = total;
+    IOLockUnlock(fEdidLock);
+    setProperty("NVDisplay-scaled-modes", total, 32);
+    IOLog("NVDisplay: %u of %u installed timings are scaled modes\n", n, array->getCount());
     return kIOReturnSuccess;
 }
 

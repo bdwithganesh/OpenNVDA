@@ -20,6 +20,7 @@ H_INST, H_COREPB, H_WNDPB, H_CURSURF = 0xc0d0d040, 0xc0d0d041, 0xc0d0d042, 0xc0d
 ISO, CURS_DMA, OLUT_DMA, ILUT_DMA, SYS_DMA = 0xc0d0d001, 0xc0d0d010, 0xc0d0d006, 0xc0d0d007, 0xc0d0d008   # cursor 0xc0d0d002 collided with OLUT in RAMHT
 DISPLAY = 0x200
 FULL, LUT = 0x3dc000000, 0x3de000000     # top of the kernel diagnostic VRAM range
+SCALED = 0x3d2000000   # 2026-11-19: two 64 MiB scaled scan-out buffers (5120x2880 "looks like" modes, NVGspControl 0.180.200)
 OLUT_OFF, LUT_LIMIT = 0x2100, 0x4fff     # head OLUT table inside the LUT surface (256-aligned)
 W, H = 3840, 2160
 CURS_USER = 0x690000 + 72 * 0x1000
@@ -173,6 +174,7 @@ if RESUME:
     if os.path.exists('/Library/NativeDriverLab/display/state/disp615.json'):
         sys.exit('resume: bring-up already complete')
     inst, corepb = partial['inst'], partial['core_pb']
+    scaled_ok = partial.get('scaled_reserved', False)
     DISPLAY = partial.get('display', DISPLAY)
     if not (isinstance(inst, int) and isinstance(corepb, int) and inst > 0 and corepb > 0):
         sys.exit('resume: bad partial state')
@@ -193,6 +195,7 @@ else:
     DISPLAY = dps[0]
     print('display 0x%x (connected 0x%x)' % (DISPLAY, conn))
     print('reserve display VRAM', d615('reserve', 34, FULL))   # FULL (32 MiB) + LUT, 0.180.138
+    scaled_ok = d615('reserve', 128, SCALED).get('kr') == '0x0'   # before Metal fills the heap
     # 2026-11-19: nvdisp615-boot.sh starts this in parallel with the first Metal client (which builds the
     # maintenance channel the CE frame copy needs). Everything above leaves the panel alone; wait here, before the
     # display root and the DP link take the panel from the boot screen, so it stays up until the first frame is ready.
@@ -210,7 +213,8 @@ else:
     corepb = vram(H_COREPB, 0x1000, 0x1000)
     channel(CORE, 0xc77d, corepb, 40)
     # 2026-11-17: resumable from here (hotplug-watch.sh runs --resume on plug)
-    json.dump({'inst': inst, 'core_pb': corepb, 'source': source, 'display': DISPLAY}, open(PARTIAL, 'w'), indent=1)
+    json.dump({'inst': inst, 'core_pb': corepb, 'source': source, 'display': DISPLAY, 'scaled_reserved': scaled_ok},
+              open(PARTIAL, 'w'), indent=1)
 # 2. DP link
 print('manual dp', ctrl(0x731365, bytes(4))[0])
 p = bytearray(80); struct.pack_into('<I', p, 4, DISPLAY)
@@ -340,10 +344,13 @@ lines = [d615('ctrl', COMMON, 0x730104, '00' * 20).get('params', '')[16:24] for 
 print('scanline samples', lines, 'except core/wnd', hex(rd(0x611020)[0]), hex(rd(0x61102c)[0]))
 if source == 'desktop':
     print('fb copy 60 Hz', d615('fbcopy', 2, FULL, pitch, H))
+    # scaled modes (NVDisplay picks them; kernel op 13 switches) need the core push buffer and the reserved buffers
+    if scaled_ok:
+        print('scaled scan-out buffers', d615('scaled', corepb, SCALED, SCALED + (64 << 20)))
 print('register cursor for NVDisplay', d615('native', curs, CURS_USER))   # 0.180.141
 json.dump({'inst': inst, 'core_pb': corepb, 'wnd_pb': wndpb, 'cursor_surface': curs, 'lut': LUT,
            'surface_dma': surf_dma, 'surface_offset': surf_off, 'pitch': pitch, 'source': source,
-           'sor_armed': sor, 'display': DISPLAY, 'sor': SOR}, open('/Library/NativeDriverLab/display/state/disp615.json', 'w'), indent=1)
+           'sor_armed': sor, 'display': DISPLAY, 'sor': SOR, 'scaled': SCALED if scaled_ok else 0}, open('/Library/NativeDriverLab/display/state/disp615.json', 'w'), indent=1)
 if os.path.exists(PARTIAL):
     os.remove(PARTIAL)
 print('done in %.1f s, source %s' % (time.time() - t0, source))

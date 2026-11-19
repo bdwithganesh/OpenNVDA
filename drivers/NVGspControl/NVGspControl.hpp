@@ -181,6 +181,14 @@ public:
     bool displayFlipPending615_ = false, displayDblStop615_ = false;
     bool displayPushFlip615(UInt64 surface);   // caller holds native615Busy_
     bool displayFlipLatched615();
+    // 0.180.200: scaled scan-out ("looks like" HiDPI). The head's postcomp scaler takes a W x H window/viewport down
+    // to the native raster; op 12 registers the core push buffer and two 64 MiB VRAM buffers for the scaled frame.
+    UInt64 displayCorePb615_ = 0, displayScaledFront615_ = 0, displayScaledBack615_ = 0;
+    UInt64 displayNativeFront615_ = 0, displayNativeBack615_ = 0;
+    UInt32 displayNativePitch615_ = 0, displayNativeLines615_ = 0, displayModeW615_ = 0, displayModeH615_ = 0;
+    UInt32 displayPendingW615_ = 0, displayPendingH615_ = 0;   // 0.180.201: mode set before op 11/12
+    bool displayPush615(UInt32 user, UInt64 pb, const UInt32 *mv, UInt32 n);   // caller holds native615Busy_
+    IOReturn displayScaledMode615(UInt32 w, UInt32 h);
     // 0.180.197: display pipe flips on the copy engine (pipeFlip615): WindowServer surfaces mapped
     // into the maintenance VAS at pipeVa615_, kPipeSlots615 LRU slots, PTEs kept until evicted
     static constexpr UInt32 kPipeSlots615 = 4;

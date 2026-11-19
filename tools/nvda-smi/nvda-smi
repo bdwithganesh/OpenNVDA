@@ -19,7 +19,9 @@ LOG_GLOBS = ('/Library/NativeDriverLab/autogpu/log-*.txt',
              '/Library/NativeDriverLab/display/hotplug.log')
 DAEMONS = ('local.macosdevicelab.autogpu', 'org.local.nvdisp615', 'org.local.nvdisphotplug')
 BUNDLES = ('org.local.macosdevicelab.NVGspControl', 'org.local.macosdevicelab.NVAccelerator15',
-           'org.local.macosdevicelab.NVDisplayFB8')
+           'org.local.macosdevicelab.NVDisplayFB10')
+# every display rebuild needs a new bundle id (approval is per cdhash), so accept any NVDisplayFB<N>
+DISPLAY_RE = re.compile(r'org\.local\.macosdevicelab\.NVDisplayFB\d+')
 # AD103 board, measured with tools/display/portmap.py (GSP-RM GET_CONNECTOR_DATA / OR_GET_INFO)
 PORTS = {0x2000: 'DP-0', 0x4000: 'DP-0 (DP++ HDMI/DVI)', 0x800: 'DP-1', 0x1000: 'DP-1 (DP++ HDMI/DVI)',
          0x200: 'DP-2', 0x400: 'DP-2 (DP++ HDMI/DVI)', 0x100: 'HDMI-0'}
@@ -88,7 +90,7 @@ def summary(p):
     temp, ps = num(p, 'gpu-temp-mC'), num(p, 'perf-pstate')
     total = num(p, 'static-fb-bytes') or num(p, 'fb-length')
     did = num(p, 'dp-display') or 0
-    w, h = num(p, 'display615-fb-width'), num(p, 'display615-fb-height')
+    w, h = num(p, 'display615-mode-w') or num(p, 'display615-fb-width'), num(p, 'display615-mode-h') or num(p, 'display615-fb-height')
     line = '+' + '-' * 78 + '+'
     print(time.strftime('%a %b %d %H:%M:%S %Y'))
     print(line)
@@ -175,6 +177,9 @@ def doctor(p):
         print('[%s] %s%s' % ('PASS' if ok else 'FAIL', name, '' if ok else '  -> ' + hint))
     loaded = run('/usr/bin/kmutil', 'showloaded', '--list-only').decode(errors='replace')
     for b in BUNDLES:
+        if b == BUNDLES[2]:
+            m = DISPLAY_RE.search(loaded)
+            b = m.group(0) if m else b
         check('kext %s loaded' % b, b in loaded,
               'AuxKC kexts need approval; see perf/auxrebuild.sh' if 'NVGsp' not in b else 'check the OpenCore Kernel/Add entry')
     check('GPU firmware up (native615-ready)', bool(num(p, 'native615-ready')), 'see nvda-smi logs (autogpu)')

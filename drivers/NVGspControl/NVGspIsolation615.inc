@@ -1891,6 +1891,9 @@ IOReturn NVGspControl::displayEdid615(UInt32 displayId, UInt64 out[3]) {
 //   op 11 (0.180.181) double-buffered scan-out: b = second VRAM surface (op 8
 //         reserved, same size as the op 7 one), payload = u64 window 0
 //         push buffer, u32 window 0 USER (put) offset; a = 0 back to one buffer.
+//   op 12 (0.180.200) scaled scan-out buffers: payload = u64 core push buffer, u64 scaled front, u64 scaled back
+//         (64 MiB each, op 8 reserved).
+//   op 13 (0.180.200) scan-out size: a = width, b = height (native = 1:1; larger = head postcomp downscale).
 //   op 8  (0.180.138) reserve a MiB of VRAM at b (diagnostic range) in the
 //         client VRAM heap so no Metal allocation lands on a display surface.
 //   op 5  (0.180.136) internal display control a with payload as params on
@@ -1902,6 +1905,11 @@ IOReturn NVGspControl::displayTransport615(const UInt8 *in, UInt32 inBytes, UInt
     __builtin_memcpy(&op,in,4);__builtin_memcpy(&a,in+4,4);__builtin_memcpy(&b,in+8,8);
     const UInt8 *payload=in+16;const UInt32 payloadBytes=inBytes-16;
     const UInt32 capacity=*outBytes;*outBytes=4;
+    if(op==13) {   // takes native615Busy_ itself
+        const IOReturn mr=b>>32 ? kIOReturnBadArgument : displayScaledMode615(a,UInt32(b));
+        const UInt32 st=UInt32(mr);__builtin_memcpy(out,&st,4);
+        return mr;
+    }
     UInt32 status=0;
     lk(__LINE__);
     // 0.180.167: short holders (display copy tick, connect poll, Metal wraps,
@@ -1950,7 +1958,8 @@ IOReturn NVGspControl::displayTransport615(const UInt8 *in, UInt32 inBytes, UInt
         if(a && a<=64 && capacity>=20) {
             const UInt64 bytes=UInt64(a)<<20;
             const bool fill=(b&1)!=0;   // 0.180.141: the pattern only on request
-            if(displayFb615_ && displayFb615_->getLength()!=bytes) {
+            // 0.180.200: never shrink: NVDisplay maps this buffer as WindowServer's aperture at its start
+            if(displayFb615_ && displayFb615_->getLength()<bytes) {
                 displayFb615_->complete();displayFb615_->release();displayFb615_=nullptr;
             }
             if(!displayFb615_) {
@@ -2020,6 +2029,10 @@ IOReturn NVGspControl::displayTransport615(const UInt8 *in, UInt32 inBytes, UInt
         lk(__LINE__);
         const UInt64 bytes=UInt64(displayCopyPitch615_)*displayCopyLines615_,primary=displayCopyDst615_;
         const bool on=displayBack615_!=0;
+        // 0.180.201: while a scaled mode is on, b (sized for the native raster) stays the native back buffer
+        const bool scaled=displayModeW615_!=0;
+        const UInt64 nativeBack=b;
+        if(scaled && b)b=displayScaledBack615_;
         ulk();
         r=kIOReturnBadArgument;
         if(a==0) {lk(__LINE__);displayDblStop615_=on;ulk();r=kIOReturnSuccess;}
@@ -2028,10 +2041,34 @@ IOReturn NVGspControl::displayTransport615(const UInt8 *in, UInt32 inBytes, UInt
                 b>=start && b+bytes<=end && (b+bytes<=primary || b>=primary+bytes)) {
             lk(__LINE__);
             displayWndPb615_=pb;displayWndUser615_=user;displayFront615_=primary;displayBack615_=b;
+            if(displayNativePitch615_)displayNativeBack615_=nativeBack;   // 0.180.201
             displayFlipPending615_=displayDblStop615_=false;
             displayPrevFirst615_=0;displayPrevLast615_=displayCopyLines615_;   // the back buffer holds nothing yet
             setProperty("NVGspControl-display615-dblbuf",b,64);ulk();
             r=kIOReturnSuccess;
+        }
+    } else if(op==12) {   // 0.180.200: register the core push buffer and the scaled scan-out buffers
+        UInt64 v[3]={0,0,0},start=0,end=0;
+        if(payloadBytes>=24)__builtin_memcpy(v,payload,24);
+        constexpr UInt64 kScaled=64ULL<<20;
+        auto inRange=[&](UInt64 at,UInt64 n) {return at>=start && at+n<=end && at+n>at;};
+        auto apart=[&](UInt64 x,UInt64 y,UInt64 ny) {return x+kScaled<=y || x>=y+ny;};
+        lk(__LINE__);
+        const UInt64 nf=displayNativeFront615_ ? displayNativeFront615_ : displayCopyDst615_;
+        const UInt64 nb=displayNativeFront615_ ? displayNativeBack615_ : displayBack615_;
+        const UInt64 ncopy=UInt64(displayCopyPitch615_)*displayCopyLines615_;
+        ulk();
+        r=kIOReturnBadArgument;
+        if(v[0] && !(v[0]&0xfff) && !(v[1]&0xfffff) && !(v[2]&0xfffff) && nf && ncopy &&
+           v[0]+0x1000<=gmcConfig_.fbBytes &&   // the RM-allocated core push buffer, as op 11's
+           nvgsp::diagnosticVramBounds615(gmcConfig_,&start,&end) &&
+           inRange(v[1],kScaled) && inRange(v[2],kScaled) && apart(v[1],v[2],kScaled) &&
+           apart(v[1],nf,ncopy) && apart(v[2],nf,ncopy) && (!nb || (apart(v[1],nb,ncopy) && apart(v[2],nb,ncopy)))) {
+            lk(__LINE__);
+            displayCorePb615_=v[0];displayScaledFront615_=v[1];displayScaledBack615_=v[2];
+            setProperty("NVGspControl-display615-scaled-front",v[1],64);
+            setProperty("NVGspControl-display615-scaled-back",v[2],64);
+            ulk();r=kIOReturnSuccess;
         }
     } else if(op==10) {   // 0.180.141: register the head-0 cursor for NVDisplay
         UInt64 surf=0;UInt32 user=0;
@@ -2103,7 +2140,14 @@ IOReturn NVGspControl::displayTransport615(const UInt8 *in, UInt32 inBytes, UInt
     lk(__LINE__);
     native615Busy_=false;setProperty("NVGspControl-native615-busy",false);
     setProperty("NVGspControl-display615-transport-last",op,32);
-    ulk();return r;
+    const UInt32 pw=(op==11 || op==12) && r==kIOReturnSuccess ? displayPendingW615_ : 0,ph=displayPendingH615_;
+    if(pw)displayPendingW615_=displayPendingH615_=0;
+    ulk();
+    if(pw) {   // 0.180.201: the mode WindowServer asked for before the display path existed
+        const IOReturn mr=displayScaledMode615(pw,ph);
+        setProperty("NVGspControl-display615-mode-pending-result",UInt32(mr),32);
+    }
+    return r;
 }
 
 
@@ -2297,6 +2341,9 @@ void NVGspControl::displayCopyTick615() {
     if(!displayCopyOn615_ || native615Stopping_) {ulk();return;}
     const UInt32 pitch=displayCopyPitch615_,lines=displayCopyLines615_;
     const bool inflight=displayCopyInflight615_,flipWait=displayFlipPending615_;   // 0.180.181
+    // 0.180.201: WindowServer already draws a pending scaled mode; copying it at the native pitch would show a
+    // sheared frame until the mode is applied, so keep the last frame instead
+    const bool pending=displayPendingW615_!=0;
     ulk();
     // damage: FNV-style hash of each band (CPU only; no GPU, no busy)
     UInt32 dirtyFirst=~0U,dirtyLast=0;
@@ -2308,7 +2355,7 @@ void NVGspControl::displayCopyTick615() {
     UInt64 pipeNs=0;
     if(pipePresentAt615_)absolutetime_to_nanoseconds(mach_absolute_time()-pipePresentAt615_,&pipeNs);
     const bool pipeActive=pipePresentAt615_ && pipeNs<400000000ULL;
-    if(!inflight && !flipWait && !pipeActive && displayFb615_ && pitch && lines && bandLines) {
+    if(!inflight && !flipWait && !pipeActive && !pending && displayFb615_ && pitch && lines && bandLines) {
         const auto *px=static_cast<const UInt64 *>(displayFb615_->getBytesNoCopy());
         for(UInt32 b=0;b<kDisplayBands615;++b) {
             const UInt32 l0=b*bandLines;if(l0>=lines)break;
@@ -2480,15 +2527,140 @@ bool NVGspControl::displayFlipLatched615() {
     return done;
 }
 
+// 0.180.200: push n (method, value) pairs into a display channel and wait until it fetched them
+// (same jump-to-0 wrap as displayPushFlip615). Caller holds native615Busy_.
+bool NVGspControl::displayPush615(UInt32 user,UInt64 pb,const UInt32 *mv,UInt32 n) {
+    if(!user || !pb || !mv || !n || n>48)return false;
+    IOMemoryMap *bm=sharedBar0Map(pci_);
+    bool ok=bm && bm->getLength()>=0x700000;
+    UInt32 put=0;
+    if(ok) {Bar0Io io{bm};ok=io.read(user,&put) && !(put&3) && put<0x1000;}
+    UInt32 base=put;const UInt32 bytes=n*8;
+    if(ok && base+bytes+4>0x1000) {UInt32 jump=0x20000000U;ok=vramAccess(pb+base,&jump,1,true,true)==kIOReturnSuccess;base=0;}
+    UInt32 w[96];
+    for(UInt32 i=0;i<n;++i) {w[2*i]=(1U<<18)|mv[2*i];w[2*i+1]=mv[2*i+1];}
+    if(ok)ok=vramAccess(pb+base,w,2*n,true,true)==kIOReturnSuccess;
+    if(ok) {Bar0Io io{bm};ok=io.write(user,base+bytes);}
+    bool fetched=false;
+    for(UInt32 i=0;ok && !fetched && i<100;++i) {
+        Bar0Io io{bm};UInt32 get=~0U;
+        fetched=io.read(user+4,&get) && get==base+bytes;
+        if(!fetched)IOSleep(1);
+    }
+    if(bm)bm->release();
+    return ok && fetched;
+}
+
+// 0.180.200: switch head 0 between the native raster and a scaled W x H scan-out. The window scans a W x H
+// surface unscaled; the head viewport takes W x H in and the postcomp scaler outputs the native raster (the window
+// input scaler refuses any scaling with exception 0x2c, see tools/display/scaler_test.py). The copy/flip path
+// moves to the registered scaled VRAM buffers. Both buffers and WindowServer's sysmem framebuffer start black.
+// shortcut: userland (hotplug-watch olut_kick) also pushes core methods without this lock; a gamma kick during a
+// mode switch could interleave. Move the OLUT kick into the kernel if that ever shows up.
+IOReturn NVGspControl::displayScaledMode615(UInt32 w,UInt32 h) {
+    auto *s=native615_;
+    lk(__LINE__);
+    if(!displayNativePitch615_ && displayCopyPitch615_) {   // first call: remember the native layout
+        displayNativeFront615_=displayCopyDst615_;displayNativeBack615_=displayBack615_;
+        displayNativePitch615_=displayCopyPitch615_;displayNativeLines615_=displayCopyLines615_;
+    }
+    const UInt32 nw=displayNativePitch615_/4,nh=displayNativeLines615_;
+    const bool native=w==nw && h==nh;
+    const bool known=s && displayCorePb615_ && displayWndPb615_ && displayWndUser615_ && displayFb615_ && nw && nh &&
+        displayScaledFront615_ && displayScaledBack615_;
+    const UInt32 curW=displayModeW615_ ? displayModeW615_ : nw,curH=displayModeH615_ ? displayModeH615_ : nh;
+    ulk();
+    // 0.180.201: at boot WindowServer sets its saved (scaled) mode before disp_all registered the buffers (op 12)
+    // and the window channel (op 11); keep it and apply it when those arrive (end of displayTransport615).
+    if(!known) {
+        if(!displayFb615_ || !w || !h || w>8192 || h>8192 || UInt64(w)*4*h>displayFb615_->getLength())return kIOReturnNotReady;
+        lk(__LINE__);displayPendingW615_=w;displayPendingH615_=h;
+        setProperty("NVGspControl-display615-mode-pending",(UInt64(w)<<32)|h,64);ulk();
+        return kIOReturnSuccess;
+    }
+    const UInt64 bytes=UInt64(w)*4*h;
+    if(!native && (w<nw || h<nh || w>2*nw || h>2*nh || (w&15) || bytes>(64ULL<<20) || bytes>displayFb615_->getLength()))
+        return kIOReturnUnsupported;
+    if(w==curW && h==curH)return kIOReturnSuccess;
+    // own native615Busy_ with no copy in flight and no flip pending (as pipeFlip615 does)
+    UInt64 deadline=0;clock_interval_to_deadline(300,kMillisecondScale,&deadline);
+    for(;;) {
+        bool got=false;
+        lk(__LINE__);
+        if(native615Stopping_ || !native615Ready_ || sleeping_ || resetBusy_ || gmcMmuFaultPending_ || userRpcLatePending_ ||
+           postInitPhase_!=27 || !s->mmu.live) {ulk();return kIOReturnNotReady;}
+        if(!native615Busy_ && !displayCopyInflight615_) native615Busy_=got=true;
+        ulk();
+        if(got) {
+            if(!displayFlipPending615_)break;
+            if(displayFlipLatched615()) {
+                lk(__LINE__);
+                const UInt64 shown=displayBack615_;displayBack615_=displayFront615_;displayFront615_=shown;
+                displayFlipPending615_=false;++displayFlips615_;ulk();
+                break;
+            }
+            lk(__LINE__);native615Busy_=false;ulk();
+        }
+        if(mach_absolute_time()>deadline)return kIOReturnBusy;
+        IOSleep(1);
+    }
+    const bool dbl=displayBack615_!=0;
+    const UInt64 front=native ? displayNativeFront615_ : displayScaledFront615_;
+    const UInt64 back=native ? displayNativeBack615_ : (dbl ? displayScaledBack615_ : 0);
+    const UInt32 pitch=w*4;
+    // black: WindowServer redraws the whole framebuffer after the mode set
+    bzero(displayFb615_->getBytesNoCopy(),size_t(bytes));
+    lk(__LINE__);
+    displayCopyPitch615_=pitch;displayCopyLines615_=h;displayBandsValid615_=false;
+    displayPendFirst615_=~0U;displayPendLast615_=0;displayPrevFirst615_=0;displayPrevLast615_=h;
+    displayCopyDst615_=back ? back : front;
+    ulk();
+    bool ok=!back || displayFbCopy615(true);
+    lk(__LINE__);displayCopyDst615_=front;ulk();
+    ok=ok && displayFbCopy615(true);
+    // core: window 0 usage bounds (nvkms fetch formula, scale 1.0), head max output scale, viewport in/out
+    const UInt32 sh=native ? 0x400 : (w*1024+nw-1)/nw,sv=native ? 0x400 : (h*1024+nh-1)/nh;
+    const UInt32 core[]={0x1010,0x10110000U|(w+14+8),0x202c,sh|sv<<16,0x204c,w|h<<16,0x2058,nw|nh<<16,
+                         0x218,0,0x21c,0,0x200,1};
+    const UInt32 wnd[]={0x224,w|h<<16,0x230,pitch>>6,0x298,w|h<<16,0x2a4,w|h<<16,0x260,UInt32(front>>8),0x200,1};
+    const bool coreOk=ok && displayPush615(0x680000,displayCorePb615_,core,sizeof(core)/8);
+    const bool wndOk=coreOk && displayPush615(displayWndUser615_,displayWndPb615_,wnd,sizeof(wnd)/8);
+    UInt32 armedIn=0,armedWnd=0;
+    if(IOMemoryMap *bm=sharedBar0Map(pci_)) {
+        if(bm->getLength()>=0x700000) {Bar0Io io{bm};IOSleep(20);io.read(0x68a04c,&armedIn);io.read(0x690a24,&armedWnd);}
+        bm->release();
+    }
+    lk(__LINE__);
+    displayFront615_=back ? front : 0;displayBack615_=back;displayFlipPending615_=false;
+    displayModeW615_=native ? 0 : w;displayModeH615_=native ? 0 : h;
+    setProperty("NVGspControl-display615-scanout-phys",front,64);
+    setProperty("NVGspControl-display615-dblbuf",back,64);
+    setProperty("NVGspControl-display615-mode-w",w,32);
+    setProperty("NVGspControl-display615-mode-h",h,32);
+    setProperty("NVGspControl-display615-mode-armed-viewport-in",armedIn,32);
+    setProperty("NVGspControl-display615-mode-armed-window",armedWnd,32);
+    setProperty("NVGspControl-display615-mode-result",UInt32(ok ? (coreOk ? (wndOk ? 0 : 3) : 2) : 1),32);
+    native615Busy_=false;setProperty("NVGspControl-native615-busy",false);
+    ulk();
+    IOLog("NVGspControl: scan-out %ux%u (%s) copy %d core %d window %d armed in 0x%x wnd 0x%x\n",w,h,
+          native ? "native" : "scaled",ok,coreOk,wndOk,armedIn,armedWnd);
+    return wndOk && armedIn==(w|h<<16) && armedWnd==(w|h<<16) ? kIOReturnSuccess : kIOReturnIOError;
+}
+
 // 0.180.141: the framebuffer NVDisplay hands to WindowServer: contiguous
 // sysmem (the display engine refuses ISO from sysmem, so displayCopyTick615
 // copies it to the VRAM scan-out surface), black, 3840x2160x4 in 32 MiB.
 bool NVGspControl::displayFbAlloc615() {
     if(displayFb615_)return true;
-    constexpr UInt64 kBytes=32ULL<<20;
-    auto *m=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-        kIODirectionInOut|kIOMemoryPhysicallyContiguous|kIOMemoryKernelUserShared,kBytes,0x000000FFFFE00000ULL);
-    if(m && m->prepare()!=kIOReturnSuccess) {m->release();m=nullptr;}
+    // 0.180.200: 64 MiB leaves room for a 5120x2880 scaled mode; 32 MiB (native only) if that much is not contiguous
+    UInt64 kBytes=64ULL<<20;
+    IOBufferMemoryDescriptor *m=nullptr;
+    for(;!m && kBytes>=(32ULL<<20);kBytes>>=1) {
+        m=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+            kIODirectionInOut|kIOMemoryPhysicallyContiguous|kIOMemoryKernelUserShared,kBytes,0x000000FFFFE00000ULL);
+        if(m && m->prepare()!=kIOReturnSuccess) {m->release();m=nullptr;}
+        if(m)break;
+    }
     IOByteCount len=0;
     const UInt64 phys=m ? m->getPhysicalSegment(0,&len,kIOMemoryMapperNone) : 0;
     if(!phys || len<kBytes) {

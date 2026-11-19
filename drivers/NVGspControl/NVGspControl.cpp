@@ -2233,6 +2233,12 @@ IOReturn NVGspControl::callPlatformFunction(const OSSymbol *name, bool wait,
         return kIOReturnSuccess;
     }
     // 0.137.0: p1 = const UInt32[10] timing (see setMode), p2 = UInt32 *code.
+    // 0.180.200: p1 = const UInt32[2] {width, height}: scaled scan-out (the native size goes back to 1:1)
+    if (name && name->isEqualTo("nvgsp-scaled-mode")) {
+        if (!p1 || !lock_) return kIOReturnBadArgument;
+        const UInt32 *wh = static_cast<const UInt32 *>(p1);
+        return displayScaledMode615(wh[0], wh[1]);
+    }
     if (name && name->isEqualTo("nvgsp-set-mode")) {
         UInt32 code = ~0U;
         const IOReturn r = setMode(static_cast<const UInt32 *>(p1), &code);
