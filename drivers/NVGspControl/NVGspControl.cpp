@@ -3793,6 +3793,8 @@ void NVGspControl::thawLocked() {
 // kernel copy channel, instead of a CPU memcpy of the whole frame. GR work
 // queued so far (the composite that drew the surface) finishes first.
 IOReturn NVGspControl::flipCopy(NVGspFlipCopy *f) {
+    // 0.180.197: native615 maps the surface into the maintenance VAS (no per-flip property churn)
+    if (native615_ && pipeVa615_) return f && f->version == 1 && f->src ? pipeFlip615(f) : kIOReturnBadArgument;
     // 0.180.10: publish the exact reason a copy-engine flip was refused; the
     // CPU fallback is ~220 ms for a 4K frame, so knowing stage 2 vs 3 vs 7 is
     // what tells us whether the aperture address or the CE ring is wrong.

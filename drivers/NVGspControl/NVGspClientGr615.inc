@@ -148,13 +148,19 @@ IOReturn NVGspControl::runClientGr615(UInt32 phase) {
         if(!m.attempted) {
             m.attempted=true;
             UInt32 *const savedLedger=ledger,*const savedCount=ledgerCount;const UInt32 savedMax=ledgerMax;
+            UInt64 pipeLo=0;
             ledger=m.objects;ledgerCount=&m.objectCount;ledgerMax=12;
             auto build=[&]() __attribute__((noinline)) {
                 nvgsp::VaspaceParams615 vas{};vas.flags=nvgsp::kExternalFaultVasFlags615;
                 if(!alloc(D,MVAS,0x90f1,&vas,sizeof(vas)) || vas.flags!=nvgsp::kExternalFaultVasFlags615 || !vas.vaSize ||
                    vas.vaSize>UINT64_MAX-vas.vaBase)return false;
                 m.va=s->grVa-8192;
-                const UInt64 lo=m.va,hi=m.va+4096;const UInt32 tables=nvgsp::externalTreeTables615(lo,hi);
+                // 0.180.197: the tree also covers kPipeSlots615 x 64 MiB from the next 2 MiB
+                // boundary for display pipe surfaces (pipeFlip615), when that fits the VAS
+                const UInt64 pLo=((m.va>>21)+1)<<21,pHi=pLo+UInt64(kPipeSlots615)*kPipeSlotBytes615;
+                const bool pFits=(m.va>>38)==((pHi-1)>>38) && pHi<=vas.vaBase+vas.vaSize;
+                const UInt64 lo=m.va,hi=pFits ? pHi : m.va+4096;const UInt32 tables=nvgsp::externalTreeTables615(lo,hi);
+                pipeLo=pFits ? pLo : 0;
                 if(lo<vas.vaBase || hi>vas.vaBase+vas.vaSize || !tables)return fail(kIOReturnBadArgument);
                 nvgsp::MemoryParams615 t{};t.owner=C;t.type=6;t.flags=0x100;t.attr=0x800000;
                 t.size=nvgsp::externalTreeBytes615(lo,hi);t.alignment=4096;const UInt64 size=t.size;   // 0.180.118
@@ -208,6 +214,7 @@ IOReturn NVGspControl::runClientGr615(UInt32 phase) {
             const bool built=build();
             ledger=savedLedger;ledgerCount=savedCount;ledgerMax=savedMax;
             lk(__LINE__);m.live=built;mmuKickToken615_=0;   // 0.180.164: a rebuilt channel has a new work-submit token
+            pipeVa615_=built ? pipeLo : 0;setProperty("NVGspControl-flipcopy-native615",pipeVa615_ ? 1U : 0U,32);
             setProperty("NVGspControl-mmu615-live",built);
             setProperty("NVGspControl-mmu615-objects",m.objects,m.objectCount*4);ulk();
             if(!built)return false;

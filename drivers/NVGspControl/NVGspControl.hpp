@@ -123,7 +123,7 @@ public:
     IOBufferMemoryDescriptor *displayFb615_ = nullptr;   // 0.180.137: contiguous sysmem scan-out test
     // 0.180.138: the sysmem framebuffer reaches the VRAM scan-out surface by
     // a maintenance-channel CE copy (the display engine scans VRAM only)
-    bool displayFbCopy615(bool wait, UInt32 firstLine = 0, UInt32 lineCount = 0);
+    bool displayFbCopy615(bool wait, UInt32 firstLine = 0, UInt32 lineCount = 0, UInt64 srcVa = 0);
     // 0.180.140: damage tracking - per-band hashes of the sysmem framebuffer;
     // only the changed line range is copied (static screen: no CE work)
     static constexpr UInt32 kDisplayBands615 = 32;
@@ -181,6 +181,14 @@ public:
     bool displayFlipPending615_ = false, displayDblStop615_ = false;
     bool displayPushFlip615(UInt64 surface);   // caller holds native615Busy_
     bool displayFlipLatched615();
+    // 0.180.197: display pipe flips on the copy engine (pipeFlip615): WindowServer surfaces mapped
+    // into the maintenance VAS at pipeVa615_, kPipeSlots615 LRU slots, PTEs kept until evicted
+    static constexpr UInt32 kPipeSlots615 = 4;
+    static constexpr UInt64 kPipeSlotBytes615 = 64ULL << 20;
+    UInt64 pipeVa615_ = 0, pipeTree615_[kPipeSlots615] = {};
+    IOMemoryDescriptor *pipeMd615_[kPipeSlots615] = {};
+    UInt32 pipeUse615_[kPipeSlots615] = {}, pipeClock615_ = 0, pipeFlips615_ = 0, pipeFlipFails615_ = 0;
+    IOReturn pipeFlip615(NVGspFlipCopy *f);
     // 0.180.98: input = 8 constant words + NAK; empty input only returns the
     // caller buffer VA. out: caller VA, dispatch sequence, code bytes.
     IOReturn nativeClientDispatch615(const void *owner, const UInt8 *input, UInt32 bytes, UInt64 out[3]);

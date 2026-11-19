@@ -2097,15 +2097,16 @@ IOReturn NVGspControl::displayTransport615(const UInt8 *in, UInt32 inBytes, UInt
 // an in-flight copy never rewrites their methods or their fence. wait=false
 // only kicks; displayCopyTick615 retires it from the semaphore, so busy is
 // held for the submission alone (a 9.6 ms 4K copy no longer stalls Metal).
-bool NVGspControl::displayFbCopy615(bool wait, UInt32 firstLine, UInt32 lineCount) {
+// 0.180.197: srcVa != 0 copies from that maintenance-VAS address (a display pipe surface) instead.
+bool NVGspControl::displayFbCopy615(bool wait, UInt32 firstLine, UInt32 lineCount, UInt64 srcVa) {
     auto *s=native615_;
-    if(!s || !s->mmu.live || !displayFb615_ || !displayCopyDst615_ || !displayCopyPitch615_ || !displayCopyLines615_)
+    if(!s || !s->mmu.live || (!srcVa && !displayFb615_) || !displayCopyDst615_ || !displayCopyPitch615_ || !displayCopyLines615_)
         return false;
     auto &m=s->mmu;
     IOByteCount len=0;
-    const UInt64 src=displayFb615_->getPhysicalSegment(0,&len,kIOMemoryMapperNone);
+    const UInt64 src=srcVa ? srcVa : displayFb615_->getPhysicalSegment(0,&len,kIOMemoryMapperNone);
     const UInt32 pitch=displayCopyPitch615_,total=displayCopyLines615_;
-    if(!src || len<UInt64(pitch)*total || firstLine>=total)return false;
+    if(!src || (!srcVa && len<UInt64(pitch)*total) || firstLine>=total)return false;
     const UInt32 lines=lineCount && lineCount<=total-firstLine ? lineCount : total-firstLine;
     const UInt64 dst=(displayBack615_ ? displayBack615_ : displayCopyDst615_)+UInt64(firstLine)*pitch;   // 0.180.181
     const UInt64 srcAt=src+UInt64(firstLine)*pitch;
@@ -2132,11 +2133,11 @@ bool NVGspControl::displayFbCopy615(bool wait, UInt32 firstLine, UInt32 lineCoun
     if(span<=0xffffffffULL) {
         w[c++]=ce(0x410,4);w[c++]=pitch;w[c++]=pitch;w[c++]=UInt32(span);w[c++]=1;
         // non-pipelined (completion ordering unchanged), flush, pitch/pitch, physical
-        w[c++]=ce(0x300,1);w[c++]=0x002U|0x004U|0x080U|0x100U|0x1000U|0x2000U;
+        w[c++]=ce(0x300,1);w[c++]=0x002U|0x004U|0x080U|0x100U|(srcVa ? 0 : 0x1000U)|0x2000U;
     } else {
         w[c++]=ce(0x410,4);w[c++]=pitch;w[c++]=pitch;w[c++]=pitch;w[c++]=lines;
         // non-pipelined, flush, pitch/pitch, multi-line, physical source and destination
-        w[c++]=ce(0x300,1);w[c++]=0x002U|0x004U|0x080U|0x100U|0x200U|0x1000U|0x2000U;
+        w[c++]=ce(0x300,1);w[c++]=0x002U|0x004U|0x080U|0x100U|0x200U|(srcVa ? 0 : 0x1000U)|0x2000U;
     }
     const UInt32 tail[6]={0x20050017,UInt32(semaphore)&0xfffffffc,UInt32(semaphore>>32)&0xff,fence,0,0x00100001};
     for(UInt32 i=0;i<6;++i)w[c++]=tail[i];
@@ -2155,6 +2156,112 @@ bool NVGspControl::displayFbCopy615(bool wait, UInt32 firstLine, UInt32 lineCoun
     } while(mach_absolute_time()<deadline);
     lk(__LINE__);displayCopyInflight615_=!done;ulk();
     return done;
+}
+
+// 0.180.197: the display pipe's flip (NVAccelerator nvgsp-flip-copy) on the copy engine. The CPU
+// used to memcpy each 33 MB 4K frame into the sysmem aperture and this file's tick hashed it again
+// (kernel_task 17 % vs 4 % idle at 63 flips/s). Now the IOSurface is mapped once into the maintenance
+// VAS (an LRU slot, cached PTEs: the CE sees the renderer's L2 lines) and copied in one line into the
+// VRAM back buffer, which is then flipped; the caller sleeps (no spin) until the copy retired, so
+// WindowServer can reuse the surface on return. Whole frames at the scan-out pitch only.
+// shortcut: a slot keeps its surface prepared and retained until evicted (up to 4 x 64 MiB wired after
+// the surfaces were freed); release on mode change if that ever matters.
+IOReturn NVGspControl::pipeFlip615(NVGspFlipCopy *f) {
+    auto *s=native615_;
+    const UInt32 pitch=displayCopyPitch615_,lines=displayCopyLines615_;
+    if(!s || !pipeVa615_ || !pitch || !lines || !displayCopyDst615_)return kIOReturnNotReady;
+    const UInt64 bytes=UInt64(pitch)*lines;
+    if(f->srcRowBytes!=pitch || f->widthBytes!=pitch || f->dstRowBytes!=pitch || f->rows!=lines || f->srcOffset ||
+       bytes>kPipeSlotBytes615 || f->src->getLength()<bytes)return kIOReturnUnsupported;
+    auto fail=[&](IOReturn r) {
+        lk(__LINE__);++pipeFlipFails615_;setProperty("NVGspControl-pipe-flip-fails",pipeFlipFails615_,32);
+        setProperty("NVGspControl-pipe-flip-last-err",UInt32(r),32);ulk();return r;
+    };
+    // own native615Busy_ with no copy in flight and the back buffer free (its flip latched)
+    UInt64 deadline=0;clock_interval_to_deadline(100,kMillisecondScale,&deadline);
+    for(;;) {
+        bool got=false;
+        lk(__LINE__);
+        if(!displayCopyOn615_ || native615Stopping_ || !native615Ready_ || sleeping_ || resetBusy_ ||
+           gmcMmuFaultPending_ || userRpcLatePending_ || postInitPhase_!=27 || !s->mmu.live) {ulk();return fail(kIOReturnNotReady);}
+        if(!native615Busy_ && !displayCopyInflight615_) native615Busy_=got=true;
+        ulk();
+        if(got) {
+            if(!displayFlipPending615_)break;
+            if(displayFlipLatched615()) {
+                lk(__LINE__);
+                const UInt64 shown=displayBack615_;displayBack615_=displayFront615_;displayFront615_=shown;
+                displayFlipPending615_=false;++displayFlips615_;ulk();
+                break;
+            }
+            lk(__LINE__);native615Busy_=false;ulk();
+        }
+        if(mach_absolute_time()>deadline)return fail(kIOReturnBusy);
+        IOSleep(1);
+    }
+    auto read=[&](UInt64 at,UInt32 count) {return vramAccess(at,s->readWords,count,false,true)==kIOReturnSuccess;};
+    IOReturn r=kIOReturnSuccess;
+    UInt32 k=kPipeSlots615;
+    for(UInt32 i=0;i<kPipeSlots615;++i)if(pipeMd615_[i]==f->src && pipeTree615_[i]==s->mmu.tree.tree) {k=i;break;}
+    const bool miss=k==kPipeSlots615;
+    if(miss) {   // the least recently used slot
+        k=0;
+        for(UInt32 i=1;i<kPipeSlots615;++i)if(pipeUse615_[i]<pipeUse615_[k])k=i;
+        if(pipeMd615_[k]) {pipeMd615_[k]->complete(kIODirectionOut);pipeMd615_[k]->release();pipeMd615_[k]=nullptr;}
+        pipeTree615_[k]=0;
+        if(f->src->prepare(kIODirectionOut)!=kIOReturnSuccess)r=kIOReturnNoMemory;   // as NVAccelerator: default direction fails
+        else {f->src->retain();pipeMd615_[k]=f->src;}
+    }
+    const UInt64 va=pipeVa615_+UInt64(k)*kPipeSlotBytes615;
+    if(r==kIOReturnSuccess && miss) {   // read-only cached sysmem PTEs, 512 (one table) a write
+        const UInt64 pages=(bytes+4095)/4096;
+        bool ok=true;
+        for(UInt64 p=0;ok && p<pages;) {
+            const UInt32 n=pages-p>512 ? 512 : UInt32(pages-p);
+            UInt64 leaf=0;
+            ok=nvgsp::externalTreeLeaf615(s->mmu.tree,va+p*4096,&leaf);
+            for(UInt32 i=0;ok && i<n;++i) {
+                IOByteCount len=0;UInt64 pte=0;
+                const UInt64 bus=f->src->getPhysicalSegment((p+i)*4096,&len,kIOMemoryMapperNone);
+                ok=bus && !(bus&4095) && len>=4096 && nvgsp::sysPte615(bus,true,&pte,0,true);
+                s->writeWords[i*2]=UInt32(pte);s->writeWords[i*2+1]=UInt32(pte>>32);
+            }
+            const UInt32 z0=s->writeWords[n*2-2],z1=s->writeWords[n*2-1];
+            ok=ok && vramAccess(leaf,s->writeWords,n*2,true,true)==kIOReturnSuccess &&
+               read(leaf+UInt64(n-1)*8,2) && s->readWords[0]==z0 && s->readWords[1]==z1;
+            p+=n;
+        }
+        if(ok && mmuSubmit615(0x1))pipeTree615_[k]=s->mmu.tree.tree;
+        else r=kIOReturnIOError;
+    }
+    pipeUse615_[k]=++pipeClock615_;
+    bool done=false;
+    if(r==kIOReturnSuccess && !displayFbCopy615(false,0,lines,va))r=kIOReturnIOError;
+    if(r==kIOReturnSuccess) {   // the copy is ~2-4 ms: sleep, do not spin
+        UInt64 limit=0;clock_interval_to_deadline(1,kSecondScale,&limit);
+        do {
+            if(!read(s->mmu.ring+0xe10,1))break;
+            if(s->readWords[0]==displayCopyFence615_) {done=true;break;}
+            IOSleep(1);
+        } while(mach_absolute_time()<limit);
+        if(!done)r=kIOReturnTimeout;   // still in flight: the tick retires (and flips) it, or calls it lost
+    }
+    bool flipped=done && (!displayBack615_ || displayPushFlip615(displayBack615_));
+    lk(__LINE__);
+    if(done) {
+        displayCopyInflight615_=false;++displayCopyFrames615_;displayCopyLinesTotal615_+=lines;
+        displayPendFirst615_=displayPrevFirst615_=~0U;displayPendLast615_=displayPrevLast615_=0;
+    }
+    if(flipped) {
+        pipePresentAt615_=mach_absolute_time();pipeEverPresented615_=true;++pipeFlips615_;
+        if(!(pipeFlips615_&63))setProperty("NVGspControl-pipe-flips",pipeFlips615_,32);
+    } else if(done) {   // the window channel refused the flip: single buffer, as in the tick
+        displayBack615_=displayFront615_=0;displayFlipPending615_=false;
+        setProperty("NVGspControl-display615-dblbuf",0ULL,64);r=kIOReturnIOError;
+    }
+    native615Busy_=false;
+    ulk();
+    return r==kIOReturnSuccess ? kIOReturnSuccess : fail(r);
 }
 
 void NVGspControl::displayCopyCallout615(thread_call_param_t p0, thread_call_param_t) {
@@ -2211,7 +2318,7 @@ void NVGspControl::displayCopyTick615() {
     }
     lk(__LINE__);
     const bool want=inflight || flipWait || dirtyFirst!=~0U;
-    const bool ready=want && !pipeActive && native615_ && native615Ready_ && !native615Busy_ && !sleeping_ && !resetBusy_ &&
+    const bool ready=want && native615_ && native615Ready_ && !native615Busy_ && !sleeping_ && !resetBusy_ &&
         !gmcMmuFaultPending_ && !userRpcLatePending_ && postInitPhase_==27;
     // 0.180.155: a busy skip keeps its damage range for the next tick instead
     // of invalidating every band (that forced a full 33 MB copy after each
@@ -2225,7 +2332,7 @@ void NVGspControl::displayCopyTick615() {
     bool retired=false,swapped=false;
     if(ready) {
         auto *s=native615_;
-        bool ok=true,kick=dirtyFirst!=~0U;
+        bool ok=true,kick=dirtyFirst!=~0U && !pipeActive;   // 0.180.197: the pipe owns the buffers
         if(displayCopyInflight615_) {
             kick=false;
             if(s && vramAccess(s->mmu.ring+0xe10,s->readWords,1,false,true)==kIOReturnSuccess &&
@@ -2250,7 +2357,7 @@ void NVGspControl::displayCopyTick615() {
                 lk(__LINE__);
                 const UInt64 shown=displayBack615_;displayBack615_=displayFront615_;displayFront615_=shown;
                 displayFlipPending615_=false;++displayFlips615_;ulk();swapped=true;
-                if(!kick && displayPendFirst615_!=~0U) {dirtyFirst=displayPendFirst615_;dirtyLast=displayPendLast615_;kick=true;}
+                if(!kick && !pipeActive && displayPendFirst615_!=~0U) {dirtyFirst=displayPendFirst615_;dirtyLast=displayPendLast615_;kick=true;}
             }
             if(displayFlipPending615_) {
                 if(kick) {displayPendFirst615_=dirtyFirst;displayPendLast615_=dirtyLast;kick=false;++displayFlipWaits615_;}
