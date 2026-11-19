@@ -34,13 +34,16 @@ struct VramHeap {
     }
 
     // lowest address a >= start with [a, a + bytes) free and a + bytes <= end
-    bool fit(uint64_t start, uint64_t end, uint64_t bytes, uint64_t *out) const {
-        if (!bytes || !out || start >= end || bytes > end - start) return false;
+    // align: power of two; the returned start is a multiple of it (0.180.195)
+    bool fit(uint64_t start, uint64_t end, uint64_t bytes, uint64_t *out, uint64_t align = 1) const {
+        if (!bytes || !out || start >= end || bytes > end - start || !align || (align & (align - 1))) return false;
         uint64_t cand = start;
         uint32_t i = lowerBound(start);
         // the range just below start may reach past it
         if (i > 0 && r[i - 1].phys + r[i - 1].bytes > cand) cand = r[i - 1].phys + r[i - 1].bytes;
         for (;; ++i) {
+            if (cand > UINT64_MAX - align) return false;
+            cand = (cand + align - 1) & ~(align - 1);
             if (cand > end || bytes > end - cand) return false;
             if (i == n || r[i].phys >= cand + bytes) { *out = cand; return true; }
             const uint64_t top = r[i].phys + r[i].bytes;

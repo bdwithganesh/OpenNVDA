@@ -600,6 +600,15 @@ private:
     NativeVram615 nativeVram_[kClientSlots615_][64] = {};
     bool displayCommon615_ = false;   // 0.180.133: 0xc0d00073 made by displayProbe615
     bool mmuZero615(UInt64 phys, UInt64 bytes);
+    bool mmuCopyVa615(UInt64 src, UInt64 dst, UInt64 bytes);   // 0.180.195
+    UInt64 vramDemote615(UInt32 requester, UInt64 need);
+    UInt64 moveSlot615(UInt32 client, UInt32 slot, UInt64 toPhys);   // toPhys 0: demote, else promote
+    void promoteOne615(UInt32 client);
+    UInt64 demotedMask_[kClientSlots615_] = {};   // slots whose VRAM went to sysmem
+    UInt64 lastDemote615_ = 0, vramPromotedBytes_ = 0;
+    UInt64 lastSubmit615_[kClientSlots615_] = {};   // mach time of the last GR/NVDEC submission
+    UInt64 vramDemotedBytes_ = 0;
+    UInt32 vramDemotions_ = 0;
     void releaseVram615(UInt32 slot);
     // 0.100.0: SR state.
     nvgsp::BooterStaging booterUnload_;

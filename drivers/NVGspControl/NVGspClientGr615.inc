@@ -607,6 +607,7 @@ IOReturn NVGspControl::runClientGr615(UInt32 phase) {
         if(!write(g.nvdecGpfifo+UInt64(at)*8,entry,2) || !write(g.nvdecUserd+0x8c,&next,1))return kIOReturnIOError;
         g.nvdecPut=next;
         lk(__LINE__);
+        lastSubmit615_[client615Slot_]=mach_absolute_time();   // 0.180.195: never demote a decoding client
         IOReturn ret=kIOReturnOffline;
         if(!resetBusy_ && !sleeping_ && !gmcMmuFaultPending_ && postInitPhase_==27 && gmcInitReady_) {
             IOMemoryMap *map=sharedBar0Map(pci_);ret=kIOReturnNoMemory;

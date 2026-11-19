@@ -44,6 +44,13 @@ int main() {
     assert(h.fit(G1 + 2 * M2 + 1, G1 + 16 * M2, M2, &a) && a == G1 + 3 * M2);
     assert(!h.remove(G1 + M2) && h.remove(G1) && h.count() == 1);
     assert(h.fit(G1, G1 + 16 * M2, 2 * M2, &a) && a == G1);
+    // 0.180.195: aligned fit uses an exact-size aligned hole, skips an unaligned one
+    h.clear();
+    assert(h.insert(G1, M2 / 2) && h.insert(G1 + 2 * M2, M2) && h.insert(G1 + 4 * M2, M2));
+    assert(h.fit(G1, G1 + 16 * M2, M2, &a, M2) && a == G1 + M2);
+    assert(h.fit(G1, G1 + 16 * M2, 2 * M2, &a, M2) && a == G1 + 5 * M2);
+    assert(h.fit(G1, G1 + 16 * M2, M2, &a) && a == G1 + M2 / 2);
+    assert(!h.fit(G1, G1 + 16 * M2, M2, &a, 3 * M2));
     h.clear();
     // capacity
     for (uint32_t i = 0; i < 64; ++i) assert(h.insert(G1 + i * M2, M2));

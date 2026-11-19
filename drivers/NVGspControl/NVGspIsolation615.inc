@@ -684,7 +684,7 @@ IOReturn NVGspControl::nativeClientDispatch615(const void *owner,const UInt8 *in
        postInitPhase_!=27 || s->generation!=resetGeneration()) {ulk();return kIOReturnNotReady;}
     out[0]=g.userVa;out[1]=g.dispatches;
     if(!bytes) {ulk();return kIOReturnSuccess;}
-    native615Busy_=true;const UInt32 rcBefore=rcEvents_;
+    native615Busy_=true;const UInt32 rcBefore=rcEvents_;lastSubmit615_[client615Slot_]=mach_absolute_time();
     setProperty("NVGspControl-native615-busy",true);ulk();
     const UInt32 slot=g.put,put=(g.put+1)%256,sequence=g.dispatches+1;
     const UInt32 computeRelease=0xc0440000U|sequence,hostFence=0x6150c400U+sequence;
@@ -845,10 +845,208 @@ bool NVGspControl::mmuZero615(UInt64 phys, UInt64 bytes) {
     return true;
 }
 
+// 0.180.195: CE copy between two maintenance-VAS addresses (virtual on both sides, plain byte copy).
+// Caller holds native615Busy_ with lock_ released. bytes: 4 KiB multiple.
+bool NVGspControl::mmuCopyVa615(UInt64 src, UInt64 dst, UInt64 bytes) {
+    auto *s=native615_;if(!s || !s->mmu.live || !bytes || (bytes&4095) || bytes>0xffffffffULL)return false;
+    auto &m=s->mmu;
+    auto read=[&](UInt64 at,UInt32 count) {return vramAccess(at,s->readWords,count,false,true)==kIOReturnSuccess;};
+    auto write=[&](UInt64 at,const UInt32 *words,UInt32 count) {
+        if(!count || count>1024)return false;
+        if(words!=s->writeWords)__builtin_memcpy(s->writeWords,words,count*4);
+        return vramAccess(at,s->writeWords,count,true,true)==kIOReturnSuccess && read(at,count) &&
+            !__builtin_memcmp(s->writeWords,s->readWords,count*4);
+    };
+    auto ce=[](UInt32 method,UInt32 n) {return 0x20000000U|(n<<16)|(4U<<13)|(method>>2);};
+    const UInt32 fence=0x6150d000|((m.fence+1)&0xfff);
+    const UInt64 semaphore=m.va+0xe00,pb=m.va+0x800;
+    UInt32 w[24];UInt32 c=0;
+    w[c++]=ce(0x000,1);w[c++]=0xC7B5;                       // SET_OBJECT AMPERE_DMA_COPY_B
+    w[c++]=ce(0x400,4);w[c++]=UInt32(src>>32);w[c++]=UInt32(src);w[c++]=UInt32(dst>>32);w[c++]=UInt32(dst);
+    w[c++]=ce(0x418,2);w[c++]=UInt32(bytes);w[c++]=1;       // one line of `bytes`
+    w[c++]=ce(0x300,1);w[c++]=0x002U|0x004U|0x080U|0x100U;  // non-pipelined, flush, pitch, virtual both sides
+    const UInt32 tail[6]={0x20050017,UInt32(semaphore)&0xfffffffc,UInt32(semaphore>>32)&0xff,fence,0,0x00100001};
+    for(UInt32 i=0;i<6;++i)w[c++]=tail[i];
+    const UInt32 entry[2]={UInt32(pb)&0xfffffffc,(UInt32(pb>>32)&0xff)|(c<<10)};
+    const UInt32 put=(m.put+1)%256;
+    if(!write(m.ring+0x800,w,c) || !write(m.ring+UInt64(m.put)*8,entry,2) || !write(m.userd+0x8c,&put,1) ||
+       diagnosticChannelKick(0xc0d00556,true)!=kIOReturnSuccess)return false;
+    UInt64 deadline=0;clock_interval_to_deadline(5,kSecondScale,&deadline);bool done=false;
+    do {
+        if(!read(m.ring+0xe00,1))return false;
+        if(s->readWords[0]==fence) {done=true;break;}
+        IODelay(10);
+    } while(mach_absolute_time()<deadline);
+    done=done && read(m.userd+0x88,2) && s->readWords[0]==put && s->readWords[1]==put;
+    lk(__LINE__);m.put=put;m.fence=fence&0xfff;if(!done)m.live=false;ulk();
+    return done;
+}
+
+// 0.180.195: WDDM-like eviction. A VRAM allocation that finds no free range moves the largest VRAM
+// slabs of the idle client (no GR/NVDEC submission for 1 s) holding the most VRAM to L2-cacheable sysmem: same
+// GPU VA, same PTE kind, so the owner's resources and shaders keep working. Caller holds lock_
+// (released and re-taken here, native615Busy_ held meanwhile). Returns the VRAM bytes freed.
+// shortcut: demoted slabs never move back to VRAM (no promotion); add it when a benchmark shows the cost.
+UInt64 NVGspControl::vramDemote615(UInt32 requester, UInt64 need) {
+    auto *s=native615_;if(!s || !s->mmu.live || s->mmu.tree.tables!=1)return 0;
+    UInt64 freed=0,idle=0;nanoseconds_to_absolutetime(1000000000ULL,&idle);
+    for(UInt32 round=0;round<16 && freed<need;++round) {
+        const UInt64 now=mach_absolute_time();
+        int victim=-1;UInt32 vslot=0;UInt64 most=0;
+        for(UInt32 k=0;k<nvgsp::kClientSlots615;++k) {
+            auto &g=s->clientGrs[k];
+            if(k==requester || !client615Owners_[k] || !g.live || !g.external || g.nvdecFaulted ||
+               now-lastSubmit615_[k]<idle)continue;
+            UInt32 best=nvgsp::kClientAllocs615;
+            for(UInt32 j=0;j<nvgsp::kClientAllocs615;++j)
+                if((g.allocLive>>j&1) && g.allocChunks[j] && nativeVram_[k][j].bytes &&
+                   (best==nvgsp::kClientAllocs615 || nativeVram_[k][j].bytes>nativeVram_[k][best].bytes))best=j;
+            if(best==nvgsp::kClientAllocs615)continue;
+            UInt64 total=0;
+            for(UInt32 j=0;j<nvgsp::kClientAllocs615;++j)if(g.allocLive>>j&1)total+=nativeVram_[k][j].bytes;
+            if(total>most) {most=total;victim=int(k);vslot=best;}
+        }
+        if(victim<0)break;
+        native615Busy_=true;ulk();
+        const UInt64 got=moveSlot615(UInt32(victim),vslot,0);
+        lk(__LINE__);native615Busy_=false;
+        if(!got)break;
+        freed+=got;
+    }
+    return freed;
+}
+
+// Move one slab between VRAM and sysmem. toPhys == 0: VRAM -> new sysmem pages (demote); otherwise
+// sysmem -> the VRAM range at toPhys, already inserted in vramHeap_ (promote). The data goes through
+// two 128-page windows of the maintenance VAS leaf (source and destination mapped with the slab's own
+// kind), then the owner's PTEs are pointed at the new pages: same GPU VA. native615Busy_ held, lock_ not.
+UInt64 NVGspControl::moveSlot615(UInt32 k, UInt32 j, UInt64 toPhys) {
+    auto *s=native615_;auto &g=s->clientGrs[k];auto &m=s->mmu;
+    const bool promote=toPhys!=0;
+    lk(__LINE__);const NativeVram615 v=nativeVram_[k][j];const UInt32 first=g.allocChunk[j],chunks=g.allocChunks[j];
+    const UInt64 bytes=promote ? g.allocBytes[j] : v.bytes;ulk();
+    auto &buffer=nativeAllocDatas_[k][j];
+    if(promote ? (v.bytes || buffer.size()!=bytes) : !v.bytes)return 0;
+    if(!bytes || (bytes&4095) || !chunks || first+chunks>g.leafChunks || !clientWaitIdle615(k))return 0;
+    auto read=[&](UInt64 at,UInt32 count) {return vramAccess(at,s->readWords,count,false,true)==kIOReturnSuccess;};
+    // Posted BAR writes are cheap, BAR reads are not (a full read-back made eviction run at 400 MB/s):
+    // check the first and last PTE of every write.
+    // shortcut: a silently corrupted middle PTE goes unnoticed; read back everything if vramAccess ever drops writes.
+    auto write=[&](UInt64 at,UInt32 count) {
+        if(count<2 || count>1024 || (count&1) || vramAccess(at,s->writeWords,count,true,true)!=kIOReturnSuccess)return false;
+        const UInt32 a0=s->writeWords[0],a1=s->writeWords[1],z0=s->writeWords[count-2],z1=s->writeWords[count-1];
+        return read(at,2) && s->readWords[0]==a0 && s->readWords[1]==a1 &&
+            read(at+UInt64(count-2)*4,2) && s->readWords[0]==z0 && s->readWords[1]==z1;
+    };
+    // the first PTE must be exactly what op 4 (VRAM) or an earlier demotion (cached sysmem) wrote
+    if(!read(g.leafAddress[first],2))return 0;
+    const UInt32 kind=s->readWords[1]>>24;
+    {
+        UInt64 bus0=0,pte0=0;
+        const bool built=promote ? buffer.busPage(0,&bus0) && nvgsp::sysPte615(bus0,false,&pte0,kind,true)
+                                 : nvgsp::vidPte615(v.phys,false,false,&pte0,kind);
+        if(!built || s->readWords[0]!=UInt32(pte0) || s->readWords[1]!=UInt32(pte0>>32))return 0;
+    }
+    if(!promote && (buffer.size() || !buffer.allocate(bytes,false,nullptr,1) || !buffer.syncToDevice())) {buffer.release();return 0;}
+    const UInt64 fromPhys=promote ? 0 : v.phys,newPhys=promote ? toPhys : 0;
+    // the new home of page p: VRAM (promote) or a sysmem page (demote). cachedSys: L2-cacheable sysmem PTE
+    auto homePte=[&](UInt64 p,bool cachedSys,UInt64 *pte) {
+        UInt64 bus=0;
+        return promote ? nvgsp::vidPte615(newPhys+p*4096,false,false,pte,kind)
+                       : buffer.busPage(size_t(p),&bus) && nvgsp::sysPte615(bus,false,pte,kind,cachedSys);
+    };
+    auto oldPte=[&](UInt64 p,UInt64 *pte) {   // promote: cached, so the CE sees the owner's dirty L2 lines
+        UInt64 bus=0;
+        return promote ? buffer.busPage(size_t(p),&bus) && nvgsp::sysPte615(bus,false,pte,kind,true)
+                       : nvgsp::vidPte615(fromPhys+p*4096,false,false,pte,kind);
+    };
+    const UInt32 mi=UInt32((m.va>>12)&511),w0=mi>=256?0:256;   // away from the channel's own page
+    const UInt64 window=m.tree.tableBase+UInt64(w0)*8;
+    const UInt64 srcVa=(m.va&~0x1fffffULL)+UInt64(w0)*4096,dstVa=srcVa+128*4096;
+    const UInt64 pages=bytes/4096;
+    bool ok=true;
+    for(UInt64 p=0;ok && p<pages;) {
+        const UInt32 n=pages-p>128 ? 128 : UInt32(pages-p);
+        bzero(s->writeWords,256*8);
+        for(UInt32 i=0;ok && i<n;++i) {
+            UInt64 src=0,dst=0;
+            ok=oldPte(p+i,&src) && homePte(p+i,false,&dst);   // demote: VOL, the copy lands in memory
+            s->writeWords[i*2]=UInt32(src);s->writeWords[i*2+1]=UInt32(src>>32);
+            s->writeWords[256+i*2]=UInt32(dst);s->writeWords[256+i*2+1]=UInt32(dst>>32);
+        }
+        ok=ok && write(window,512) && mmuSubmit615(0x1) && mmuCopyVa615(srcVa,dstVa,UInt64(n)*4096);
+        p+=n;
+    }
+    if(ok && !promote && !kind) {   // pitch kind: the physical VRAM bytes must equal the copy
+        auto *cpu=static_cast<const UInt32 *>(buffer.bytes());
+        const UInt64 ends[2]={0,bytes-64};
+        for(UInt64 e:ends)ok=ok && cpu && read(v.phys+e,16) && !__builtin_memcmp(s->readWords,cpu+e/4,64);
+    }
+    bzero(s->writeWords,256*8);
+    if(!write(window,512) || !mmuSubmit615(0x1))ok=false;
+    if(!ok) {if(!promote)buffer.release();return 0;}   // the owner's PTEs are untouched
+    UInt64 p=0;
+    for(UInt32 c=0;c<chunks && ok;++c) {
+        const UInt64 leaf=g.leafAddress[first+c];const UInt32 count=g.leafCount[first+c];
+        for(UInt32 i=0;ok && i<count;++i) {
+            UInt64 pte=0;
+            ok=homePte(p+i,true,&pte);
+            s->writeWords[i*2]=UInt32(pte);s->writeWords[i*2+1]=UInt32(pte>>32);
+        }
+        ok=ok && write(leaf,count*2);
+        p+=count;
+    }
+    ok=ok && p==pages && mmuSubmit615(0x1);
+    lk(__LINE__);
+    if(!ok) {   // a half-rewritten tree: fail closed like a failed allocation
+        native615Ready_=false;native615Status_=UInt32(kIOReturnIOError);
+        setProperty("NVGspControl-native615-ready",false);
+        setProperty("NVGspControl-native615-status",native615Status_,32);
+        ulk();return 0;
+    }
+    if(promote) {
+        nativeVram_[k][j]={toPhys,bytes};demotedMask_[k]&=~(1ULL<<j);
+        vramPromotedBytes_+=bytes;
+        setProperty("NVGspControl-vram-promoted-bytes",vramPromotedBytes_,64);
+    } else {
+        g.sysCached=true;   // its submissions now carry the L2 prologue (the cached PTEs above)
+        vramHeap_.remove(v.phys);nativeVram_[k][j]={0,0};demotedMask_[k]|=1ULL<<j;
+        vramDemotedBytes_+=bytes;++vramDemotions_;lastDemote615_=mach_absolute_time();
+        setProperty("NVGspControl-vram-demoted-bytes",vramDemotedBytes_,64);
+        setProperty("NVGspControl-vram-demotions",vramDemotions_,32);
+    }
+    ulk();
+    if(promote)buffer.release();   // no PTE reaches these pages any more
+    return bytes;
+}
+
+// 0.180.195: a client with demoted slabs submits while VRAM is free again: bring one slab back.
+// Only when no demotion ran for 5 s and 1 GiB stays free after it, so two apps never ping-pong.
+// Caller holds native615Busy_ with lock_ released (the submit path).
+void NVGspControl::promoteOne615(UInt32 k) {
+    UInt64 calm=0;nanoseconds_to_absolutetime(5000000000ULL,&calm);
+    lk(__LINE__);
+    auto *s=native615_;auto &g=s->clientGrs[k];
+    UInt64 start=0,end=0,at=0,bytes=0;UInt32 j=0;
+    for(;j<nvgsp::kClientAllocs615;++j)if((demotedMask_[k]>>j&1) && (g.allocLive>>j&1))break;
+    bool go=j<nvgsp::kClientAllocs615 && mach_absolute_time()-lastDemote615_>=calm &&
+        nvgsp::diagnosticVramBounds615(gmcConfig_,&start,&end);
+    if(go) {
+        bytes=(g.allocBytes[j]+0x1fffff)&~0x1fffffULL;
+        go=g.allocBytes[j]==bytes && vramHeap_.fit(start,end,bytes+(1ULL<<30),&at,0x200000) &&
+           vramHeap_.fit(start,end,bytes,&at,0x200000) && vramHeap_.insert(at,bytes);
+    }
+    if(j<nvgsp::kClientAllocs615 && !(g.allocLive>>j&1))demotedMask_[k]&=~(1ULL<<j);
+    ulk();
+    if(!go)return;
+    if(!moveSlot615(k,j,at)) {lk(__LINE__);vramHeap_.remove(at);ulk();}
+}
+
 void NVGspControl::releaseVram615(UInt32 slot) {
     if(slot>=nvgsp::kClientSlots615)return;
     lk(__LINE__);
     for(auto &v:nativeVram_[slot])if(v.bytes) {vramHeap_.remove(v.phys);v={0,0};}
+    demotedMask_[slot]=0;
     ulk();
 }
 
@@ -901,7 +1099,10 @@ IOReturn NVGspControl::nativeClientMemory615(const void *owner,UInt32 operation,
             UInt64 start=0,end=0,at=0;
             if(va+bytes>g.userVa+nvgsp::kClientUserWindow615 || nativeVram_[client615Slot_][slot].bytes ||
                !nvgsp::diagnosticVramBounds615(gmcConfig_,&start,&end) ||
-               !vramHeap_.fit(start,end,bytes+0x200000,&at)) {ulk();return kIOReturnNoSpace;}
+               (!vramHeap_.fit(start,end,bytes,&at,0x200000) &&
+                (!vramDemote615(client615Slot_,bytes) || !vramHeap_.fit(start,end,bytes,&at,0x200000)))) {
+                ulk();return kIOReturnNoSpace;
+            }
             at=(at+0x1fffff)&~0x1fffffULL;
             if(!vramHeap_.insert(at,bytes)) {ulk();return kIOReturnNoMemory;}
             nativeVram_[client615Slot_][slot]={at,bytes};
@@ -977,7 +1178,7 @@ IOReturn NVGspControl::nativeClientMemory615(const void *owner,UInt32 operation,
                 g.leafChunks-=n;
                 for(UInt32 k=0;k<nvgsp::kClientAllocs615;++k)if((g.allocLive>>k&1) && g.allocChunk[k]>first)g.allocChunk[k]-=n;
             }
-            g.allocChunks[slot]=0;
+            g.allocChunks[slot]=0;demotedMask_[client615Slot_]&=~(1ULL<<slot);
             auto &v=nativeVram_[client615Slot_][slot];   // 0.180.131
             if(v.bytes) {lk(__LINE__);vramHeap_.remove(v.phys);v={0,0};ulk();}
             out[0]=slot;out[1]=g.allocVa[slot];out[2]=g.allocBytes[slot];
@@ -1325,8 +1526,9 @@ IOReturn NVGspControl::nativeClientSubmit615(const void *owner,UInt64 va,UInt64 
     if(!waitOnly && (va<g.userVa || words*4>nvgsp::kClientUserWindow615 || va+words*4>g.userVa+nvgsp::kClientUserWindow615))
         {ulk();return kIOReturnBadArgument;}
     if(waitOnly && (!va || va>g.dispatches)) {ulk();return kIOReturnBadArgument;}
-    native615Busy_=true;const UInt32 rcBefore=rcEvents_;
+    native615Busy_=true;const UInt32 rcBefore=rcEvents_;lastSubmit615_[client615Slot_]=mach_absolute_time();
     setProperty("NVGspControl-native615-busy",true);ulk();
+    if(demotedMask_[client615Slot_])promoteOne615(client615Slot_);   // 0.180.195: VRAM free again
     // 0.180.177: a sysCached client gets a prologue entry (SET_REFERENCE,
     // MEM_OP_D L2_SYSMEM_INVALIDATE: drop the L2's clean sysmem lines, the CPU
     // may have written them) and SET_REFERENCE before its fence (its sysmem

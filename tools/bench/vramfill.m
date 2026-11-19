@@ -77,6 +77,23 @@ int main(int argc, char **argv) {
         printf("allocated %lu x 256 MiB = %.1f GiB in %.1f s, first nil at %d, %d bad, %d bad on re-read: %s\n",
                (unsigned long)res.count, res.count / 4.0, s, nilAt, bad, rebad,
                (nilAt < 0 && !bad && !rebad) ? "PASS" : "FAIL");
+        if (getenv("VRAMFILL_HOLD")) {   // stay idle with everything alive (another app may evict us), then check all
+            printf("holding %s s in use\n", getenv("VRAMFILL_HOLD")); fflush(stdout);
+            sleep((unsigned)atoi(getenv("VRAMFILL_HOLD")));
+            int holdbad = 0;
+            for (NSUInteger i = 0; i < res.count; i++) {
+                id<MTLCommandBuffer> cb = [q commandBuffer];
+                id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+                if (buffers) [bl copyFromBuffer:res[i] sourceOffset:each / 2 toBuffer:rb destinationOffset:0 size:4];
+                else [bl copyFromTexture:res[i] sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(4097, 3001, 0)
+                              sourceSize:MTLSizeMake(1, 1, 1) toBuffer:rb destinationOffset:0
+                   destinationBytesPerRow:4 destinationBytesPerImage:4];
+                [bl endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                holdbad += cb.status != MTLCommandBufferStatusCompleted ||
+                           ((const uint8_t *)rb.contents)[0] != (uint8_t)(i * 37 + 11);
+            }
+            printf("after hold: %d of %lu bad: %s\n", holdbad, (unsigned long)res.count, holdbad ? "FAIL" : "PASS");
+        }
         [res removeAllObjects];
         // after release: VRAM must be usable again
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
