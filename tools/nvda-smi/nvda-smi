@@ -183,10 +183,12 @@ def doctor(p):
     did = num(p, 'dp-display') or 0
     check('a DP display was found', did != 0, 'plug the monitor into a DP port; HDMI is not supported yet')
     check('display scan-out copy running', bool(p.get('%s-display615-copy-on' % GSP)), 'see the display boot log')
-    lst = run('/bin/launchctl', 'list').decode(errors='replace')
-    for d in DAEMONS:
-        out = run('/bin/launchctl', 'print', 'system/' + d)
-        check('launch daemon %s' % d, bool(out) or d in lst, 'sudo launchctl bootstrap system /Library/LaunchDaemons/%s.plist' % d)
+    for d in DAEMONS:   # autogpu is LaunchOnlyOnce: launchd drops it after the run, so check the plist instead
+        check('launch daemon %s installed' % d, os.path.exists('/Library/LaunchDaemons/%s.plist' % d),
+              'the boot chain is not installed')
+    f = newest(LOG_GLOBS[0])
+    check('autogpu boot script finished this boot', bool(f) and any('autowarm done' in l for l in tail(f, 50)),
+          'see nvda-smi logs')
     check('hotplug watcher running', bool(run('/usr/bin/pgrep', '-f', 'hotplug-watch.sh').strip()),
           'sudo launchctl kickstart -k system/org.local.nvdisphotplug')
     print('\n%d/%d checks passed' % (sum(checks), len(checks)))
