@@ -14,13 +14,15 @@ D615=/Users/dhruveen/nvbuild/d615
 exec >> "$LOG" 2>&1
 echo "hotplug-watch start $(date)"
 mask() { /usr/sbin/ioreg -l -w0 -r -c NVGspControl 2>/dev/null | grep 'hotplug-poll-mask' | head -1 | sed 's/.*= //'; }
+# 0.180.199+: the mask holds the bit of the DP display ID the kernel polls (0x2000 = 8192 on DP connector 0), so any nonzero value means a sink.
+sink() { [ -n "$1" ] && [ "$1" != "0" ]; }
 copyon() { /usr/sbin/ioreg -l -w0 -r -c NVGspControl 2>/dev/null | grep -q 'display615-copy-on" = Yes'; }
 n=0; last=0; pm=$(mask)
 until copyon; do
     m=$(mask)
-    if [ -e /Library/NativeDriverLab/display/state/disp615-partial.json ] && ! /usr/bin/pgrep -f nvdisp615-boot.sh >/dev/null && [ "$m" = "512" ]; then
+    if [ -e /Library/NativeDriverLab/display/state/disp615-partial.json ] && ! /usr/bin/pgrep -f nvdisp615-boot.sh >/dev/null && sink "$m"; then
         now=$(date +%s)
-        if [ "$pm" != "512" ] || [ $((now - last)) -ge 30 ]; then
+        if ! sink "$pm" || [ $((now - last)) -ge 30 ]; then
             echo "$(date) sink present (mask $pm -> $m), resuming display bring-up"
             sleep 0.6
             /usr/bin/python3 "$D615/disp_all.py" desktop --resume
@@ -61,7 +63,7 @@ while :; do
     m=$(mask)
     if [ "$m" != "$prev" ]; then
         echo "$(date) mask $prev -> $m"
-        if [ "$m" = "512" ]; then
+        if sink "$m"; then
             sleep 0.6
             /usr/bin/python3 "$D615/disp_replug.py"
         fi

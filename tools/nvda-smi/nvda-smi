@@ -1,0 +1,239 @@
+#!/usr/bin/python3 -I
+"""nvda-smi: status and checks for the native NVIDIA stack on macOS (like nvidia-smi).
+
+  nvda-smi              summary (GPU, clocks, VRAM, display, health)
+  nvda-smi -l N         repeat the summary every N seconds
+  nvda-smi displays     ports, connected sink, scan-out, hotplug
+  nvda-smi boot         boot timeline and native615 stage times
+  nvda-smi doctor       pass/fail checks for the whole boot chain
+  nvda-smi logs [N]     last N lines of the newest driver logs
+  nvda-smi -q [TEXT]    every NVGspControl / NVAccelerator property (filtered by TEXT)
+Read-only: it only reads ioreg, kmutil, launchctl and the log files.
+"""
+import glob, os, plistlib, re, struct, subprocess, sys, time
+
+GSP = 'NVGspControl'
+ACCEL_CLASSES = ('NVAccelerator', 'NVAccelerator15')
+LOG_GLOBS = ('/Library/NativeDriverLab/autogpu/log-*.txt',
+             '/Library/NativeDriverLab/display/boot-*.log',
+             '/Library/NativeDriverLab/display/hotplug.log')
+DAEMONS = ('local.macosdevicelab.autogpu', 'org.local.nvdisp615', 'org.local.nvdisphotplug')
+BUNDLES = ('org.local.macosdevicelab.NVGspControl', 'org.local.macosdevicelab.NVAccelerator15',
+           'org.local.macosdevicelab.NVDisplayFB8')
+# AD103 board, measured with tools/display/portmap.py (GSP-RM GET_CONNECTOR_DATA / OR_GET_INFO)
+PORTS = {0x2000: 'DP-0', 0x4000: 'DP-0 (DP++ HDMI/DVI)', 0x800: 'DP-1', 0x1000: 'DP-1 (DP++ HDMI/DVI)',
+         0x200: 'DP-2', 0x400: 'DP-2 (DP++ HDMI/DVI)', 0x100: 'HDMI-0'}
+PROTO = {1: 'TMDS-A', 2: 'TMDS-B', 8: 'DP-A', 9: 'DP-B'}
+
+
+def run(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=20).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return b''
+
+
+def ioreg(cls):
+    """Properties of the first IORegistry entry of class cls ({} if absent)."""
+    out = run('/usr/sbin/ioreg', '-a', '-r', '-l', '-c', cls)
+    try:
+        objs = plistlib.loads(out) if out else []
+    except Exception:
+        return {}
+    return objs[0] if objs else {}
+
+
+def num(p, key, default=None):
+    v = p.get('%s-%s' % (GSP, key), default)
+    if isinstance(v, bytes) and len(v) in (4, 8):
+        v = int.from_bytes(v, 'little')
+    return v
+
+
+def u32s(p, key):
+    v = p.get('%s-%s' % (GSP, key))
+    return list(struct.unpack('<%dI' % (len(v) // 4), v)) if isinstance(v, bytes) else []
+
+
+def mib(b):
+    return '%d MiB' % (b >> 20) if isinstance(b, int) else '?'
+
+
+def port(did):
+    return PORTS.get(did, 'display 0x%x' % did)
+
+
+def kver(bundle):
+    m = re.search(re.escape(bundle) + r' \(([^)]+)\)', run('/usr/bin/kmutil', 'showloaded', '--list-only').decode(errors='replace'))
+    return m.group(1) if m else None
+
+
+def accel():
+    for c in ACCEL_CLASSES:
+        p = ioreg(c)
+        if p:
+            return p
+    return {}
+
+
+def row(text):
+    return '| ' + text[:76].ljust(76) + ' |'
+
+
+def summary(p):
+    a = accel()
+    clk = u32s(p, 'clk615')   # status, samples, last gpc, max gpc, last active gpc, last dram (kHz)
+    ok = len(clk) == 6 and clk[0] == 0
+    mhz = lambda khz: '%d MHz' % (khz // 1000) if ok else '?'
+    temp, ps = num(p, 'gpu-temp-mC'), num(p, 'perf-pstate')
+    total = num(p, 'static-fb-bytes') or num(p, 'fb-length')
+    did = num(p, 'dp-display') or 0
+    w, h = num(p, 'display615-fb-width'), num(p, 'display615-fb-height')
+    line = '+' + '-' * 78 + '+'
+    print(time.strftime('%a %b %d %H:%M:%S %Y'))
+    print(line)
+    print(row('nvda-smi    NVGspControl %s    NVAccelerator %s' % (
+        kver(BUNDLES[0]) or '?', (kver(BUNDLES[1]) or 'loaded') if a else 'NOT LOADED')))
+    print(line)
+    print(row('GPU   NVIDIA AD103 (RTX 4080)   firmware %s   reset busy %s   resets %s' % (
+        'ready' if num(p, 'native615-ready') else 'NOT READY', 'yes' if p.get(GSP + '-reset-busy') else 'no',
+        num(p, 'gpu-reset-count', 0))))
+    print(row('Temp  %s   P%s   GPC %s (max %s)   DRAM %s' % (
+        '%dC' % (temp // 1000) if isinstance(temp, int) else '?', ps if isinstance(ps, int) else '?',
+        mhz(clk[2] if ok else 0), mhz(clk[3] if ok else 0), mhz(clk[5] if ok else 0))))
+    print(row('VRAM  %s / %s   evicted %s   RC events %s   MMU faults %s' % (
+        mib(num(p, 'mem-vram-bytes')), mib(total), mib((num(p, 'vram-evicted-mib') or 0) << 20),
+        num(p, 'rc-count', 0), num(p, 'mmu-fault-events', 0))))
+    print(row('Disp  %s   %s   copy %s   CE flips %s' % (
+        port(did) if did else 'none', '%sx%s' % (w, h) if w else '-',
+        'on' if p.get(GSP + '-display615-copy-on') else 'off', a.get('NVAccelerator-flip-ce', '?'))))
+    print(line)
+
+
+def displays(p):
+    conn = num(p, 'display615-connect-mask') or 0
+    did, proto = num(p, 'dp-display') or 0, num(p, 'dp-protocol')
+    print('Connector   Display ID  State')
+    for d in sorted(PORTS, key=lambda d: PORTS[d]):
+        st = 'connected' if conn & d else '-'
+        if d == did:
+            st += '  <- driven (%s)' % PROTO.get(proto, proto)
+        print('%-22s 0x%-5x %s' % (PORTS[d], d, st))
+    print()
+    print('scan-out    %sx%s rowbytes %s, copy %s, flips %s' % (
+        num(p, 'display615-fb-width'), num(p, 'display615-fb-height'), num(p, 'display615-fb-rowbytes'),
+        'on' if p.get('%s-display615-copy-on' % GSP) else 'off', num(p, 'display615-flips')))
+    print('hotplug     poll-mask 0x%x, plugs %s, unplugs %s, polls %s' % (
+        num(p, 'hotplug-poll-mask') or 0, num(p, 'hotplug-poll-plug'), num(p, 'hotplug-poll-unplug'),
+        num(p, 'hotplug-poll-count')))
+    if conn & 0x5500:   # HDMI-0 or a DP++ TMDS display ID
+        print('note: an HDMI/DVI sink is connected; HDMI bring-up is not implemented yet (DP only).')
+
+
+def boot(p):
+    print('kernel timeline (ms since NVGspControl start):')
+    for ev in (p.get('%s-boot-timeline' % GSP) or '').split():
+        name, _, ms = ev.rpartition('@')
+        print('  %-36s %s' % (name, ms))
+    st = u32s(p, 'native615-stage-ms')
+    if st:
+        print('native615 bootstrap stage ms:', ' '.join('%d:%d' % (i, v) for i, v in enumerate(st) if v))
+    for g in LOG_GLOBS[:2]:
+        f = newest(g)
+        if f:
+            print('\n%s:' % f)
+            for l in tail(f, 400):
+                if ' at uptime ' in l or 'ready' in l or 'lit' in l:
+                    print('  ' + l)
+
+
+def newest(pattern):
+    fs = glob.glob(pattern)
+    return max(fs, key=os.path.getmtime) if fs else None
+
+
+def tail(path, n):
+    try:
+        with open(path, errors='replace') as f:
+            return [l.rstrip('\n') for l in f.readlines()[-n:]]
+    except OSError as e:
+        return ['(%s)' % e]
+
+
+def logs(n):
+    for g in LOG_GLOBS:
+        f = newest(g)
+        if f:
+            print('==> %s <==' % f)
+            print('\n'.join(tail(f, n)))
+
+
+def doctor(p):
+    checks = []
+    def check(name, ok, hint=''):
+        checks.append(ok)
+        print('[%s] %s%s' % ('PASS' if ok else 'FAIL', name, '' if ok else '  -> ' + hint))
+    loaded = run('/usr/bin/kmutil', 'showloaded', '--list-only').decode(errors='replace')
+    for b in BUNDLES:
+        check('kext %s loaded' % b, b in loaded,
+              'AuxKC kexts need approval; see perf/auxrebuild.sh' if 'NVGsp' not in b else 'check the OpenCore Kernel/Add entry')
+    check('GPU firmware up (native615-ready)', bool(num(p, 'native615-ready')), 'see nvda-smi logs (autogpu)')
+    check('no GPU reset in progress', not p.get('%s-reset-busy' % GSP), 'wait, then re-run')
+    check('accelerator registered', bool(accel()), 'NVAccelerator15 missing from AuxKC (black screen); run perf/auxrebuild.sh')
+    did = num(p, 'dp-display') or 0
+    check('a DP display was found', did != 0, 'plug the monitor into a DP port; HDMI is not supported yet')
+    check('display scan-out copy running', bool(p.get('%s-display615-copy-on' % GSP)), 'see the display boot log')
+    lst = run('/bin/launchctl', 'list').decode(errors='replace')
+    for d in DAEMONS:
+        out = run('/bin/launchctl', 'print', 'system/' + d)
+        check('launch daemon %s' % d, bool(out) or d in lst, 'sudo launchctl bootstrap system /Library/LaunchDaemons/%s.plist' % d)
+    check('hotplug watcher running', bool(run('/usr/bin/pgrep', '-f', 'hotplug-watch.sh').strip()),
+          'sudo launchctl kickstart -k system/org.local.nvdisphotplug')
+    print('\n%d/%d checks passed' % (sum(checks), len(checks)))
+    return all(checks)
+
+
+def query(p, text):
+    a = accel()
+    for k in sorted(list(p) + list(a)):
+        if (k.startswith('NV')) and (not text or text.lower() in k.lower()):
+            v = p.get(k, a.get(k))
+            if isinstance(v, bytes):
+                v = v.hex() if len(v) > 8 else int.from_bytes(v, 'little')
+            print('%-60s %s' % (k, v))
+
+
+def main(argv):
+    p = ioreg(GSP)
+    if not p and argv[:1] not in (['logs'], ['doctor'], ['-h'], ['--help']):
+        print('NVGspControl is not loaded (no IORegistry entry). Try: nvda-smi doctor; nvda-smi logs')
+        return 1
+    if not argv:
+        summary(p)
+    elif argv[0] == '-l':
+        delay = float(argv[1]) if len(argv) > 1 else 1.0
+        while True:
+            os.system('clear')
+            summary(ioreg(GSP))
+            time.sleep(delay)
+    elif argv[0] == 'displays':
+        displays(p)
+    elif argv[0] == 'boot':
+        boot(p)
+    elif argv[0] == 'doctor':
+        return 0 if doctor(p) else 2
+    elif argv[0] == 'logs':
+        logs(int(argv[1]) if len(argv) > 1 else 30)
+    elif argv[0] == '-q':
+        query(p, argv[1] if len(argv) > 1 else '')
+    else:
+        print(__doc__)
+        return 0 if argv[0] in ('-h', '--help') else 1
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)
