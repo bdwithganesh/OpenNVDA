@@ -2050,7 +2050,7 @@ IOReturn NVGspControl::displayTransport615(const UInt8 *in, UInt32 inBytes, UInt
     } else if(op==12) {   // 0.180.200: register the core push buffer and the scaled scan-out buffers
         UInt64 v[3]={0,0,0},start=0,end=0;
         if(payloadBytes>=24)__builtin_memcpy(v,payload,24);
-        constexpr UInt64 kScaled=64ULL<<20;
+        constexpr UInt64 kScaled=kScaledBytes615;
         auto inRange=[&](UInt64 at,UInt64 n) {return at>=start && at+n<=end && at+n>at;};
         auto apart=[&](UInt64 x,UInt64 y,UInt64 ny) {return x+kScaled<=y || x>=y+ny;};
         lk(__LINE__);
@@ -2579,7 +2579,11 @@ IOReturn NVGspControl::displayScaledMode615(UInt32 w,UInt32 h) {
         return kIOReturnSuccess;
     }
     const UInt64 bytes=UInt64(w)*4*h;
-    if(!native && (w<nw || h<nh || w>2*nw || h>2*nh || (w&15) || bytes>(64ULL<<20) || bytes>displayFb615_->getLength()))
+    // 0.180.202: at most 1.5667x per axis (6016x3384 on 4K). A 6720x3780 viewport-in (1.75x) wedges GSP-RM: a
+    // control RPC never returns and the display freezes until a reboot (perf/scale_probe.py, reproduced twice).
+    // Upscaling (smaller than native) is refused by the core channel.
+    if(!native && (w<nw || h<nh || UInt64(w)*10000>UInt64(nw)*15667 || UInt64(h)*10000>UInt64(nh)*15667 || (w&15) ||
+                   bytes>kScaledBytes615 || bytes>displayFb615_->getLength()))
         return kIOReturnUnsupported;
     if(w==curW && h==curH)return kIOReturnSuccess;
     // own native615Busy_ with no copy in flight and no flip pending (as pipeFlip615 does)
@@ -2653,18 +2657,24 @@ IOReturn NVGspControl::displayScaledMode615(UInt32 w,UInt32 h) {
 bool NVGspControl::displayFbAlloc615() {
     if(displayFb615_)return true;
     // 0.180.200: 64 MiB leaves room for a 5120x2880 scaled mode; 32 MiB (native only) if that much is not contiguous
-    UInt64 kBytes=64ULL<<20;
+    // 0.180.202: 80 MiB fits 6016x3384 ("looks like 3008x1692"); smaller if that much is not contiguous
+    static const UInt64 kTry[]={80ULL<<20,64ULL<<20,32ULL<<20};
+    // 0.180.203: a size whose first segment is short (80 MiB at boot was) falls through to the next size;
+    // 0.180.202 gave up there and NVDisplay started without a framebuffer (WindowServer could not open it)
+    UInt64 kBytes=0,phys=0;
     IOBufferMemoryDescriptor *m=nullptr;
-    for(;!m && kBytes>=(32ULL<<20);kBytes>>=1) {
+    for(UInt64 tryBytes:kTry) {
+        kBytes=tryBytes;
         m=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
             kIODirectionInOut|kIOMemoryPhysicallyContiguous|kIOMemoryKernelUserShared,kBytes,0x000000FFFFE00000ULL);
         if(m && m->prepare()!=kIOReturnSuccess) {m->release();m=nullptr;}
-        if(m)break;
+        IOByteCount len=0;
+        phys=m ? m->getPhysicalSegment(0,&len,kIOMemoryMapperNone) : 0;
+        if(phys && len>=kBytes)break;
+        if(m) {m->complete();m->release();m=nullptr;}
+        phys=0;
     }
-    IOByteCount len=0;
-    const UInt64 phys=m ? m->getPhysicalSegment(0,&len,kIOMemoryMapperNone) : 0;
-    if(!phys || len<kBytes) {
-        if(m) {m->complete();m->release();}
+    if(!m) {
         setProperty("NVGspControl-display615-fb-phys",0ULL,64);
         return false;
     }

@@ -7,7 +7,7 @@
 	<key>CFBundleExecutable</key>
 	<string>NVDisplay</string>
 	<key>CFBundleIdentifier</key>
-	<string>org.local.macosdevicelab.NVDisplayFB10</string>
+	<string>org.local.macosdevicelab.NVDisplayFB11</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -15,15 +15,15 @@
 	<key>CFBundlePackageType</key>
 	<string>KEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.5.1</string>
+	<string>1.5.2</string>
 	<key>CFBundleVersion</key>
-	<string>1.5.1</string>
+	<string>1.5.2</string>
 	<key>IOKitPersonalities</key>
 	<dict>
 		<key>RTX 4080 native display</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
-			<string>org.local.macosdevicelab.NVDisplayFB10</string>
+			<string>org.local.macosdevicelab.NVDisplayFB11</string>
 			<key>IOClass</key>
 			<string>NVDA</string>
 			<key>IOGLBundleName</key>

@@ -183,6 +183,7 @@ public:
     bool displayFlipLatched615();
     // 0.180.200: scaled scan-out ("looks like" HiDPI). The head's postcomp scaler takes a W x H window/viewport down
     // to the native raster; op 12 registers the core push buffer and two 64 MiB VRAM buffers for the scaled frame.
+    static constexpr UInt64 kScaledBytes615 = 80ULL << 20;   // 0.180.202: each scaled buffer (was 64 MiB)
     UInt64 displayCorePb615_ = 0, displayScaledFront615_ = 0, displayScaledBack615_ = 0;
     UInt64 displayNativeFront615_ = 0, displayNativeBack615_ = 0;
     UInt32 displayNativePitch615_ = 0, displayNativeLines615_ = 0, displayModeW615_ = 0, displayModeH615_ = 0;
@@ -192,7 +193,7 @@ public:
     // 0.180.197: display pipe flips on the copy engine (pipeFlip615): WindowServer surfaces mapped
     // into the maintenance VAS at pipeVa615_, kPipeSlots615 LRU slots, PTEs kept until evicted
     static constexpr UInt32 kPipeSlots615 = 4;
-    static constexpr UInt64 kPipeSlotBytes615 = 64ULL << 20;
+    static constexpr UInt64 kPipeSlotBytes615 = 80ULL << 20;   // 0.180.202: a 6016x3384 frame (was 64 MiB)
     UInt64 pipeVa615_ = 0, pipeTree615_[kPipeSlots615] = {};
     IOMemoryDescriptor *pipeMd615_[kPipeSlots615] = {};
     UInt32 pipeUse615_[kPipeSlots615] = {}, pipeClock615_ = 0, pipeFlips615_ = 0, pipeFlipFails615_ = 0;

@@ -20,7 +20,7 @@ H_INST, H_COREPB, H_WNDPB, H_CURSURF = 0xc0d0d040, 0xc0d0d041, 0xc0d0d042, 0xc0d
 ISO, CURS_DMA, OLUT_DMA, ILUT_DMA, SYS_DMA = 0xc0d0d001, 0xc0d0d010, 0xc0d0d006, 0xc0d0d007, 0xc0d0d008   # cursor 0xc0d0d002 collided with OLUT in RAMHT
 DISPLAY = 0x200
 FULL, LUT = 0x3dc000000, 0x3de000000     # top of the kernel diagnostic VRAM range
-SCALED = 0x3d2000000   # 2026-11-19: two 64 MiB scaled scan-out buffers (5120x2880 "looks like" modes, NVGspControl 0.180.200)
+SCALED, SCALED_MIB = 0x3c8000000, 80   # two scaled scan-out buffers (up to 6016x3384), NVGspControl 0.180.202
 OLUT_OFF, LUT_LIMIT = 0x2100, 0x4fff     # head OLUT table inside the LUT surface (256-aligned)
 W, H = 3840, 2160
 CURS_USER = 0x690000 + 72 * 0x1000
@@ -195,7 +195,7 @@ else:
     DISPLAY = dps[0]
     print('display 0x%x (connected 0x%x)' % (DISPLAY, conn))
     print('reserve display VRAM', d615('reserve', 34, FULL))   # FULL (32 MiB) + LUT, 0.180.138
-    scaled_ok = d615('reserve', 128, SCALED).get('kr') == '0x0'   # before Metal fills the heap
+    scaled_ok = d615('reserve', 2 * SCALED_MIB, SCALED).get('kr') == '0x0'   # before Metal fills the heap
     # 2026-11-19: nvdisp615-boot.sh starts this in parallel with the first Metal client (which builds the
     # maintenance channel the CE frame copy needs). Everything above leaves the panel alone; wait here, before the
     # display root and the DP link take the panel from the boot screen, so it stays up until the first frame is ready.
@@ -346,7 +346,7 @@ if source == 'desktop':
     print('fb copy 60 Hz', d615('fbcopy', 2, FULL, pitch, H))
     # scaled modes (NVDisplay picks them; kernel op 13 switches) need the core push buffer and the reserved buffers
     if scaled_ok:
-        print('scaled scan-out buffers', d615('scaled', corepb, SCALED, SCALED + (64 << 20)))
+        print('scaled scan-out buffers', d615('scaled', corepb, SCALED, SCALED + (SCALED_MIB << 20)))
 print('register cursor for NVDisplay', d615('native', curs, CURS_USER))   # 0.180.141
 json.dump({'inst': inst, 'core_pb': corepb, 'wnd_pb': wndpb, 'cursor_surface': curs, 'lut': LUT,
            'surface_dma': surf_dma, 'surface_offset': surf_off, 'pitch': pitch, 'source': source,

@@ -17,7 +17,7 @@
 // real refresh rate, the native flag and full detailed timing
 // (getTimingInfoForDisplayMode), so IODisplay/WindowServer see real timing.
 //
-// 1.5.0 (bundle NVDisplayFB9; 1.5.1 = NVDisplayFB10, built-in scaled modes): scaled modes on native615. NVGspControl 0.180.200 drives the head's postcomp
+// 1.5.0 (bundle NVDisplayFB9; 1.5.1 = NVDisplayFB10, built-in scaled modes; 1.5.2 = NVDisplayFB11, 3008x1692): scaled modes on native615. NVGspControl 0.180.200 drives the head's postcomp
 // scaler (nvgsp-scaled-mode), so IOFBScalerInfo is published (downsampling only) and the OS-installed detailed
 // timings with horizontalScaled/verticalScaled above the native raster become modes: WindowServer renders e.g.
 // 5120x2880 ("looks like 2560x1440" HiDPI on the 4K panel) and the head scales it to 3840x2160. The text below
@@ -1424,9 +1424,11 @@ IOReturn NVDisplay::setDisplayMode(IODisplayModeID displayMode, IOIndex depth) {
 }
 
 // 1.5.0: Mac-style HiDPI sizes for the native raster, as 2x backing stores ("looks like" W/2 x H/2): 2560x1440
-// and 2304x1296 on a 4K panel. Larger ones (3008x1692 = 6016x3384) do not fit the 64 MiB framebuffer.
+// and 2304x1296 on a 4K panel. 1.5.2: 3008x1692 (6016x3384, needs the 80 MiB framebuffer of NVGspControl
+// 0.180.202). The ids stay stable (WindowServer saves IODisplayModeID 0x200 = 2560x1440), so new sizes go last.
+// 3360x1890 (6720x3780) wedges GSP-RM and is never offered.
 void NVDisplay::addBuiltinScaled() {
-    static const UInt16 kLooksLike[][2] = {{2560, 1440}, {2304, 1296}};
+    static const UInt16 kLooksLike[][2] = {{2560, 1440}, {2304, 1296}, {3008, 1692}};
     UInt32 n = 0;
     for (const auto &l : kLooksLike) {
         IODetailedTimingInformationV2 t{};
@@ -1435,21 +1437,21 @@ void NVDisplay::addBuiltinScaled() {
         // same aspect as the panel: the height follows the width
         t.horizontalScaled = UInt32(l[0]) * 2 * fBootW / 3840;
         t.verticalScaled = UInt32(l[1]) * 2 * fBootH / 2160;
-        if (n < kNVMaxScaled && scaledOK(t) && t.horizontalScaled > fBootW) {
-            fScaled[n] = {kNVScaledModeBase + static_cast<IODisplayModeID>(n), t};
-            ++n;
-        }
+        const IODisplayModeID id = kNVScaledModeBase + static_cast<IODisplayModeID>(&l - kLooksLike);
+        if (n < kNVMaxScaled && scaledOK(t) && t.horizontalScaled > fBootW) fScaled[n++] = {id, t};
     }
     fScaledBuiltin = fScaledCount = n;
     setProperty("NVDisplay-scaled-modes", n, 32);
 }
 
 // 1.5.0: what NVGspControl 0.180.200 can scan out: the native timing (scaled to it by the head), a scan-out
-// at least the native raster and at most twice it per axis, width a multiple of 16, inside the aperture.
+// at least the native raster, width a multiple of 16, inside the aperture. 1.5.2: at most 1.5667x per axis, the
+// kernel's limit (larger wedges GSP-RM).
 bool NVDisplay::scaledOK(const IODetailedTimingInformationV2 &t) {
     const UInt32 w = t.horizontalScaled, h = t.verticalScaled;
     return fNative615 && w && h && t.horizontalActive == fBootW && t.verticalActive == fBootH && w >= fBootW &&
-           h >= fBootH && w <= 2 * fBootW && h <= 2 * fBootH && !(w & 15) && UInt64(w) * h * 4 <= fApertureBytes &&
+           h >= fBootH && UInt64(w) * 10000 <= UInt64(fBootW) * 15667 && UInt64(h) * 10000 <= UInt64(fBootH) * 15667 &&
+           !(w & 15) && UInt64(w) * h * 4 <= fApertureBytes &&
            !t.horizontalScaledInset && !t.verticalScaledInset && !(t.scalerFlags & kIOScaleRotateFlags);
 }
 
