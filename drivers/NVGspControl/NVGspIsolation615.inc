@@ -2328,6 +2328,36 @@ IOReturn NVGspControl::pipeFlip615(NVGspFlipCopy *f) {
     return r==kIOReturnSuccess ? kIOReturnSuccess : fail(r);
 }
 
+// 0.180.204: sticky for this boot: a CE copy may have been queued and not retired (timeout, submit failure). The
+// display tick can clear displayCopyInflight615_ while the CE still runs, so nothing is ever unwired after that:
+// detileUnwire615 refuses and nativeDetile615 returns kIOReturnUnsupported (the caller detiles on the CPU). Bounded leak
+// of the 4 slots (4 x 80 MiB wired).
+static bool detilePoisoned615 = false;
+
+// 0.180.204: unwire detile slot k: zero its PTEs (last one read back), TLB-invalidate, only then complete/release, so
+// no PTE or TLB entry points at pages we no longer hold. false = left wired (poisoned, runtime gone, or a PTE write
+// or the invalidate failed). native615Busy_ held by the caller.
+// shortcut: no release when the kext stops (it never unloads in practice); the wirings die with the machine.
+static bool detileUnwire615(NVGspControl *self,NVGspNative615State *s,UInt32 k) {
+    auto &d=self->detile615_[k];
+    if(!d.md)return true;
+    if(detilePoisoned615 || !s || !self->pipeVa615_ || !s->mmu.live)return false;
+    const UInt64 va=self->pipeVa615_+UInt64(NVGspControl::kPipeSlots615+k)*NVGspControl::kPipeSlotBytes615,pages=d.bytes>>12;
+    for(UInt64 p=0;p<pages;) {
+        const UInt32 n=pages-p>512 ? 512 : UInt32(pages-p);
+        UInt64 leaf=0;
+        __builtin_memset(s->writeWords,0,512*8);
+        if(!nvgsp::externalTreeLeaf615(s->mmu.tree,va+p*4096,&leaf) ||
+           self->vramAccess(leaf,s->writeWords,n*2,true,true)!=kIOReturnSuccess ||
+           self->vramAccess(leaf+UInt64(n-1)*8,s->readWords,2,false,true)!=kIOReturnSuccess ||
+           s->readWords[0] || s->readWords[1])return false;
+        p+=n;
+    }
+    if(!self->mmuSubmit615(0x1))return false;
+    d.md->complete();d.md->release();d={};
+    return true;
+}
+
 // 0.180.204: NVDEC block-linear NV12 -> the caller's pitch-linear pixel buffer on the copy engine (the CPU
 // detile of NVVTDecoder). Scalars of selector 45 op 6:
 //   {6, srcVa, srcBytes, lumaBytes, blPitch, x0, y0, w, h, yVa, yPitch, uvVa, uvPitch, dstTag}
@@ -2338,11 +2368,11 @@ IOReturn NVGspControl::pipeFlip615(NVGspFlipCopy *f) {
 // dstTag must differ for different destination memory (the IOSurface ID): a VA reused for other memory would
 // otherwise hit a stale wiring. Source and destination PTEs are VOL (uncached in L2): NVDEC's stores and the
 // reader's loads then need no cache maintenance.
-// shortcut: after a timeout the cached mappings stay wired, the copy may still run on them; a later
-// re-target of such a slot could free pages under it (the channel is serial, a stuck CE is a GPU reset anyway).
+// A timeout or submit failure poisons the feature for this boot (detilePoisoned615).
 IOReturn NVGspControl::nativeDetile615(const void *owner,task_t task,const UInt64 *in,UInt32 count) {
     auto *s=native615_;
     if(!lock_ || !owner || !task || !in || count!=14 || in[0]!=6)return kIOReturnBadArgument;
+    if(detilePoisoned615)return kIOReturnUnsupported;
     const UInt64 srcVa=in[1],srcBytes=in[2],lumaBytes=in[3],blPitch=in[4],x0=in[5],y0=in[6],w=in[7],h=in[8];
     const UInt64 yVa=in[9],yPitch=in[10],uvVa=in[11],uvPitch=in[12],tag=in[13];
     constexpr UInt64 kUser=0x0000800000000000ULL;   // as userMemBind: never a kernel address
@@ -2352,11 +2382,12 @@ IOReturn NVGspControl::nativeDetile615(const void *owner,task_t task,const UInt6
     };
     const UInt64 rows=blPitch ? lumaBytes/blPitch : 0;
     // every size is bounded before any sum, so nothing below can wrap
-    if(!blPitch || blPitch>0x10000 || (blPitch&63) || lumaBytes>(1ULL<<30) || rows*blPitch!=lumaBytes || !rows || (rows&15) ||
+    if(!blPitch || blPitch>0x10000 || (blPitch&63) || lumaBytes>(1ULL<<30) || rows*blPitch!=lumaBytes || !rows || (rows&31) ||
        x0>0xffff || y0>0xffff || w>0xffff || h>0xffff || !w || !h || (x0&15) || ((h|y0)&1) ||
        x0+w>blPitch || y0+h>rows || yPitch<w || uvPitch<w || yPitch>0x100000 || uvPitch>0x100000 ||
        !srcVa || ((srcVa|srcBytes)&0xfff) || srcVa>=kUser || srcBytes>kPipeSlotBytes615 || srcBytes>kUser-srcVa ||
-       lumaBytes+lumaBytes/2>srcBytes || !yVa || !uvVa || yVa>=kUser || uvVa>=kUser)return fail(kIOReturnBadArgument);
+       lumaBytes+((rows/2+15)&~15ULL)*blPitch>srcBytes ||   // furthest chroma block row the CE can address
+        !yVa || !uvVa || yVa>=kUser || uvVa>=kUser)return fail(kIOReturnBadArgument);
     const UInt64 yEnd=yVa+(h-1)*yPitch+w,uvEnd=uvVa+(h/2-1)*uvPitch+w;   // last byte written + 1
     const UInt64 dLo=(yVa<uvVa ? yVa : uvVa)&~0xfffULL,dHi=((yEnd>uvEnd ? yEnd : uvEnd)+0xfff)&~0xfffULL;
     if((yEnd>uvVa && uvEnd>yVa) || yEnd>kUser || uvEnd>kUser || dHi-dLo>kPipeSlotBytes615)return fail(kIOReturnBadArgument);
@@ -2397,7 +2428,10 @@ IOReturn NVGspControl::nativeDetile615(const void *owner,task_t task,const UInt6
             for(UInt32 i=0;i<kDetileSlots615;++i)
                 if(i!=avoid && (k==kDetileSlots615 || detile615_[i].use<detile615_[k].use))k=i;
             auto &d=detile615_[k];
-            if(d.md) {d.md->complete();d.md->release();}
+            if(d.md) {   // no stale PTE may outlive the pages; refused (wired forever) once poisoned
+                d.tree=0;
+                if(!detileUnwire615(this,s,k))return kIOReturnIOError;
+            }
             d={};
             IOMemoryDescriptor *md=IOMemoryDescriptor::withAddressRange(uaddr,bytes,kIODirectionInOut,task);
             if(!md)return kIOReturnNoMemory;
@@ -2463,7 +2497,7 @@ IOReturn NVGspControl::nativeDetile615(const void *owner,task_t task,const UInt6
         const UInt32 entry[2]={UInt32(pb)&0xfffffffc,(UInt32(pb>>32)&0xff)|(c<<10)};
         const UInt32 put=(m.put+1)%256;
         if(!write(m.ring+0xc00,w32,c) || !write(m.ring+UInt64(m.put)*8,entry,2) || !write(m.userd+0x8c,&put,1) ||
-           diagnosticChannelKick(0xc0d00556,true)!=kIOReturnSuccess)r=kIOReturnIOError;
+           diagnosticChannelKick(0xc0d00556,true)!=kIOReturnSuccess) {detilePoisoned615=true;r=kIOReturnIOError;}   // may be queued
         else {
             lk(__LINE__);m.put=put;m.fence=fence&0xfff;ulk();
             UInt64 limit=0,spin=0;clock_interval_to_deadline(1,kSecondScale,&limit);clock_interval_to_deadline(2,kMillisecondScale,&spin);
@@ -2472,7 +2506,7 @@ IOReturn NVGspControl::nativeDetile615(const void *owner,task_t task,const UInt6
                 if(s->readWords[0]==fence) {finished=true;break;}
                 if(mach_absolute_time()<spin)IODelay(10); else IOSleep(1);
             } while(mach_absolute_time()<limit);
-            if(!finished)r=kIOReturnTimeout;
+            if(!finished) {detilePoisoned615=true;r=kIOReturnTimeout;}
         }
     }
     lk(__LINE__);
@@ -2504,7 +2538,12 @@ void NVGspControl::detileRelease615(const void *owner) {
         }
         IOSleep(1);
     }
-    for(auto &d:detile615_)if(d.md && d.owner==owner) {d.md->complete();d.md->release();d={};}
+    for(UInt32 k=0;k<kDetileSlots615;++k) {
+        auto &d=detile615_[k];
+        if(!d.md || d.owner!=owner)continue;
+        d.tree=0;
+        if(!detileUnwire615(this,native615_,k))d.owner=nullptr;   // left wired: freed at the next re-target
+    }
     lk(__LINE__);native615Busy_=false;ulk();
 }
 
