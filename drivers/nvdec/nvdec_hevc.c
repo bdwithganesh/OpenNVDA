@@ -29,12 +29,19 @@ int nvdec_hevc_param_nal(nvdec_hevc_dec *d, const uint8_t *nal, size_t size) {
     return NVDEC_HEVC_OK;
 }
 
+int nvdec_hevc_sps_depth(const hevc_sps *s) {
+    if (s->chroma_format_idc != 1 || s->bit_depth_luma != s->bit_depth_chroma) return 0;
+    if (s->bit_depth_luma == 8) return 8;
+    return s->bit_depth_luma == 10 && s->main10_profile ? 10 : 0;
+}
+
 void nvdec_hevc_layout_for(const hevc_sps *s, nvdec_hevc_layout *l) {
     memset(l, 0, sizeof(*l));
     l->width = (uint32_t)s->width;
     l->height = (uint32_t)s->height;
+    l->bytes_per_sample = s->bit_depth_luma > 8 ? 2 : 1;   /* 10-bit: 16-bit words */
     const uint32_t w64 = (l->width + 63) & ~63u, h64 = (l->height + 63) & ~63u;
-    l->pitch = w64;                          /* whole GOBs */
+    l->pitch = ((l->width + 63) & ~63u) * l->bytes_per_sample;   /* whole GOBs; framestride (samples) stays a multiple of 64 */
     l->aligned_height = h64;                 /* whole CTBs; chroma rows stay whole 16-row blocks */
     l->luma_bytes = l->pitch * l->aligned_height;
     l->surface_bytes = (l->luma_bytes + l->luma_bytes / 2 + 0xff) & ~0xffu;
@@ -137,7 +144,7 @@ int nvdec_hevc_begin(nvdec_hevc_dec *d, const hevc_slice *sl, uint8_t *in, nvdec
     hevc_pps *p = &d->pps[sl->pps_id];
     if (!p->valid || p->sps_id < 0 || p->sps_id >= HEVC_MAX_SPS || !d->sps[p->sps_id].valid) return NVDEC_HEVC_EPARAM;
     const hevc_sps *s = &d->sps[p->sps_id];
-    if (s->chroma_format_idc != 1 || s->bit_depth_luma != 8 || s->bit_depth_chroma != 8) return NVDEC_HEVC_EFORMAT;
+    if (!nvdec_hevc_sps_depth(s)) return NVDEC_HEVC_EFORMAT;
     hevc_pps_tiles(p, s);
     d->sps_id = p->sps_id;
     const int t = sl->nal_type, irap = hevc_is_irap(t), idr = hevc_is_idr(t);
@@ -215,7 +222,10 @@ int nvdec_hevc_begin(nvdec_hevc_dec *d, const hevc_slice *sl, uint8_t *in, nvdec
     o->tileformat = 1;          /* KBL, as H.264 */
     o->gob_height = 0;          /* GOB_2 */
     o->sw_start_code_e = 1;
-    o->framestride[0] = o->framestride[1] = l.pitch;
+    /* measured 2026-11-20: NVDEC scales framestride by the output sample size (10-bit wrote at twice the pitch) */
+    o->framestride[0] = o->framestride[1] = l.pitch / l.bytes_per_sample;
+    /* nvdec_drv.h: 0 = Rec.709 8 bit, 1 = Rec.709 10 bit. Assumed to select 16-bit sample output; not measured. */
+    o->disp_output_mode = s->bit_depth_luma > 8 ? 1 : 0;
     o->colMvBuffersize = l.coloc_frame_bytes >> 8;
     o->HevcSaoBufferOffset = l.sao_offset >> 8;
     o->HevcBsdCtrlOffset = l.bsd_offset >> 8;

@@ -1,4 +1,4 @@
-// avdecode <file>: decode the first video track with AVAssetReader (NV12) and print one hash per frame
+// avdecode <file> [10]: decode the first video track with AVAssetReader (NV12) and print one hash per frame
 // plus totals. Run once with NVMTL_NVVT=0 (software) and once without (NVDEC via NVMTL 0.9.93), then diff.
 // clang -fobjc-arc avdecode.m -framework AVFoundation -framework CoreVideo -framework CoreMedia -framework Metal -framework Foundation -o avdecode
 #import <AVFoundation/AVFoundation.h>
@@ -8,6 +8,8 @@
 int main(int argc, char **argv) {
     @autoreleasepool {
         if (argc < 2) return 2;
+        const bool ten = argc > 2 && !strcmp(argv[2], "10");   // optional: P010-style 10-bit output
+        const size_t bps = ten ? 2 : 1;
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();   // loads NVMTL, which registers the NVDEC decoders
         (void)dev; usleep(300000);
         AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:@(argv[1])] options:nil];
@@ -19,7 +21,7 @@ int main(int argc, char **argv) {
         NSError *err = nil;
         AVAssetReader *r = [AVAssetReader assetReaderWithAsset:asset error:&err];
         AVAssetReaderTrackOutput *o = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:tracks[0]
-            outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)}];
+            outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey: @(ten ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)}];
         [r addOutput:o];
         if (![r startReading]) { printf("startReading: %s\n", r.error.description.UTF8String); return 1; }
         int frames = 0;
@@ -33,7 +35,7 @@ int main(int argc, char **argv) {
                 CC_MD5_CTX m; CC_MD5_Init(&m);
                 for (size_t p = 0; p < CVPixelBufferGetPlaneCount(pb); p++) {
                     const uint8_t *b = CVPixelBufferGetBaseAddressOfPlane(pb, p);
-                    const size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, p), w = CVPixelBufferGetWidthOfPlane(pb, p) * (p ? 2 : 1);
+                    const size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, p), w = CVPixelBufferGetWidthOfPlane(pb, p) * (p ? 2 : 1) * bps;
                     for (size_t y = 0; y < CVPixelBufferGetHeightOfPlane(pb, p); y++) CC_MD5_Update(&m, b + y * bpr, (CC_LONG)w);
                 }
                 uint8_t d[16]; CC_MD5_Final(d, &m);
@@ -41,7 +43,7 @@ int main(int argc, char **argv) {
                     FILE *f = fopen(getenv("AVDECODE_OUT") ? getenv("AVDECODE_OUT") : "/tmp/frame.nv12", "wb");
                     for (size_t p = 0; p < CVPixelBufferGetPlaneCount(pb); p++) {
                         const uint8_t *b = CVPixelBufferGetBaseAddressOfPlane(pb, p);
-                        const size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, p), w = CVPixelBufferGetWidthOfPlane(pb, p) * (p ? 2 : 1);
+                        const size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, p), w = CVPixelBufferGetWidthOfPlane(pb, p) * (p ? 2 : 1) * bps;
                         for (size_t y = 0; y < CVPixelBufferGetHeightOfPlane(pb, p); y++) fwrite(b + y * bpr, 1, w, f);
                     }
                     fclose(f);

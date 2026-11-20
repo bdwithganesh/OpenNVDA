@@ -18,6 +18,10 @@ extern "C" {
 }
 
 namespace {
+// 0.3.3 shortcut: where NVDEC puts the 10 bits of a 16-bit HEVC Main10 sample is not measured. 0 = already in
+// the upper bits (P010 / cudaVideoSurfaceFormat_P016 style, assumed): the CE detile is used. 6 = in the low
+// bits: the CE cannot shift, so 10-bit frames are detiled on the CPU and shifted left by this. Set by measurement.
+constexpr int kHevc10Shift = 0;
 std::atomic<uint64_t> sessions{0}, submitted{0}, emitted{0}, errors{0}, gpuNS{0};
 struct Buffer { uint64_t handle = 0, va = 0, bytes = 0; uint8_t *cpu = nullptr; };
 struct Decoder {
@@ -27,7 +31,8 @@ struct Decoder {
     nvdec_h264_dec h264;
     nvdec_h264_layout layout{};
     nvdec_h264_addrs addrs{};
-    bool hevc = false;   // HEVC Main 8-bit: same buffers and submit as H.264
+    bool hevc = false;   // HEVC Main / Main10: same buffers and submit as H.264
+    int depth = 8, bps = 1;   // 0.3.3: sample bit depth, bytes per sample in the NVDEC surface and pixel buffer
     nvdec_hevc_dec hdec;
     nvdec_hevc_layout hlayout{};
     nvdec_hevc_addrs haddrs{};
@@ -125,7 +130,8 @@ struct Decoder {
         haddrs.in_va = input.va; haddrs.coloc_va = aux.va; haddrs.filter_va = aux.va + c;
         haddrs.misc_va = aux.va + c + f; haddrs.subch = 4; haddrs.obj_class = 0xc9b0;
         for (int i = 0; i < NVDEC_HEVC_SURFACES; ++i) haddrs.surface_va[i] = surfaces.va + stride * i;
-        linear.resize((size_t)hlayout.width * hlayout.height * 3 / 2);
+        bps = (int)hlayout.bytes_per_sample;
+        linear.resize((size_t)hlayout.width * bps * hlayout.height * 3 / 2);
         return true;
     }
     // 0.3.2: NVGspControl >= 0.180.204 selector 45 op 6: the copy engine detiles one NVDEC surface window
@@ -134,8 +140,8 @@ struct Decoder {
     bool ceDetile(CVPixelBufferRef pixel, const uint8_t *base, uint32_t blPitch, uint32_t lumaBytes) {
         IOSurfaceRef io = CVPixelBufferGetIOSurface(pixel);
         if (!io) return false;
-        uint64_t args[] = {6, (uint64_t)(uintptr_t)base, stride, lumaBytes, blPitch, (uint64_t)x0, (uint64_t)y0,
-            (uint64_t)width, (uint64_t)height,
+        uint64_t args[] = {6, (uint64_t)(uintptr_t)base, stride, lumaBytes, blPitch, (uint64_t)x0 * bps, (uint64_t)y0,
+            (uint64_t)width * bps, (uint64_t)height,
             (uint64_t)(uintptr_t)CVPixelBufferGetBaseAddressOfPlane(pixel, 0), CVPixelBufferGetBytesPerRowOfPlane(pixel, 0),
             (uint64_t)(uintptr_t)CVPixelBufferGetBaseAddressOfPlane(pixel, 1), CVPixelBufferGetBytesPerRowOfPlane(pixel, 1),
             IOSurfaceGetID(io)}, out[3]; uint32_t count = 3;
@@ -210,26 +216,32 @@ OSStatus start(VTVideoDecoderRef instance, VTVideoDecoderSession session,
         h264_nal nal{data, size, data[0] & 31, (data[0] >> 5) & 3};
         if (nvdec_h264_param_nal(&d->h264, &nal)) return kVTVideoDecoderBadDataErr;
     }
-    // 0.3.1: refuse what NVDEC is not set up for (4:2:0 8-bit only) here, at session start, so VT picks
-    // the software decoder. Failing on the first frame instead made QuickTime stall on Main10 HEVC.
-    auto supported = [](const auto *sps, int n) {
-        int valid = 0;
+    // 0.3.1: refuse what NVDEC is not set up for here, at session start, so VT picks the software decoder
+    // (failing on the first frame instead made QuickTime stall on Main10 HEVC). 0.3.3: 4:2:0 8-bit, and
+    // HEVC Main10 (4:2:0 10-bit); all SPS must agree. Returns the bit depth, 0 = refuse.
+    auto depthOf = [](const auto *sps, int n, auto one) {
+        int valid = 0, depth = 0;
         for (int i = 0; i < n; ++i) {
             if (!sps[i].valid) continue;
-            ++valid;
-            if (sps[i].chroma_format_idc != 1 || sps[i].bit_depth_luma != 8 || sps[i].bit_depth_chroma != 8) return false;
+            const int v = one(sps[i]);
+            if (!v || (valid++ && v != depth)) return 0;
+            depth = v;
         }
-        return valid > 0;
+        return depth;
     };
-    if (d->hevc ? !supported(d->hdec.sps, HEVC_MAX_SPS) : !supported(d->h264.sps, H264_MAX_SPS)) {
-        os_log(OS_LOG_DEFAULT, "NVVTDecoder: format not supported by NVDEC path (needs 4:2:0 8-bit), software decode");
+    d->depth = d->hevc ? depthOf(d->hdec.sps, HEVC_MAX_SPS, [](const hevc_sps &s) { return nvdec_hevc_sps_depth(&s); })
+                       : depthOf(d->h264.sps, H264_MAX_SPS, [](const h264_sps &s) {
+                             return s.chroma_format_idc == 1 && s.bit_depth_luma == 8 && s.bit_depth_chroma == 8 ? 8 : 0; });
+    if (!d->depth) {
+        os_log(OS_LOG_DEFAULT, "NVVTDecoder: format not supported by NVDEC path (needs 4:2:0 8-bit or HEVC Main10), software decode");
         return kVTVideoDecoderUnsupportedDataFormatErr;
     }
     const auto dim = CMVideoFormatDescriptionGetDimensions(format);
     d->width = dim.width; d->height = dim.height;
     if (d->width <= 0 || d->height <= 0 || d->width > 4096 || d->height > 2304)
         return kVTVideoDecoderUnsupportedDataFormatErr;
-    int formatCode = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    int formatCode = d->depth == 10 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+                                    : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     CFNumberRef w = CFNumberCreate(nullptr, kCFNumberIntType, &d->width);
     CFNumberRef h = CFNumberCreate(nullptr, kCFNumberIntType, &d->height);
     CFNumberRef f = CFNumberCreate(nullptr, kCFNumberIntType, &formatCode);
@@ -258,24 +270,32 @@ OSStatus emitSurface(Decoder *d, VTVideoDecoderFrame frame, const uint8_t *base,
     CVPixelBufferPoolRef pool = VTDecoderSessionGetPixelBufferPool(d->session);
     CVPixelBufferRef pixel = nullptr;
     if (!pool || CVPixelBufferPoolCreatePixelBuffer(nullptr, pool, &pixel)) return kVTAllocationFailedErr;
-    if (CVPixelBufferGetPixelFormatType(pixel) != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+    if (CVPixelBufferGetPixelFormatType(pixel) != (d->depth == 10 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+                                                                  : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) ||
         CVPixelBufferGetWidth(pixel) != (size_t)d->width || CVPixelBufferGetHeight(pixel) != (size_t)d->height ||
         CVPixelBufferGetPlaneCount(pixel) != 2 || CVPixelBufferLockBaseAddress(pixel, 0)) {
         CFRelease(pixel); return kVTVideoDecoderMalfunctionErr;
     }
-    const bool ce = !d->cpuOnly && d->ceDetile(pixel, base, blPitch, lumaBytes);
+    const bool ce = !d->cpuOnly && !(d->bps == 2 && kHevc10Shift) && d->ceDetile(pixel, base, blPitch, lumaBytes);
     if (ce) ++d->ceFrames; else ++d->cpuFrames;
     for (int plane = 0; plane < 2 && !ce; ++plane) {
         uint8_t *dst = static_cast<uint8_t *>(CVPixelBufferGetBaseAddressOfPlane(pixel, plane));
         const size_t pitch = CVPixelBufferGetBytesPerRowOfPlane(pixel, plane);
         // 0.3.1: straight into the pixel buffer (8 ms -> see LOG); the staged path stays for odd crops
-        if (!nvdec_detile_crop(base + (plane ? lumaBytes : 0), blPitch, dst, (uint32_t)pitch, d->x0, d->y0 >> plane,
-                               d->width, d->height >> plane))
-            continue;
-        nvdec_detile(base + (plane ? lumaBytes : 0), blPitch, d->linear.data(), codedWidth, codedWidth,
-                     codedHeight >> plane);
-        for (int y = 0; y < (d->height >> plane); ++y)
-            memcpy(dst + y * pitch, d->linear.data() + (size_t)(y + (d->y0 >> plane)) * codedWidth + d->x0, d->width);
+        // 0.3.3: widths and x0 in bytes (x2 for 10-bit); the interleaved chroma row is as many bytes as luma
+        const uint32_t rowBytes = codedWidth * d->bps, cropBytes = (uint32_t)d->width * d->bps, x0Bytes = (uint32_t)d->x0 * d->bps;
+        if (nvdec_detile_crop(base + (plane ? lumaBytes : 0), blPitch, dst, (uint32_t)pitch, x0Bytes, d->y0 >> plane,
+                              cropBytes, d->height >> plane)) {
+            nvdec_detile(base + (plane ? lumaBytes : 0), blPitch, d->linear.data(), rowBytes, rowBytes,
+                         codedHeight >> plane);
+            for (int y = 0; y < (d->height >> plane); ++y)
+                memcpy(dst + y * pitch, d->linear.data() + (size_t)(y + (d->y0 >> plane)) * rowBytes + x0Bytes, cropBytes);
+        }
+        if (d->bps == 2 && kHevc10Shift)
+            for (int y = 0; y < (d->height >> plane); ++y) {
+                uint16_t *row = reinterpret_cast<uint16_t *>(dst + y * pitch);
+                for (int x = 0; x < d->width; ++x) row[x] = (uint16_t)(row[x] << kHevc10Shift);
+            }
     }
     CVPixelBufferUnlockBaseAddress(pixel, 0);
     const OSStatus err = VTDecoderSessionEmitDecodedFrame(d->session, frame, noErr, 0, pixel);
@@ -319,6 +339,7 @@ OSStatus decodeHevc(Decoder *d, VTVideoDecoderFrame frame, std::vector<uint8_t> 
         return VTDecoderSessionEmitDecodedFrame(d->session, frame, noErr, kVTDecodeInfo_FrameDropped, nullptr);
     if (r) return fail(r == NVDEC_HEVC_EFORMAT ? kVTVideoDecoderUnsupportedDataFormatErr : kVTVideoDecoderBadDataErr);
     const hevc_sps &s = d->hdec.sps[d->hdec.sps_id];
+    if (nvdec_hevc_sps_depth(&s) != d->depth) return fail(kVTVideoDecoderUnsupportedDataFormatErr);
     if (s.width > 4096 || s.height > 2304 || s.width - s.conf_left - s.conf_right != d->width ||
         s.height - s.conf_top - s.conf_bottom != d->height || ((d->width | d->height | s.conf_left | s.conf_top) & 1))
         return fail(kVTVideoDecoderUnsupportedDataFormatErr);

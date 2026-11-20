@@ -1,5 +1,5 @@
 /*
- * HEVC (Main, 4:2:0 8-bit) decode on NVDEC (NVC9B0, AD103): driver-side state machine, the HEVC
+ * HEVC (Main 8-bit, Main 10; 4:2:0) decode on NVDEC (NVC9B0, AD103): driver-side state machine, the HEVC
  * counterpart of nvdec_h264.h. The firmware parses the slice data and most of each slice header;
  * the driver supplies, per picture, nvdec_hevc_pic_s (SPS/PPS fields, reference slots and POC
  * differences, sw_hdr_skip_length), the scaling list and tile tables, the bitstream (00 00 01 +
@@ -23,7 +23,7 @@
 enum {
     NVDEC_HEVC_OK = 0,
     NVDEC_HEVC_EPARAM = -1,    /* missing / bad VPS-SPS-PPS */
-    NVDEC_HEVC_EFORMAT = -3,   /* not 4:2:0 8-bit */
+    NVDEC_HEVC_EFORMAT = -3,   /* not 4:2:0 8-bit / Main 10 */
     NVDEC_HEVC_ENOSURF = -4,
     NVDEC_HEVC_SKIP = 1,       /* RASL picture of a CRA/BLA that starts decoding: not decoded */
 };
@@ -48,6 +48,7 @@ typedef struct {
 
 typedef struct {
     uint32_t width, height;                 /* coded size (pic_*_in_luma_samples) */
+    uint32_t bytes_per_sample;              /* 1, or 2 for 10-bit (16-bit words); pitch is in bytes */
     uint32_t pitch, aligned_height;         /* block-linear luma plane, height to 64 */
     uint32_t luma_bytes, surface_bytes;     /* chroma at +luma_bytes */
     uint32_t coloc_frame_bytes, coloc_bytes, filter_bytes, sao_offset, bsd_offset;
@@ -69,6 +70,8 @@ typedef struct {
 void nvdec_hevc_init(nvdec_hevc_dec *d);
 /* VPS/SPS/PPS/EOS NALs (data starts at the 2-byte NAL header); others ignored. */
 int nvdec_hevc_param_nal(nvdec_hevc_dec *d, const uint8_t *nal, size_t size);
+/* 8 or 10 if the SPS is a supported 4:2:0 format (8-bit, or 10-bit Main 10), else 0. */
+int nvdec_hevc_sps_depth(const hevc_sps *s);
 void nvdec_hevc_layout_for(const hevc_sps *s, nvdec_hevc_layout *l);
 /* First slice segment of a picture: POC, RPS, bumping, surface, setup + scaling/tile tables
  * (written into `in`, the CPU view of the input buffer). Pictures leave in display order

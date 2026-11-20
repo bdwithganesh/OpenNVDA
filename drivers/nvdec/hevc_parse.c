@@ -199,8 +199,11 @@ static int parse_st_rps(h264_bits *b, int idx, int num_sets, const hevc_st_rps *
 
 /* -------------------------------------------------------------------- SPS */
 
-static void skip_ptl(h264_bits *b, int max_sub_layers_minus1) {
-    h264_u(b, 32); h264_u(b, 32); h264_u(b, 24);   /* general profile: 88 bits */
+/* Skips profile_tier_level; returns 1 if general_profile_idc is 2 (Main 10) or compatibility flag 2 is set. */
+static int skip_ptl(h264_bits *b, int max_sub_layers_minus1) {
+    const uint32_t w0 = h264_u(b, 32);             /* space, tier, profile_idc, compatibility flags 0..23 */
+    h264_u(b, 32); h264_u(b, 24);                  /* general profile: 88 bits in all */
+    const int main10 = ((w0 >> 24) & 31) == 2 || ((w0 >> 21) & 1);
     h264_u(b, 8);                                  /* general_level_idc */
     int prof[8] = {0}, lev[8] = {0};
     for (int i = 0; i < max_sub_layers_minus1; ++i) {
@@ -213,6 +216,7 @@ static void skip_ptl(h264_bits *b, int max_sub_layers_minus1) {
         if (prof[i]) { h264_u(b, 32); h264_u(b, 32); h264_u(b, 24); }
         if (lev[i]) h264_u(b, 8);
     }
+    return main10;
 }
 
 int hevc_parse_sps(const uint8_t *nal, size_t size, hevc_sps *out) {
@@ -230,7 +234,7 @@ int hevc_parse_sps(const uint8_t *nal, size_t size, hevc_sps *out) {
     const int max_sub_layers_minus1 = (int)h264_u(&b, 3);
     h264_u(&b, 1);
     if (max_sub_layers_minus1 > 6) return -1;
-    skip_ptl(&b, max_sub_layers_minus1);
+    s.main10_profile = skip_ptl(&b, max_sub_layers_minus1);
     s.id = (int)h264_ue(&b);
     if (s.id < 0 || s.id >= HEVC_MAX_SPS) return -1;
     s.chroma_format_idc = (int)h264_ue(&b);

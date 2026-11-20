@@ -51,7 +51,7 @@ typedef struct {
 
 typedef struct {
     int valid, id;
-    int chroma_format_idc, separate_colour_plane_flag;
+    int chroma_format_idc, separate_colour_plane_flag, main10_profile;
     int width, height;                                  /* pic_*_in_luma_samples */
     int conf_left, conf_right, conf_top, conf_bottom;   /* in luma samples */
     int bit_depth_luma, bit_depth_chroma;
