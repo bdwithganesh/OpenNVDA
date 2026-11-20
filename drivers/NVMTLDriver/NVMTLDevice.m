@@ -5557,7 +5557,7 @@ static NSArray *nvAppleReflArgs(NVMTLKernel *k) {
         free(mem);
         if (st) {
             objc_setAssociatedObject(st, &kNvVisMembers, [members copy], OBJC_ASSOCIATION_RETAIN);
-            ((void (*)(id, SEL, id))objc_msgSend)(lastBuf, sel_registerName("setStructType:"), st);
+            ((void (*)(id, SEL, id, BOOL))objc_msgSend)(lastBuf, sel_registerName("setStructType:doRetain:"), st, YES);   // 0.9.95: plain setStructType: aborts
         }
     };
     for (NSString *line in k.refl) {
@@ -5783,6 +5783,56 @@ static id nvComputeReflection(NVMTLComputePipelineState *ps) {
 - (NSArray *)bindings { return _arguments; }
 - (NSArray *)builtInArguments { return @[]; }
 @end
+// 0.9.95: struct type of an argument-buffer parameter from nakc's refli rows (offset kind id count access name),
+// laid out the way nvOurArgEncoder reads them; nil (today's behaviour) when Apple's classes lack a selector.
+static char kNvArgBufKeep;
+static BOOL nvHas(const char *c, const char *s) { Class k = objc_getClass(c); return k && class_getInstanceMethod(k, sel_registerName(s)); }
+static id nvArgBufStruct(NSArray<NSArray<NSString *> *> *rows) {
+    if (!nvHas("MTLStructTypeInternal", "initWithMembers:count:") || !nvHas("MTLStructTypeInternal", "setIsIndirectArgumentBuffer:") ||
+        !nvHas("MTLStructMemberInternal", "initWithName:offset:dataType:pixelFormat:aluType:indirectArgumentIndex:render_target:raster_order_group:details:") ||
+        !nvHas("MTLArrayTypeInternal", "initWithArrayLength:elementType:stride:pixelFormat:aluType:details:") ||
+        !nvHas("MTLTextureReferenceTypeInternal", "initWithDataType:textureType:access:isDepthTexture:") ||
+        !nvHas("MTLPointerTypeInternal", "initWithElementType:elementTypeDescription:access:alignment:dataSize:elementIsIndirectArgumentBuffer:isConstantBuffer:"))
+        return nil;
+    NSMutableArray *keep = [NSMutableArray new];   // Apple's inits may not retain details
+    const NSUInteger n = rows.count;
+    __unsafe_unretained id *mem = (__unsafe_unretained id *)malloc(n * sizeof(id));
+    if (!mem) return nil;
+    for (NSUInteger i = 0; i < n; i++) {
+        NSArray<NSString *> *w = rows[i];
+        const NSUInteger off = (NSUInteger)w[1].integerValue, kind = (NSUInteger)w[2].integerValue, aid = (NSUInteger)w[3].integerValue;
+        const NSUInteger cnt = (NSUInteger)MAX(w[4].integerValue, 1), acc = (NSUInteger)w[5].integerValue;
+        const NSUInteger edt = kind == 2 ? MTLDataTypeTexture : kind == 3 ? MTLDataTypeSampler : MTLDataTypePointer;
+        id det = nil;
+        // shortcut: refli carries no texture type or pointee type, so textures are texture2d<float> and pointers float*
+        if (kind == 2)
+            det = ((id (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger, BOOL))objc_msgSend)([objc_getClass("MTLTextureReferenceTypeInternal") alloc],
+                sel_registerName("initWithDataType:textureType:access:isDepthTexture:"), (NSUInteger)MTLDataTypeFloat, (NSUInteger)MTLTextureType2D, acc, NO);
+        else if (kind == 0)
+            det = ((id (*)(id, SEL, NSUInteger, id, NSUInteger, NSUInteger, NSUInteger, BOOL, BOOL))objc_msgSend)([objc_getClass("MTLPointerTypeInternal") alloc],
+                sel_registerName("initWithElementType:elementTypeDescription:access:alignment:dataSize:elementIsIndirectArgumentBuffer:isConstantBuffer:"),
+                (NSUInteger)MTLDataTypeFloat, nil, acc, (NSUInteger)4, (NSUInteger)4, NO, NO);
+        if (det) [keep addObject:det];
+        if (cnt > 1) {
+            det = ((id (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger, NSUInteger, NSUInteger, id))objc_msgSend)([objc_getClass("MTLArrayTypeInternal") alloc],
+                sel_registerName("initWithArrayLength:elementType:stride:pixelFormat:aluType:details:"), cnt, edt, (NSUInteger)8, (NSUInteger)0, (NSUInteger)0, det);
+            if (det) [keep addObject:det];
+        }
+        id m = ((id (*)(id, SEL, id, NSUInteger, NSUInteger, NSUInteger, NSUInteger, NSUInteger, NSUInteger, NSUInteger, id))objc_msgSend)(
+            [objc_getClass("MTLStructMemberInternal") alloc],
+            sel_registerName("initWithName:offset:dataType:pixelFormat:aluType:indirectArgumentIndex:render_target:raster_order_group:details:"),
+            w[6], off, cnt > 1 ? (NSUInteger)MTLDataTypeArray : edt, (NSUInteger)0, (NSUInteger)0, aid, (NSUInteger)0, (NSUInteger)0, det);
+        if (!m) { free(mem); return nil; }
+        [keep addObject:m];
+        mem[i] = m;
+    }
+    id st = ((id (*)(id, SEL, void *, NSUInteger))objc_msgSend)([objc_getClass("MTLStructTypeInternal") alloc], sel_registerName("initWithMembers:count:"), mem, n);
+    free(mem);
+    if (!st) return nil;
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(st, sel_registerName("setIsIndirectArgumentBuffer:"), YES);
+    objc_setAssociatedObject(st, &kNvArgBufKeep, keep, OBJC_ASSOCIATION_RETAIN);
+    return st;
+}
 static NSArray *nvFunctionReflArgs(NVMTLKernel *k) {
     Class BB = objc_getClass("MTLBufferBindingInternal"), TB = objc_getClass("MTLThreadgroupMemoryBindingInternal");
     Class XB = objc_getClass("MTLTextureBindingInternal"), XT = objc_getClass("MTLTextureReferenceTypeInternal");
@@ -5793,13 +5843,13 @@ static NSArray *nvFunctionReflArgs(NVMTLKernel *k) {
     // textures count their indices apart
     NSMutableArray *a = [NSMutableArray new];
     NSUInteger nbuf = 0, ntg = 0, ntex = 0;
-    for (NSString *line in k.refl) {
-        NSArray<NSString *> *w = [line componentsSeparatedByString:@" "];
+    for (NSUInteger li = 0; li < k.refl.count; li++) {
+        NSArray<NSString *> *w = [k.refl[li] componentsSeparatedByString:@" "];
         if (w.count < 13 || ![w[0] isEqual:@"refl"] || [w[12] hasPrefix:@"__"]) continue;
         const NSUInteger type = (NSUInteger)w[1].integerValue, acc = (NSUInteger)w[3].integerValue;
         const NSUInteger size = (NSUInteger)w[6].integerValue, align = (NSUInteger)w[7].integerValue;
         const NSUInteger dt = (NSUInteger)w[8].integerValue;
-        id b = nil;
+        id b = nil, st = nil;
         if (type == MTLArgumentTypeTexture) {
             const NSUInteger tt = (NSUInteger)w[9].integerValue, tdt = (NSUInteger)w[10].integerValue;
             const BOOL depth = w[11].integerValue != 0;
@@ -5815,12 +5865,20 @@ static NSArray *nvFunctionReflArgs(NVMTLKernel *k) {
             continue;
         }
         if (type == MTLArgumentTypeBuffer) {
+            // an argument buffer (refli rows follow) is type 0 at its real buffer index with a struct type:
+            // Metal's debug layer looks it up that way (0.9.95)
+            NSMutableArray *rows = nil;
+            for (NSUInteger j = li + 1; j < k.refl.count && ![k.refl[j] hasPrefix:@"refl "]; j++)
+                if ([k.refl[j] hasPrefix:@"refli "]) [(rows = rows ?: [NSMutableArray new]) addObject:[k.refl[j] componentsSeparatedByString:@" "]];
+            st = rows ? nvArgBufStruct(rows) : nil;
             // by-value arguments (nakc marks air.constant " const") are type 22 on the M1
-            const BOOL byval = w.count > 13 && [w[13] isEqual:@"const"];
+            const BOOL byval = !st && w.count > 13 && [w[13] isEqual:@"const"];
+            const NSUInteger loc = st ? (NSUInteger)w[2].integerValue : nbuf;
+            nbuf++;
             b = ((id (*)(id, SEL, id, NSUInteger, NSUInteger, BOOL, NSUInteger, NSUInteger, NSUInteger, NSUInteger, NSUInteger, BOOL,
                          NSUInteger, NSUInteger))objc_msgSend)([BB alloc],
                 sel_registerName("initWithName:type:access:isActive:locationIndex:arraySize:dataType:pixelFormat:aluType:isConstantBuffer:dataSize:alignment:"),
-                w[12], byval ? (NSUInteger)22 : type, acc, YES, nbuf++, (NSUInteger)1, dt, (NSUInteger)0, (NSUInteger)0, NO, size, align);
+                w[12], byval ? (NSUInteger)22 : type, acc, YES, loc, (NSUInteger)1, st ? (NSUInteger)MTLDataTypeStruct : dt, (NSUInteger)0, (NSUInteger)0, NO, size, align);
         }
         else if (type == MTLArgumentTypeThreadgroupMemory)
             b = ((id (*)(id, SEL, id, NSUInteger, NSUInteger, BOOL, NSUInteger, NSUInteger, NSUInteger, NSUInteger, NSUInteger))objc_msgSend)(
@@ -5829,19 +5887,21 @@ static NSArray *nvFunctionReflArgs(NVMTLKernel *k) {
         else continue;
         id t = ((id (*)(id, SEL, NSUInteger, id, NSUInteger, NSUInteger, NSUInteger, BOOL, BOOL))objc_msgSend)([PT alloc],
             sel_registerName("initWithElementType:elementTypeDescription:access:alignment:dataSize:elementIsIndirectArgumentBuffer:isConstantBuffer:"),
-            dt, nil, acc, align, size, NO, NO);
+            st ? (NSUInteger)MTLDataTypeStruct : dt, st, acc, align, size, st != nil, NO);
         if (!b || !t) return nil;
         object_setIvar(b, ti, t);
         CFRetain((__bridge CFTypeRef)t);   // the ivar is strong in Apple's class; object_setIvar does not retain
+        if (st && class_getInstanceMethod(object_getClass(b), sel_registerName("setStructType:doRetain:")))
+            ((void (*)(id, SEL, id, BOOL))objc_msgSend)(b, sel_registerName("setStructType:doRetain:"), st, YES);   // plain setStructType: aborts
         [a addObject:b];
     }
     return a;
 }
-static IMP gNvFnReflOrig;
+static IMP gNvFnReflOrig, gNvFnReflOrig2;   // 0.9.95: Metal's debug layer asks the binaryArchives: variant
 static id nvFunctionReflection(id fn, SEL sel, NSUInteger opts, id lib) {
     id<MTLDevice> dev = [(id<MTLFunction>)fn device];
     if (![(NSObject *)dev isKindOfClass:objc_getClass("NVMTLDevice")])
-        return ((id (*)(id, SEL, NSUInteger, id))gNvFnReflOrig)(fn, sel, opts, lib);
+        return ((id (*)(id, SEL, NSUInteger, id))(sel == sel_registerName("reflectionWithOptions:binaryArchives:") ? gNvFnReflOrig2 : gNvFnReflOrig))(fn, sel, opts, lib);
     if ([(id<MTLFunction>)fn functionType] != MTLFunctionTypeKernel) return nil;
     NSError *e = nil;
     NVMTLComputePipelineState *ps = (NVMTLComputePipelineState *)[dev newComputePipelineStateWithFunction:fn error:&e];
@@ -5856,6 +5916,8 @@ static id nvFunctionReflection(id fn, SEL sel, NSUInteger opts, id lib) {
 static void nvInstallFunctionReflection(void) {
     Method m = class_getInstanceMethod(objc_getClass("_MTLFunction"), sel_registerName("reflectionWithOptions:pipelineLibrary:"));
     if (m && !gNvFnReflOrig) gNvFnReflOrig = method_setImplementation(m, (IMP)nvFunctionReflection);
+    m = class_getInstanceMethod(objc_getClass("_MTLFunction"), sel_registerName("reflectionWithOptions:binaryArchives:"));
+    if (m && !gNvFnReflOrig2) gNvFnReflOrig2 = method_setImplementation(m, (IMP)nvFunctionReflection);
 }
 
 #pragma clang diagnostic pop
@@ -7818,9 +7880,11 @@ static NVMTLArgLayout *nvArgLayoutFromRefl(NSArray<NSString *> *refl, NSUInteger
     l.length = (end + 7) & ~(NSUInteger)7;
     return l;
 }
-static IMP gOrigFnArgEnc1, gOrigFnArgEnc2, gOrigFnArgEnc3;
-static id nvOurArgEncoder(id fn, NSUInteger idx) NS_RETURNS_RETAINED;
-static id nvOurArgEncoder(id fn, NSUInteger idx) {
+static IMP gOrigFnArgEnc1, gOrigFnArgEnc2, gOrigFnArgEnc3[3];
+static const char *const kFnArgEnc3Sels[3] = {"newArgumentEncoderWithBufferIndex:reflection:functionReflection:",
+    "newArgumentEncoderWithBufferIndex:reflection:pipelineLibrary:", "newArgumentEncoderWithBufferIndex:reflection:binaryArchives:"};
+static id nvOurArgEncoder(id fn, NSUInteger idx, __autoreleasing id *refl) NS_RETURNS_RETAINED;
+static id nvOurArgEncoder(id fn, NSUInteger idx, __autoreleasing id *refl) {
     id dev = [fn respondsToSelector:@selector(device)] ? [fn device] : nil;
     if (![dev isKindOfClass:objc_getClass("NVMTLDevice")] || [(id<MTLFunction>)fn functionType] != MTLFunctionTypeKernel) return nil;
     id ps = [dev newComputePipelineStateWithFunction:fn error:nil];
@@ -7829,6 +7893,11 @@ static id nvOurArgEncoder(id fn, NSUInteger idx) {
     if (!l) return nil;
     NVMTLArgumentEncoder *e = [NVMTLArgumentEncoder new];
     e.layout = l;
+    // 0.9.95: the debug layer takes the argument (type, index, struct type) from the out-parameter
+    if (refl)
+        for (id a in nvKernelArgs(fn))
+            if (((NSUInteger (*)(id, SEL))objc_msgSend)(a, sel_registerName("type")) == MTLBindingTypeBuffer &&
+                ((NSUInteger (*)(id, SEL))objc_msgSend)(a, sel_registerName("index")) == idx) { *refl = a; break; }
     return e;
 }
 // these stand in for new... methods: the caller owns the result (+1)
@@ -7839,18 +7908,22 @@ static id nvFnArgEnc1(id fn, SEL cmd, NSUInteger idx) NS_RETURNS_RETAINED;
 static id nvFnArgEnc2(id fn, SEL cmd, NSUInteger idx, __autoreleasing id *refl) NS_RETURNS_RETAINED;
 static id nvFnArgEnc3(id fn, SEL cmd, NSUInteger idx, __autoreleasing id *refl, id fnRefl) NS_RETURNS_RETAINED;
 static id nvFnArgEnc1(id fn, SEL cmd, NSUInteger idx) {
-    id e = nvOurArgEncoder(fn, idx);
+    id e = nvOurArgEncoder(fn, idx, NULL);
     return e ?: ((NVArgEnc1)gOrigFnArgEnc1)(fn, cmd, idx);
 }
 static id nvFnArgEnc2(id fn, SEL cmd, NSUInteger idx, __autoreleasing id *refl) {
-    id e = nvOurArgEncoder(fn, idx);
-    if (e) { if (refl) *refl = nil; return e; }
+    if (refl) *refl = nil;
+    id e = nvOurArgEncoder(fn, idx, refl);
+    if (e) return e;
     return ((NVArgEnc2)gOrigFnArgEnc2)(fn, cmd, idx, refl);
 }
 static id nvFnArgEnc3(id fn, SEL cmd, NSUInteger idx, __autoreleasing id *refl, id fnRefl) {
-    id e = nvOurArgEncoder(fn, idx);
-    if (e) { if (refl) *refl = nil; return e; }
-    return ((NVArgEnc3)gOrigFnArgEnc3)(fn, cmd, idx, refl, fnRefl);
+    if (refl) *refl = nil;
+    id e = nvOurArgEncoder(fn, idx, refl);
+    if (e) return e;
+    for (int i = 0; i < 3; i++)
+        if (cmd == sel_registerName(kFnArgEnc3Sels[i])) return ((NVArgEnc3)gOrigFnArgEnc3[i])(fn, cmd, idx, refl, fnRefl);
+    return nil;
 }
 __attribute__((constructor)) static void nvInstallFnArgEncoders(void) {
     Class c = objc_getClass("_MTLFunction");
@@ -7859,8 +7932,9 @@ __attribute__((constructor)) static void nvInstallFnArgEncoders(void) {
         gOrigFnArgEnc1 = method_setImplementation(m, (IMP)nvFnArgEnc1);
     if (c && (m = class_getInstanceMethod(c, sel_registerName("newArgumentEncoderWithBufferIndex:reflection:"))))
         gOrigFnArgEnc2 = method_setImplementation(m, (IMP)nvFnArgEnc2);
-    if (c && (m = class_getInstanceMethod(c, sel_registerName("newArgumentEncoderWithBufferIndex:reflection:functionReflection:"))))
-        gOrigFnArgEnc3 = method_setImplementation(m, (IMP)nvFnArgEnc3);
+    for (int i = 0; i < 3; i++)
+        if (c && (m = class_getInstanceMethod(c, sel_registerName(kFnArgEnc3Sels[i]))))
+            gOrigFnArgEnc3[i] = method_setImplementation(m, (IMP)nvFnArgEnc3);
 }
 
 @implementation NVMTLDevice (ArgumentEncoders)
