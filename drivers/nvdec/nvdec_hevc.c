@@ -47,9 +47,12 @@ void nvdec_hevc_layout_for(const hevc_sps *s, nvdec_hevc_layout *l) {
     l->surface_bytes = (l->luma_bytes + l->luma_bytes / 2 + 0xff) & ~0xffu;
     l->coloc_frame_bytes = (w64 * h64 / 16 + 0xff) & ~0xffu;   /* MVs of one picture */
     l->coloc_bytes = l->coloc_frame_bytes * (NVDEC_HEVC_SURFACES + 1);
-    l->sao_offset = 480 * h64;                                 /* deblock | SAO | BSD control */
-    l->bsd_offset = (480 + 3840) * h64;
-    l->filter_bytes = (480 + 3840 + 60) * h64;
+    /* deblock | SAO | BSD control. The pixel line buffers are sized for 8-bit; 10-bit scales them by the
+       sample size. shortcut: not measured for 10-bit, over-allocates; derive exact sizes if VRAM gets tight */
+    const uint32_t bps = l->bytes_per_sample;
+    l->sao_offset = 480 * bps * h64;
+    l->bsd_offset = (480 + 3840) * bps * h64;
+    l->filter_bytes = l->bsd_offset + 60 * h64;
 }
 
 /* ---------------------------------------------------------------- DPB (C.5.2) */

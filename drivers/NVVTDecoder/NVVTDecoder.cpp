@@ -18,9 +18,8 @@ extern "C" {
 }
 
 namespace {
-// 0.3.3 shortcut: where NVDEC puts the 10 bits of a 16-bit HEVC Main10 sample is not measured. 0 = already in
-// the upper bits (P010 / cudaVideoSurfaceFormat_P016 style, assumed): the CE detile is used. 6 = in the low
-// bits: the CE cannot shift, so 10-bit frames are detiled on the CPU and shifted left by this. Set by measurement.
+// Measured 2026-11-20: NVDEC writes HEVC Main10 samples in the upper 10 bits (P010), so 0 and the CE detile.
+// 6 would mean low bits: CPU detile with a left shift (the CE cannot shift).
 constexpr int kHevc10Shift = 0;
 std::atomic<uint64_t> sessions{0}, submitted{0}, emitted{0}, errors{0}, gpuNS{0};
 struct Buffer { uint64_t handle = 0, va = 0, bytes = 0; uint8_t *cpu = nullptr; };
