@@ -1,6 +1,7 @@
 #include "NVVTDecoder.h"
 #include "spi/VTVideoDecoderSPI.h"
 #include <IOKit/IOKitLib.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <mach/mach_time.h>
 #include <atomic>
 #include <mutex>
@@ -34,6 +35,8 @@ struct Decoder {
     uint64_t stride = 0;
     int lengthBytes = 0, width = 0, height = 0, x0 = 0, y0 = 0;
     bool failed = false;
+    bool cpuOnly = [] { const char *e = getenv("NVVT_CPU_DETILE"); return e && e[0] == '1'; }();   // 0.3.2
+    uint64_t ceFrames = 0, cpuFrames = 0;
     std::vector<uint8_t> linear;
     Decoder() { nvdec_h264_init(&h264); nvdec_hevc_init(&hdec); }
     // native615 (NVGspControl >= 0.180.191): an owned user-buffer client (selector 45 op 3),
@@ -125,6 +128,19 @@ struct Decoder {
         linear.resize((size_t)hlayout.width * hlayout.height * 3 / 2);
         return true;
     }
+    // 0.3.2: NVGspControl >= 0.180.204 selector 45 op 6: the copy engine detiles one NVDEC surface window
+    // (base, stride bytes) into the locked pixel buffer's planes. The IOSurface ID tells the kernel which
+    // destination memory its cached wiring of this VA belongs to. Any error: the caller detiles on the CPU.
+    bool ceDetile(CVPixelBufferRef pixel, const uint8_t *base, uint32_t blPitch, uint32_t lumaBytes) {
+        IOSurfaceRef io = CVPixelBufferGetIOSurface(pixel);
+        if (!io) return false;
+        uint64_t args[] = {6, (uint64_t)(uintptr_t)base, stride, lumaBytes, blPitch, (uint64_t)x0, (uint64_t)y0,
+            (uint64_t)width, (uint64_t)height,
+            (uint64_t)(uintptr_t)CVPixelBufferGetBaseAddressOfPlane(pixel, 0), CVPixelBufferGetBytesPerRowOfPlane(pixel, 0),
+            (uint64_t)(uintptr_t)CVPixelBufferGetBaseAddressOfPlane(pixel, 1), CVPixelBufferGetBytesPerRowOfPlane(pixel, 1),
+            IOSurfaceGetID(io)}, out[3]; uint32_t count = 3;
+        return IOConnectCallScalarMethod(conn, 45, args, 14, out, &count) == KERN_SUCCESS;
+    }
     OSStatus execute(uint32_t words, uint32_t want) {
         uint64_t args[] = {5, push.va, words}, out[3]; uint32_t count = 3;
         const uint64_t start = mach_absolute_time();
@@ -149,6 +165,9 @@ Storage *storage(CMBaseObjectRef object) {
 }
 OSStatus invalidate(CMBaseObjectRef object) {
     Storage *s = storage(object);
+    if (s->decoder && s->decoder->ceFrames + s->decoder->cpuFrames)
+        os_log(OS_LOG_DEFAULT, "NVVTDecoder: detile frames CE %llu CPU %llu in %{public}s",
+               s->decoder->ceFrames, s->decoder->cpuFrames, getprogname());
     delete s->decoder; s->decoder = nullptr;
     return noErr;
 }
@@ -244,7 +263,9 @@ OSStatus emitSurface(Decoder *d, VTVideoDecoderFrame frame, const uint8_t *base,
         CVPixelBufferGetPlaneCount(pixel) != 2 || CVPixelBufferLockBaseAddress(pixel, 0)) {
         CFRelease(pixel); return kVTVideoDecoderMalfunctionErr;
     }
-    for (int plane = 0; plane < 2; ++plane) {
+    const bool ce = !d->cpuOnly && d->ceDetile(pixel, base, blPitch, lumaBytes);
+    if (ce) ++d->ceFrames; else ++d->cpuFrames;
+    for (int plane = 0; plane < 2 && !ce; ++plane) {
         uint8_t *dst = static_cast<uint8_t *>(CVPixelBufferGetBaseAddressOfPlane(pixel, plane));
         const size_t pitch = CVPixelBufferGetBytesPerRowOfPlane(pixel, plane);
         // 0.3.1: straight into the pixel buffer (8 ms -> see LOG); the staged path stays for odd crops

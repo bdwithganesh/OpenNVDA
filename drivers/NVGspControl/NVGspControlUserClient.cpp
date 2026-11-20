@@ -656,6 +656,13 @@ IOReturn IOAccelNVGspUserClient::nativeClient615(
     OSObject *target, void *, IOExternalMethodArguments *arguments) {
     auto *self=OSDynamicCast(IOAccelNVGspUserClient,target);
     if(!self)return kIOReturnNotPrivileged;
+    // 0.180.204: op 6 = CE detile of an NVDEC surface into the caller's pixel buffer, 14 scalars (nativeDetile615)
+    if(self->driver_ && arguments && arguments->scalarInput && arguments->scalarInputCount==14 &&
+       arguments->scalarInput[0]==6) {
+        if(arguments->scalarOutputCount!=3 || !arguments->scalarOutput)return kIOReturnBadArgument;
+        arguments->scalarOutput[0]=arguments->scalarOutput[1]=arguments->scalarOutput[2]=0;
+        return self->driver_->nativeDetile615(self,self->task_,arguments->scalarInput,14);
+    }
     // 0.180.191: {op} for 0..4, {5, pushbuffer VA, words} for an NVDEC0 submit
     if(!self->driver_ || !arguments || !arguments->scalarInput ||
        arguments->scalarInputCount!=(arguments->scalarInputCount>=1 && arguments->scalarInput[0]==5 ? 3U : 1U) ||

@@ -630,6 +630,7 @@ IOMemoryDescriptor *NVGspControl::client615UserMemory(const void *owner) {
 
 void NVGspControl::nativeClient615Close(const void *owner) {
     if(!lock_ || !owner)return;
+    detileRelease615(owner);   // 0.180.204
     lk(__LINE__);const bool mine=ownedSlot615(owner)>=0;ulk();
     if(mine) {
         UInt64 stage=0,status=0,passed=0;
@@ -2325,6 +2326,186 @@ IOReturn NVGspControl::pipeFlip615(NVGspFlipCopy *f) {
     native615Busy_=false;
     ulk();
     return r==kIOReturnSuccess ? kIOReturnSuccess : fail(r);
+}
+
+// 0.180.204: NVDEC block-linear NV12 -> the caller's pitch-linear pixel buffer on the copy engine (the CPU
+// detile of NVVTDecoder). Scalars of selector 45 op 6:
+//   {6, srcVa, srcBytes, lumaBytes, blPitch, x0, y0, w, h, yVa, yPitch, uvVa, uvPitch, dstTag}
+// srcVa/srcBytes = the caller's mapping of one NVDEC surface (page multiples, <= one 80 MiB slot); luma rows
+// = lumaBytes / blPitch; chroma follows at lumaBytes with half the rows. Both destination planes are covered by
+// one wired range. Layout (nvdec_h264.c bl_offset): 64 B x 8 row GOBs, 2 per block, pitch>>6 blocks a row.
+// Mappings are cached per (owner, VA, bytes, ro, tag) until the slot is re-targeted or the owner closes, so
+// dstTag must differ for different destination memory (the IOSurface ID): a VA reused for other memory would
+// otherwise hit a stale wiring. Source and destination PTEs are VOL (uncached in L2): NVDEC's stores and the
+// reader's loads then need no cache maintenance.
+// shortcut: after a timeout the cached mappings stay wired, the copy may still run on them; a later
+// re-target of such a slot could free pages under it (the channel is serial, a stuck CE is a GPU reset anyway).
+IOReturn NVGspControl::nativeDetile615(const void *owner,task_t task,const UInt64 *in,UInt32 count) {
+    auto *s=native615_;
+    if(!lock_ || !owner || !task || !in || count!=14 || in[0]!=6)return kIOReturnBadArgument;
+    const UInt64 srcVa=in[1],srcBytes=in[2],lumaBytes=in[3],blPitch=in[4],x0=in[5],y0=in[6],w=in[7],h=in[8];
+    const UInt64 yVa=in[9],yPitch=in[10],uvVa=in[11],uvPitch=in[12],tag=in[13];
+    constexpr UInt64 kUser=0x0000800000000000ULL;   // as userMemBind: never a kernel address
+    auto fail=[&](IOReturn r) {
+        lk(__LINE__);++detileFails615_;setProperty("NVGspControl-cedetile-fails",detileFails615_,32);
+        setProperty("NVGspControl-cedetile-last-err",UInt32(r),32);ulk();return r;
+    };
+    const UInt64 rows=blPitch ? lumaBytes/blPitch : 0;
+    // every size is bounded before any sum, so nothing below can wrap
+    if(!blPitch || blPitch>0x10000 || (blPitch&63) || lumaBytes>(1ULL<<30) || rows*blPitch!=lumaBytes || !rows || (rows&15) ||
+       x0>0xffff || y0>0xffff || w>0xffff || h>0xffff || !w || !h || (x0&15) || ((h|y0)&1) ||
+       x0+w>blPitch || y0+h>rows || yPitch<w || uvPitch<w || yPitch>0x100000 || uvPitch>0x100000 ||
+       !srcVa || ((srcVa|srcBytes)&0xfff) || srcVa>=kUser || srcBytes>kPipeSlotBytes615 || srcBytes>kUser-srcVa ||
+       lumaBytes+lumaBytes/2>srcBytes || !yVa || !uvVa || yVa>=kUser || uvVa>=kUser)return fail(kIOReturnBadArgument);
+    const UInt64 yEnd=yVa+(h-1)*yPitch+w,uvEnd=uvVa+(h/2-1)*uvPitch+w;   // last byte written + 1
+    const UInt64 dLo=(yVa<uvVa ? yVa : uvVa)&~0xfffULL,dHi=((yEnd>uvEnd ? yEnd : uvEnd)+0xfff)&~0xfffULL;
+    if((yEnd>uvVa && uvEnd>yVa) || yEnd>kUser || uvEnd>kUser || dHi-dLo>kPipeSlotBytes615)return fail(kIOReturnBadArgument);
+    // own native615Busy_ with no display copy in flight (that copy uses the same ring words)
+    UInt64 deadline=0;clock_interval_to_deadline(100,kMillisecondScale,&deadline);
+    for(;;) {
+        bool got=false;
+        lk(__LINE__);
+        const int own=s ? ownedSlot615(owner) : -1;
+        if(own<0 || !s->clientGrs[own].userBuffer) {ulk();return fail(kIOReturnNotFound);}
+        if(!pipeVa615_ || native615Stopping_ || !native615Ready_ || sleeping_ || resetBusy_ ||
+           gmcMmuFaultPending_ || userRpcLatePending_ || postInitPhase_!=27 || !s->mmu.live) {ulk();return fail(kIOReturnNotReady);}
+        if(!native615Busy_ && !displayCopyInflight615_)native615Busy_=got=true;
+        ulk();
+        if(got)break;
+        if(mach_absolute_time()>deadline)return fail(kIOReturnBusy);
+        IOSleep(1);
+    }
+    auto &m=s->mmu;
+    auto read=[&](UInt64 at,UInt32 count) {return vramAccess(at,s->readWords,count,false,true)==kIOReturnSuccess;};
+    auto write=[&](UInt64 at,const UInt32 *words,UInt32 count) {
+        if(!count || count>1024)return false;
+        if(words!=s->writeWords)__builtin_memcpy(s->writeWords,words,count*4);
+        return vramAccess(at,s->writeWords,count,true,true)==kIOReturnSuccess && read(at,count) &&
+            !__builtin_memcmp(s->writeWords,s->readWords,count*4);
+    };
+    const UInt64 tree=m.tree.tree;
+    bool fresh[kDetileSlots615]={};
+    const auto slotVa=[&](UInt32 k) {return pipeVa615_+UInt64(kPipeSlots615+k)*kPipeSlotBytes615;};
+    // the slot already mapping [uaddr, +bytes), else the least recently used one but `avoid`, rewired
+    auto slotFor=[&](UInt64 uaddr,UInt64 bytes,bool ro,UInt64 t,UInt32 avoid,UInt32 *out)->IOReturn {
+        UInt32 k=kDetileSlots615;
+        for(UInt32 i=0;i<kDetileSlots615;++i) {
+            const auto &d=detile615_[i];
+            if(d.md && d.tree==tree && d.owner==owner && d.uaddr==uaddr && d.bytes==bytes && d.ro==ro && d.tag==t) {k=i;break;}
+        }
+        if(k==kDetileSlots615) {
+            for(UInt32 i=0;i<kDetileSlots615;++i)
+                if(i!=avoid && (k==kDetileSlots615 || detile615_[i].use<detile615_[k].use))k=i;
+            auto &d=detile615_[k];
+            if(d.md) {d.md->complete();d.md->release();}
+            d={};
+            IOMemoryDescriptor *md=IOMemoryDescriptor::withAddressRange(uaddr,bytes,kIODirectionInOut,task);
+            if(!md)return kIOReturnNoMemory;
+            if(md->prepare()!=kIOReturnSuccess) {md->release();return kIOReturnVMError;}
+            d={owner,uaddr,bytes,t,0,ro,md,0};   // tree stays 0 (not a hit) until the invalidate below succeeded
+            const UInt64 va=slotVa(k),pages=bytes>>12;
+            bool ok=true;
+            for(UInt64 p=0;ok && p<pages;) {   // 512 PTEs (one table) a write
+                const UInt32 n=pages-p>512 ? 512 : UInt32(pages-p);
+                UInt64 leaf=0;
+                ok=nvgsp::externalTreeLeaf615(m.tree,va+p*4096,&leaf);
+                for(UInt32 i=0;ok && i<n;++i) {
+                    IOByteCount len=0;UInt64 pte=0;
+                    const UInt64 bus=md->getPhysicalSegment((p+i)*4096,&len,kIOMemoryMapperNone);
+                    ok=bus && !(bus&4095) && len>=4096 && nvgsp::sysPte615(bus,ro,&pte,0,false);
+                    s->writeWords[i*2]=UInt32(pte);s->writeWords[i*2+1]=UInt32(pte>>32);
+                }
+                const UInt32 z0=s->writeWords[n*2-2],z1=s->writeWords[n*2-1];
+                ok=ok && vramAccess(leaf,s->writeWords,n*2,true,true)==kIOReturnSuccess &&
+                   read(leaf+UInt64(n-1)*8,2) && s->readWords[0]==z0 && s->readWords[1]==z1;
+                p+=n;
+            }
+            if(!ok)return kIOReturnIOError;
+            fresh[k]=true;
+        }
+        detile615_[k].use=++detileClock615_;
+        *out=k;
+        return kIOReturnSuccess;
+    };
+    UInt32 ks=0,kd=0;
+    IOReturn r=slotFor(srcVa,srcBytes,true,0,kDetileSlots615,&ks);
+    if(r==kIOReturnSuccess)r=slotFor(dLo,dHi-dLo,false,tag,ks,&kd);
+    bool any=false;
+    for(UInt32 i=0;i<kDetileSlots615;++i)any=any||fresh[i];
+    if(r==kIOReturnSuccess && any && !mmuSubmit615(0x1))r=kIOReturnIOError;   // TLB invalidate for the new PTEs
+    if(r==kIOReturnSuccess)for(UInt32 i=0;i<kDetileSlots615;++i)if(fresh[i])detile615_[i].tree=tree;
+    UInt32 fence=0;
+    bool finished=false;
+    if(r==kIOReturnSuccess) {
+        // CE class 0xC7B5 (clc7b5.h): per plane OFFSET_IN/OUT 0x400, PITCH_IN/OUT 0x410/0x414, LINE_LENGTH_IN
+        // 0x418, LINE_COUNT 0x41c, SET_SRC_BLOCK_SIZE..SET_SRC_ORIGIN 0x728..0x73c, LAUNCH_DMA 0x300
+        auto ce=[](UInt32 method,UInt32 n) {return 0x20000000U|(n<<16)|(4U<<13)|(method>>2);};
+        fence=0x6150e000|((m.fence+1)&0xfff);
+        const UInt64 semaphore=m.va+0xe10,pb=m.va+0xc00;
+        UInt32 w32[64];UInt32 c=0;
+        w32[c++]=ce(0x000,1);w32[c++]=0xC7B5;                              // SET_OBJECT AMPERE_DMA_COPY_B
+        for(UInt32 plane=0;plane<2;++plane) {
+            const UInt64 src=slotVa(ks)+(plane ? lumaBytes : 0);
+            const UInt64 dst=slotVa(kd)+(plane ? uvVa : yVa)-dLo;
+            w32[c++]=ce(0x400,4);w32[c++]=UInt32(src>>32);w32[c++]=UInt32(src);w32[c++]=UInt32(dst>>32);w32[c++]=UInt32(dst);
+            // PITCH_IN unused (block-linear source), PITCH_OUT, LINE_LENGTH_IN = bytes a row, LINE_COUNT = rows
+            w32[c++]=ce(0x410,4);w32[c++]=0;w32[c++]=UInt32(plane ? uvPitch : yPitch);w32[c++]=UInt32(w);w32[c++]=UInt32(plane ? h/2 : h);
+            // SET_SRC_BLOCK_SIZE: WIDTH one GOB (0), HEIGHT two GOBs (1<<4), DEPTH one GOB, GOB_HEIGHT_FERMI_8 (1<<12);
+            // WIDTH bytes (= blPitch: pitch>>6 blocks a row), HEIGHT rows, DEPTH 1, LAYER 0, ORIGIN X bytes | Y rows << 16
+            w32[c++]=ce(0x728,6);w32[c++]=0x1010;w32[c++]=UInt32(blPitch);w32[c++]=UInt32(plane ? rows/2 : rows);
+            w32[c++]=1;w32[c++]=0;w32[c++]=UInt32(x0)|(UInt32(plane ? y0/2 : y0)<<16);
+            // NON_PIPELINED 0x2, FLUSH_ENABLE 0x4, SRC block-linear (bit 7 clear), DST pitch 0x100, MULTI_LINE 0x200,
+            // SRC/DST virtual (bits 12/13 clear)
+            w32[c++]=ce(0x300,1);w32[c++]=0x002U|0x004U|0x100U|0x200U;
+        }
+        const UInt32 tail[6]={0x20050017,UInt32(semaphore)&0xfffffffc,UInt32(semaphore>>32)&0xff,fence,0,0x00100001};
+        for(UInt32 i=0;i<6;++i)w32[c++]=tail[i];
+        const UInt32 entry[2]={UInt32(pb)&0xfffffffc,(UInt32(pb>>32)&0xff)|(c<<10)};
+        const UInt32 put=(m.put+1)%256;
+        if(!write(m.ring+0xc00,w32,c) || !write(m.ring+UInt64(m.put)*8,entry,2) || !write(m.userd+0x8c,&put,1) ||
+           diagnosticChannelKick(0xc0d00556,true)!=kIOReturnSuccess)r=kIOReturnIOError;
+        else {
+            lk(__LINE__);m.put=put;m.fence=fence&0xfff;ulk();
+            UInt64 limit=0,spin=0;clock_interval_to_deadline(1,kSecondScale,&limit);clock_interval_to_deadline(2,kMillisecondScale,&spin);
+            do {   // ~1 ms of CE work: spin first, then sleep
+                if(!read(m.ring+0xe10,1))break;
+                if(s->readWords[0]==fence) {finished=true;break;}
+                if(mach_absolute_time()<spin)IODelay(10); else IOSleep(1);
+            } while(mach_absolute_time()<limit);
+            if(!finished)r=kIOReturnTimeout;
+        }
+    }
+    lk(__LINE__);
+    native615Busy_=false;
+    if(r==kIOReturnTimeout) {   // the CE may still run: the copy tick retires it (or calls it lost after 1 s), nobody else touches ring+0xc00/0xe10
+        displayCopyFence615_=fence;displayCopyInflight615_=true;displayCopyKick615_=mach_absolute_time();
+    }
+    if(finished) {++detileFrames615_;if(!(detileFrames615_&63))setProperty("NVGspControl-cedetile-frames",detileFrames615_,32);}
+    ulk();
+    return r==kIOReturnSuccess ? kIOReturnSuccess : fail(r);
+}
+
+// 0.180.204: unwire the detile mappings of a closing client (waits up to 1 s for the runtime to be idle)
+void NVGspControl::detileRelease615(const void *owner) {
+    if(!lock_ || !owner)return;
+    bool any=false;
+    lk(__LINE__);
+    for(const auto &d:detile615_)any=any||(d.md && d.owner==owner);
+    ulk();
+    if(!any)return;
+    UInt64 deadline=0;clock_interval_to_deadline(1,kSecondScale,&deadline);
+    for(;;) {
+        bool got=false;
+        lk(__LINE__);if(!native615Busy_)native615Busy_=got=true;ulk();
+        if(got)break;
+        if(mach_absolute_time()>deadline) {   // shortcut: stays wired until a later detile re-targets the slot
+            for(auto &d:detile615_)if(d.owner==owner)d.owner=nullptr;   // never a hit for a later client at this address
+            return;
+        }
+        IOSleep(1);
+    }
+    for(auto &d:detile615_)if(d.md && d.owner==owner) {d.md->complete();d.md->release();d={};}
+    lk(__LINE__);native615Busy_=false;ulk();
 }
 
 void NVGspControl::displayCopyCallout615(thread_call_param_t p0, thread_call_param_t) {

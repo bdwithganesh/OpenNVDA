@@ -198,6 +198,16 @@ public:
     IOMemoryDescriptor *pipeMd615_[kPipeSlots615] = {};
     UInt32 pipeUse615_[kPipeSlots615] = {}, pipeClock615_ = 0, pipeFlips615_ = 0, pipeFlipFails615_ = 0;
     IOReturn pipeFlip615(NVGspFlipCopy *f);
+    // 0.180.204: selector 45 op 6, NVDEC block-linear NV12 -> the caller's pixel buffer on the copy engine.
+    // The caller's source window and destination planes are wired and mapped into kDetileSlots615 more
+    // 80 MiB slots after the pipe's; a mapping stays (key owner/VA/bytes/tag) until its slot is re-targeted
+    // or its owner's client closes.
+    static constexpr UInt32 kDetileSlots615 = 4;
+    struct DetileSlot615 { const void *owner; UInt64 uaddr, bytes, tag, tree; bool ro; IOMemoryDescriptor *md; UInt32 use; };
+    DetileSlot615 detile615_[kDetileSlots615] = {};
+    UInt32 detileClock615_ = 0, detileFrames615_ = 0, detileFails615_ = 0;
+    IOReturn nativeDetile615(const void *owner, task_t task, const UInt64 *in, UInt32 count);
+    void detileRelease615(const void *owner);
     // 0.180.197: the state sandboxed Metal clients (WebKit) read, mirrored on the PCI device: their
     // sandboxes deny NVGspControl property reads but allow IOPCIDevice ones
     using IOService::setProperty;
