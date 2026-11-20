@@ -4,8 +4,6 @@
 <dict>
 	<key>DisplayProductID</key>
 	<integer>32827</integer>
-	<key>DisplayProductName</key>
-	<string>NVIDIA 4K (scaled HiDPI)</string>
 	<key>DisplayVendorID</key>
 	<integer>2513</integer>
 	<key>scale-resolutions</key>
