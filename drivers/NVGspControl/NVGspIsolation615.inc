@@ -552,7 +552,7 @@ IOReturn NVGspControl::runIsolation615() {
 // only it may destroy the client, and its close/stop tears the client down.
 // One client at a time; a torn-down (stage 13) client slot is reused.
 IOReturn NVGspControl::nativeClient615(const void *owner,UInt32 operation,UInt64 *stage,
-                                       UInt64 *status,UInt64 *passed,UInt64 pbVa,UInt64 pbWords) {
+                                       UInt64 *status,UInt64 *passed,UInt64 pbVa,UInt64 pbWords,UInt32 engine) {
     if(!lock_ || !owner || !stage || !status || !passed || operation>5)return kIOReturnBadArgument;
     *stage=*status=*passed=0;lk(__LINE__);
     auto *s=native615_;
@@ -562,8 +562,17 @@ IOReturn NVGspControl::nativeClient615(const void *owner,UInt32 operation,UInt64
     // 0.180.191: 4 = open an NVDEC0 channel in the caller's client, 5 = submit {pbVa, words} on it
     if(operation==4 || operation==5) {
         if(slot<0 || !s->clientGrs[slot].userBuffer) {ulk();return kIOReturnNotFound;}
-        if(operation==5) {s->clientGrs[slot].nvdecPbVa=pbVa;s->clientGrs[slot].nvdecPbWords=UInt32(pbWords>0x1fffff?0:pbWords);}
+        auto &q=s->clientGrs[slot];
+        // 0.180.207: engine 0 = NVDEC0, 1 = NVENC0. One video channel per client, the engine is fixed by its open.
+        if(engine>1 || (q.nvdec && q.nvdecVideo!=engine)) {ulk();return kIOReturnBadArgument;}
+        const bool bringUp=operation==5 && engine==1 && !q.nvdec;   // first NVENC0 submit opens the channel
+        if(!q.nvdec)q.nvdecVideo=engine;
+        if(operation==5) {q.nvdecPbVa=pbVa;q.nvdecPbWords=UInt32(pbWords>0x1fffff?0:pbWords);}
         ulk();
+        if(bringUp) {
+            const IOReturn o=nativeIsolation615(16,stage,status,passed,slot);
+            if(o!=kIOReturnSuccess)return o;
+        }
         return nativeIsolation615(operation==4?16:17,stage,status,passed,slot);
     }
     if(operation==2) {

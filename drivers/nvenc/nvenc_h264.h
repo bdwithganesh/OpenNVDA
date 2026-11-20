@@ -28,7 +28,7 @@ typedef struct {
 } nvenc_h264_setup;
 
 typedef struct {
-    uint64_t setup, status, bitstream, input, recon, history, coloc, scratch;
+    uint64_t setup, status, bitstream, input, recon, history, coloc, scratch, mepred;   /* mepred: ME predictor in/out (ucode E_MEPRED_OFFSET when 0) */
     uint32_t subchannel;
 } nvenc_h264_addresses;
 

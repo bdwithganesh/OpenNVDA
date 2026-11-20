@@ -506,6 +506,7 @@ IOReturn NVGspControl::runClientGr615(UInt32 phase) {
             return kIOReturnNotReady;
       auto open=[&]() __attribute__((noinline)) -> IOReturn {   // own frame: the client GR frame stays < 2 KiB
         const UInt32 savedStatus=g.status;
+        const nvgsp::VideoEngineDesc *const ve=nvgsp::videoEngine(g.nvdecVideo);   // 0.180.207: NVDEC0 or NVENC0
         g.nvdec=true;nvdecStep(1);
         // An RM refusal (NV_STATUS) means the handle was never made: drop it from the ledger so
         // the client's teardown does not free it.
@@ -553,13 +554,13 @@ IOReturn NVGspControl::runClientGr615(UInt32 phase) {
         }
         if(!mmuInvalidate(0x1))return done(kIOReturnTimeout);
         nvdecStep(3);
-        nvgsp::ChannelGroup615 group{};group.hVASpace=g.vas;group.engineType=nvgsp::kEngineTypeNvdec0;
+        nvgsp::ChannelGroup615 group{};group.hVASpace=g.vas;group.engineType=ve->engineType;
         nvgsp::ContextShare615 share{g.vas,0,~0U};
         if(!mk(D,H|NTSG,0xa06c,&group,sizeof(group)) || !mk(H|NTSG,H|NSHARE,0x9067,&share,sizeof(share)) ||
            share.hVASpace!=g.vas || share.subctxId==~0U)return done(kIOReturnNotReady);
         nvgsp::ChannelAlloc615 ch{};
         ch.gpFifoOffset=g.nvdecRingVa;ch.gpFifoEntries=256;ch.flags=0x004000c0U;
-        ch.hContextShare=H|NSHARE;ch.hUserdMemory[0]=H|0x64;ch.engineType=nvgsp::kEngineTypeNvdec0;
+        ch.hContextShare=H|NSHARE;ch.hUserdMemory[0]=H|0x64;ch.engineType=ve->engineType;
         ch.instanceMem={g.nvdecInstance,4096,2,1};ch.userdMem={g.nvdecUserd,4096,2,1};
         ch.ramfcMem={g.nvdecInstance,512,2,1};ch.mthdbufMem={g.nvdecMethod,mBytes,2,0};
         ch.hPhysChannelGroup=H|NTSG;ch.internalFlags=0x14;
@@ -573,14 +574,14 @@ IOReturn NVGspControl::runClientGr615(UInt32 phase) {
         UInt32 used=nvgsp::kPromoteVariants,first=0;
         for(UInt32 v=0;v<nvgsp::kPromoteVariants && used==nvgsp::kPromoteVariants;++v) {
             g.status=0;
-            if(nvgsp::buildFalconPromote(nvgsp::kEngineTypeNvdec0,C,g.nvdecCid,H|NCH,g.nvdecCtx,g.nvdecCtxVa,4096,
+            if(nvgsp::buildFalconPromote(ve->engineType,C,g.nvdecCid,H|NCH,g.nvdecCtx,g.nvdecCtxVa,4096,
                                          pr,nvgsp::kPromoteCtxBytes,v) && ctl(S,0x2080012b,pr,nvgsp::kPromoteCtxBytes))used=v;
             else if(!first)first=g.status?g.status:~0U;
         }
         UInt32 vaBind=~0U;
         if(used==nvgsp::kPromoteRmExternal) {
             g.status=0;
-            vaBind=nvgsp::buildFalconPromoteVa(nvgsp::kEngineTypeNvdec0,C,H|NCH,g.nvdecCtxVa,pr,nvgsp::kPromoteCtxBytes) &&
+            vaBind=nvgsp::buildFalconPromoteVa(ve->engineType,C,H|NCH,g.nvdecCtxVa,pr,nvgsp::kPromoteCtxBytes) &&
                    ctl(S,0x2080012b,pr,nvgsp::kPromoteCtxBytes) ? 0 : (g.status?g.status:~0U);
         }
         g.nvdecPromote=used|first<<8;
@@ -590,9 +591,9 @@ IOReturn NVGspControl::runClientGr615(UInt32 phase) {
         if(used==nvgsp::kPromoteVariants || !healthy())return done(kIOReturnNotReady);
         nvdecStep(5);
         UInt8 obj[12];nvgsp::buildVideoObjectParams(0,obj);
-        if(!mk(H|NCH,H|NOBJ,0xc9b0,obj,sizeof(obj)))return done(kIOReturnNotReady);
+        if(!mk(H|NCH,H|NOBJ,ve->objClass,obj,sizeof(obj)))return done(kIOReturnNotReady);
         nvdecStep(6);
-        UInt32 engine=nvgsp::kEngineTypeNvdec0;UInt8 on[3]={1,0,0};
+        UInt32 engine=ve->engineType;UInt8 on[3]={1,0,0};
         if(!ctl(H|NCH,0xa06f0104,&engine,4) || !ctl(H|NCH,0xc36f0108,&g.nvdecToken,4) || !g.nvdecToken)
             return done(kIOReturnNotReady);
         g.nvdecScheduled=true;

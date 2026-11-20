@@ -8602,9 +8602,11 @@ IOReturn NVGspControl::pollStatusLocked() {
             // engine's fault.
             if (rc[4] == 31) {
                 int owner = -1;
-                for (UInt32 k = 0; native615_ && rc[0] == 0x13 && k < nvgsp::kClientSlots615 && owner < 0; ++k) {
+                // 0.180.207: the owned video channel is NVDEC0 (0x13) or NVENC0 (0x1b): match the client's own engine
+                for (UInt32 k = 0; native615_ && k < nvgsp::kClientSlots615 && owner < 0; ++k) {
                     auto &c = native615_->clientGrs[k];
-                    if (c.live && c.nvdecScheduled && (c.nvdecToken & 0xffff) == rc[1]) owner = int(k);
+                    if (c.live && c.nvdecScheduled && rc[0] == nvgsp::videoEngine(c.nvdecVideo)->engineType &&
+                        (c.nvdecToken & 0xffff) == rc[1]) owner = int(k);
                 }
                 if (owner < 0) {
                     // fail closed: any other fault in the epoch re-asserts pending (even after an absorb)

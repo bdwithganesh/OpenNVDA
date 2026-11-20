@@ -663,16 +663,20 @@ IOReturn IOAccelNVGspUserClient::nativeClient615(
         arguments->scalarOutput[0]=arguments->scalarOutput[1]=arguments->scalarOutput[2]=0;
         return self->driver_->nativeDetile615(self,self->task_,arguments->scalarInput,14);
     }
-    // 0.180.191: {op} for 0..4, {5, pushbuffer VA, words} for an NVDEC0 submit
-    if(!self->driver_ || !arguments || !arguments->scalarInput ||
-       arguments->scalarInputCount!=(arguments->scalarInputCount>=1 && arguments->scalarInput[0]==5 ? 3U : 1U) ||
+    // 0.180.191: {op} for 0..4, {5, pushbuffer VA, words} for a video engine submit
+    // 0.180.207: ops 4 and 5 take an optional last scalar = engine (0 NVDEC0 default, 1 NVENC0): {4, engine}, {5, va, words, engine}
+    if(!self->driver_ || !arguments || !arguments->scalarInput || arguments->scalarInputCount<1 ||
        arguments->scalarInput[0]>5 || arguments->scalarOutputCount!=3 ||
        !arguments->scalarOutput)return kIOReturnBadArgument;
+    const bool submit=arguments->scalarInput[0]==5,video=submit || arguments->scalarInput[0]==4;
+    const UInt32 base=submit ? 3U : 1U;
+    if(arguments->scalarInputCount!=base && !(video && arguments->scalarInputCount==base+1))return kIOReturnBadArgument;
+    const UInt64 engine=arguments->scalarInputCount>base ? arguments->scalarInput[base] : 0;
+    if(engine>1)return kIOReturnBadArgument;
     arguments->scalarOutput[0]=arguments->scalarOutput[1]=arguments->scalarOutput[2]=0;
-    const bool submit=arguments->scalarInput[0]==5;
     return self->driver_->nativeClient615(self,static_cast<UInt32>(arguments->scalarInput[0]),
         &arguments->scalarOutput[0],&arguments->scalarOutput[1],&arguments->scalarOutput[2],
-        submit?arguments->scalarInput[1]:0,submit?arguments->scalarInput[2]:0);
+        submit?arguments->scalarInput[1]:0,submit?arguments->scalarInput[2]:0,static_cast<UInt32>(engine));
 }
 
 IOReturn IOAccelNVGspUserClient::nativeClientMemory615(

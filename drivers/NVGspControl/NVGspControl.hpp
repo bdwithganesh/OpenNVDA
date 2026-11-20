@@ -92,7 +92,8 @@ public:
     // 0.180.92: a user client owns the external-VAS GR client it created
     // (op 0 create, 1 destroy, 2 query); close/stop of that client tears it down.
     IOReturn nativeClient615(const void *owner, UInt32 operation, UInt64 *stage, UInt64 *status, UInt64 *passed,
-                             UInt64 pbVa = 0, UInt64 pbWords = 0);   // 0.180.191: ops 4/5 NVDEC0 open/submit
+                             UInt64 pbVa = 0, UInt64 pbWords = 0,   // 0.180.191: ops 4/5 NVDEC0 open/submit
+                             UInt32 engine = 0);                    // 0.180.207: ops 4/5 video engine, 0 NVDEC0 / 1 NVENC0
     void nativeClient615Close(const void *owner);
     IOMemoryDescriptor *client615UserMemory(const void *owner);   // retained, or nullptr
     // 0.180.101: op 0 alloc(bytes) -> {slot, GPU VA, bytes}; op 1 free(slot).

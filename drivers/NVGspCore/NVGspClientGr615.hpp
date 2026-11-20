@@ -158,6 +158,7 @@ struct ClientGrState615 {
     uint64_t nvdecInstance,nvdecMethod,nvdecUserd,nvdecGpfifo,nvdecCtx,nvdecRingVa,nvdecCtxVa,nvdecPbVa;
     uint32_t nvdecStage,nvdecStatus,nvdecCid,nvdecToken,nvdecPut,nvdecPbWords,nvdecPromote;
     bool nvdec,nvdecScheduled,nvdecFaulted;   // 0.180.192: faulted = RC killed the NVDEC channel
+    uint32_t nvdecVideo;   // 0.180.207: which video engine that channel is, VideoEngineIndex (0 NVDEC0, 1 NVENC0)
     uint32_t copyEngine;   // 0.180.128: NV2080 engine type of the GR channel's copy object, 0 = none
     uint32_t completed;    // 0.180.133: last submission sequence seen finished (async submits)
     uint32_t output[64];

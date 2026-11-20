@@ -33,7 +33,8 @@ int nvenc_h264_layout_init(const nvenc_h264_config *c, nvenc_h264_layout *l) {
     if (mbs > 36864 || (uint64_t)mbs*c->fps > 2073600) return -1; /* Level 5.2 */
     /* IPCM is 384 bytes/MB. Leave room for headers and emulation prevention. */
     l->bitstream_bytes = align_up(mbs * 768 + 4096, 4096);
-    l->history_bytes = align_up((l->padded_width / 16 + 16) * HIST_BLOCK_SIZE, 4096);
+    /* nvenc_drv.h: H264_HIST_BLOCK_SIZE 224 (HIST_BLOCK_SIZE 192 and the 128 in the 2.3 text are older); bigger is safe. */
+    l->history_bytes = align_up((l->padded_width / 16 + 16) * H264_HIST_BLOCK_SIZE, 4096);
     l->coloc_bytes = align_up(mbs * sizeof(nvenc_h264_coloc_mb_s), 4096);
     return 0;
 }
@@ -70,6 +71,7 @@ int nvenc_h264_setup_init(const nvenc_h264_config *c, const nvenc_h264_layout *l
         s->pic.rate_control.maxQP[i] = c->qp;
         s->pic.rate_control.rhopbi[i] = 256;
     }
+    /* shortcut: constant-QP only; Np/R/Bmin/Ravg/hrd/buffersize/maxQPD stay 0 (driver-updated RC state). */
     s->pic.rate_control.framerate = c->fps;
     s->pic.rate_control.gop_length = 1;
     s->pic.rate_control.session_max_qp = 51;
@@ -97,6 +99,8 @@ int nvenc_h264_setup_init(const nvenc_h264_config *c, const nvenc_h264_layout *l
     p->stats_fifo_offset = 768;
     p->slice_encoding_row_num = l->padded_height / 16;
     p->strips_in_frame = 1;
+    /* shortcut: GPTIMER 0xffffffff cycles (header wants it below the watchdog); frame_*_minus1 are the visible size and
+       enable_source_image_padding stays 0 because pack() already replicates the edge into the padded rows. */
     s->pic.gpTimer_timeout_val = 0xffffffffu;
     s->slice.num_mb = (l->padded_width / 16) * (l->padded_height / 16);
     s->slice.qp_avr = c->qp;
@@ -200,11 +204,13 @@ size_t nvenc_h264_headers(const nvenc_h264_config *c, uint8_t *out, size_t cap) 
 }
 
 static int addr_ok(uint64_t a) { return a && !(a & 255) && a < (1ull << 40); }
+/* shortcut: bring-up hook to drop doubtful writes (1: 0x740-0x74c, 2: ctrl bit 14, 4: 0x204, 8: ctrl GPTIMER bit 12, 16: no mepred, 32: mepred out only, 64: mepred in only); remove once C9B7 is settled */
+unsigned nvenc_h264_push_skip;
 size_t nvenc_h264_push(const nvenc_h264_addresses *a, const nvenc_h264_layout *l,
                        uint32_t picture, uint32_t fence, uint32_t *out, size_t cap) {
     if (!a || !l || !out || cap < 64 || a->subchannel > 7 || !fence) return 0;
     const uint64_t addresses[] = {a->setup,a->status,a->bitstream,a->input,a->recon,
-                                 a->history,a->coloc,a->scratch,
+                                 a->history,a->coloc,a->scratch,a->mepred,
                                  a->status+NVENC_SEM_OFFSET,a->input+l->luma_bytes,
                                  a->recon+l->luma_bytes};
     for (size_t i=0; i<sizeof(addresses)/sizeof(addresses[0]); ++i)
@@ -212,15 +218,19 @@ size_t nvenc_h264_push(const nvenc_h264_addresses *a, const nvenc_h264_layout *l
     size_t n = 0;
 #define M(m,v) do { out[n++]=0x20000000u | (1u<<16) | (a->subchannel<<13) | ((m)>>2); out[n++]=(uint32_t)(v); } while(0)
     M(0x000,NVENC_CLASS); M(0x200,1); /* Application H.264. */
-    M(0x204,0xffffffffu);
-    M(0x700,3 | (1u<<11) | (1u<<12) | (1u<<14)); /* constant QP, slice stats, timer */
+    if (!(nvenc_h264_push_skip & 4)) M(0x204,0xffffffffu); /* shortcut: SET_WATCHDOG_TIMER is not in nvenc_drv.h; max assumed, GPTIMER below is not smaller as the header asks */
+    /* shortcut: bit 14 is undefined in nvenc_drv.h (RC_MODE 0 = constant QP is the default); drop it if the engine
+       rejects the picture. Defined bits: codec H.264, SLICE_STAT_ON (result() reads slice stats), GPTIMER_ON. */
+    M(0x700,3 | (1u<<11) | ((nvenc_h264_push_skip & 8) ? 0 : 1u<<12) | ((nvenc_h264_push_skip & 2) ? 0 : 1u<<14));
     M(0x704,picture);
     M(0x710,a->setup>>8); M(0x718,a->status>>8); M(0x71c,a->bitstream>>8);
     M(0x720,a->history>>8); M(0x724,a->scratch>>8);
     M(0x72c,a->coloc>>8); M(0x730,a->recon>>8);
-    M(0x734,a->input>>8); M(0x740,a->input>>8); M(0x744,a->input>>8);
-    M(0x74c,a->recon>>8);
-    M(0x738,0); M(0x73c,0); M(0x714,0); M(0x728,0); M(0x748,0);
+    M(0x734,a->input>>8);
+    /* shortcut: 0x740/0x744/0x748/0x74c are not defined by nvenc_drv.h (methods end at 0x73c); kept as first written.
+       If the engine faults on them, remove these four lines first. */
+    if (!(nvenc_h264_push_skip & 1)) {M(0x740,a->input>>8); M(0x744,a->input>>8); M(0x74c,a->recon>>8); M(0x748,0);}
+    M(0x738,(nvenc_h264_push_skip & 48) ? 0 : a->mepred>>8); M(0x73c,(nvenc_h264_push_skip & 80) ? 0 : (a->mepred+(512u<<10))>>8);   /* measured: offset 0 is refused with E_MEPRED_OFFSET */ M(0x714,0); M(0x728,0);
     M(0x300,1u<<8);
     uint64_t sem = a->status + NVENC_SEM_OFFSET;
     M(0x240,sem>>32); M(0x244,sem); M(0x248,fence); M(0x304,0);
